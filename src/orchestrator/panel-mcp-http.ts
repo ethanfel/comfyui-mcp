@@ -3,7 +3,7 @@
 // The Codex `codex app-server` can only host CONFIG-DECLARED MCP servers — it
 // can't run an in-process SDK MCP server the way the Claude Agent SDK does. So
 // to give Codex the SAME live-canvas control Claude has, the orchestrator stands
-// up a loopback HTTP MCP endpoint here and declares it to Codex as
+// up an HTTP MCP endpoint here and declares its loopback route to Codex as
 // `mcp_servers.panel.url = http://127.0.0.1:<port>/<tabId>`.
 //
 // ROUTING: the URL path is the panel tab id. Each tab gets its OWN McpServer
@@ -12,12 +12,13 @@
 // SURFACE is shared (registerPanelTools / buildPanelToolDefs in panel-tools.ts),
 // so Codex and Claude expose an identical panel toolset and parity is automatic.
 //
-// LOOPBACK ONLY: bound to 127.0.0.1; never exposed off-host. Sessions are
-// stateful (the transport mints a session id per Codex connection) and held in
-// a per-tab map so the same Codex thread reuses its server.
+// REMOTE OPT-IN: the default remains loopback-only. An operator may explicitly
+// bind a LAN interface and publish a base URL, but every non-loopback request is
+// then bearer-authenticated. Loopback callers stay credential-free so the
+// orchestrator's own Codex/Gemini backends keep working unchanged.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -34,12 +35,104 @@ interface Session {
 }
 
 export interface PanelMcpHttpServer {
-  /** The bound port (loopback). */
+  /** The bound port. */
   readonly port: number;
-  /** Build the URL Codex should connect to for a given tab. */
+  /** Build the loopback URL used by orchestrator-owned agent backends. */
   urlFor(tabId: string): string;
+  /** Authenticated externally reachable base URL, when explicitly configured. */
+  readonly publicBaseUrl: string | null;
   /** Stop the HTTP server and tear down every live session. */
   stop(): Promise<void>;
+}
+
+export interface PanelMcpHttpOptions {
+  host?: string;
+  workflowTargets?: WorkflowTargetStore;
+  /** Required for every non-loopback request. Never included in advertised URLs. */
+  bearerToken?: string | null;
+  /** Reachable origin/base advertised to panels, e.g. http://192.168.1.12:9181. */
+  publicBaseUrl?: string | null;
+}
+
+export const PANEL_MCP_BEARER_TOKEN_ENV = "COMFYUI_MCP_PANEL_MCP_TOKEN";
+
+interface RequestSecurityInput {
+  remoteAddress?: string;
+  hostHeader?: string;
+  originHeader?: string;
+  authorizationHeader?: string;
+  port: number;
+  publicHost: string | null;
+  bearerToken: string | null;
+}
+
+interface RequestSecurityResult {
+  ok: boolean;
+  status: number;
+  message?: string;
+}
+
+function loopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.toLowerCase().split("%")[0];
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1";
+}
+
+function loopbackBindHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
+}
+
+function bearerMatches(header: string | undefined, token: string | null): boolean {
+  if (!header || !token) return false;
+  const actual = Buffer.from(header, "utf8");
+  const expected = Buffer.from(`Bearer ${token}`, "utf8");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+/** Shared by the HTTP handler and focused tests. Remote access fails closed. */
+export function authorizePanelMcpRequest(input: RequestSecurityInput): RequestSecurityResult {
+  if (input.originHeader) {
+    return { ok: false, status: 403, message: "Cross-origin requests are not allowed." };
+  }
+
+  const local = loopbackAddress(input.remoteAddress);
+  const loopbackHost =
+    input.hostHeader === `127.0.0.1:${input.port}` || input.hostHeader === `localhost:${input.port}`;
+  if (loopbackHost) {
+    return local
+      ? { ok: true, status: 200 }
+      : { ok: false, status: 403, message: "Forbidden host." };
+  }
+
+  if (!input.publicHost || input.hostHeader !== input.publicHost) {
+    return { ok: false, status: 403, message: "Forbidden host." };
+  }
+  // A request aimed at the public route always authenticates, even if a local
+  // reverse proxy makes its socket peer appear loopback.
+  if (!bearerMatches(input.authorizationHeader, input.bearerToken)) {
+    return { ok: false, status: 401, message: "Valid bearer authentication is required." };
+  }
+  return { ok: true, status: 200 };
+}
+
+function normalizePublicBaseUrl(raw: string | null | undefined): { baseUrl: string | null; host: string | null } {
+  const value = raw?.trim();
+  if (!value) return { baseUrl: null, host: null };
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("COMFYUI_MCP_PANEL_MCP_PUBLIC_URL must be a valid http(s) URL.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("COMFYUI_MCP_PANEL_MCP_PUBLIC_URL must use http:// or https://.");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("COMFYUI_MCP_PANEL_MCP_PUBLIC_URL must not contain credentials, a query, or a fragment.");
+  }
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  return { baseUrl: parsed.toString().replace(/\/$/, ""), host: parsed.host };
 }
 
 /** Read the raw request body (Codex POSTs JSON-RPC). The transport wants the
@@ -72,15 +165,36 @@ function tabIdFromUrl(url: string | undefined): string | null {
 }
 
 /**
- * Start the loopback HTTP MCP server that exposes the panel_* tools to Codex,
- * routed by tab id. Returns once the port is bound (or rejects on bind failure).
+ * Start the HTTP MCP server that exposes the panel_* tools to Codex, routed by
+ * tab id. It is loopback-only unless a host, public URL, and strong bearer token
+ * are all explicitly supplied.
  */
 export function startPanelMcpHttpServer(
   bridge: UiBridge,
   port: number,
-  host = "127.0.0.1",
-  workflowTargets?: WorkflowTargetStore,
+  options: PanelMcpHttpOptions = {},
 ): Promise<PanelMcpHttpServer> {
+  const host = options.host?.trim() || "127.0.0.1";
+  const bearerToken = options.bearerToken?.trim() || null;
+  const { baseUrl: publicBaseUrl, host: publicHost } = normalizePublicBaseUrl(options.publicBaseUrl);
+  const remoteEnabled = !loopbackBindHost(host) || publicBaseUrl !== null;
+  if (remoteEnabled && host !== "0.0.0.0") {
+    throw new Error(
+      "Remote panel MCP requires COMFYUI_MCP_PANEL_MCP_HOST=0.0.0.0 so the same listener remains reachable through 127.0.0.1 by internal agents.",
+    );
+  }
+  if (remoteEnabled && (!bearerToken || bearerToken.length < 24)) {
+    throw new Error(
+      "Remote panel MCP requires COMFYUI_MCP_PANEL_MCP_TOKEN containing at least 24 characters.",
+    );
+  }
+  if (remoteEnabled && !publicBaseUrl) {
+    throw new Error(
+      "Remote panel MCP requires COMFYUI_MCP_PANEL_MCP_PUBLIC_URL so clients and Host validation use the intended address.",
+    );
+  }
+
+  const allowedHosts = [`127.0.0.1:${port}`, `localhost:${port}`, ...(publicHost ? [publicHost] : [])];
   // tabId -> (sessionId -> Session). A tab can hold multiple Codex sessions
   // across reconnects; each is its own server+transport over the SAME tab ctx.
   const tabs = new Map<string, Map<string, Session>>();
@@ -89,14 +203,14 @@ export function startPanelMcpHttpServer(
     const server = new McpServer({ name: "comfyui-panel", version: "1.0.0" });
     // Tab-bound context: every tool forwards to the bridge for THIS tab — the
     // same surface the Claude in-process server exposes (shared defs).
-    registerPanelTools(server, makePanelToolCtx(bridge, tabId, workflowTargets));
+    registerPanelTools(server, makePanelToolCtx(bridge, tabId, options.workflowTargets));
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       // Defense in depth against DNS rebinding (a malicious page resolving its own
       // host to 127.0.0.1 to reach this loopback server). We also Host/Origin-guard
       // in the request handler since we hand-roll http.createServer.
       enableDnsRebindingProtection: true,
-      allowedHosts: [`127.0.0.1:${port}`, `localhost:${port}`],
+      allowedHosts,
       allowedOrigins: [], // no browser origin should ever reach this (Codex sends none)
       onsessioninitialized: (sid) => {
         let m = tabs.get(tabId);
@@ -122,20 +236,25 @@ export function startPanelMcpHttpServer(
   const httpServer: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        // SECURITY (P1): this loopback server is reachable by any local process and,
-        // via DNS rebinding, by a malicious web page the user has open. Only the
-        // local Codex app-server should reach it — and it sends an exact-loopback
-        // Host and NO browser Origin. Reject anything else before doing any work.
-        const hostHeader = req.headers.host;
-        if (hostHeader !== `127.0.0.1:${port}` && hostHeader !== `localhost:${port}`) {
-          res.writeHead(403, { "content-type": "application/json" }).end(
-            JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Forbidden host." }, id: null }),
-          );
-          return;
-        }
-        if (req.headers.origin) {
-          res.writeHead(403, { "content-type": "application/json" }).end(
-            JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Cross-origin requests are not allowed." }, id: null }),
+        // SECURITY: loopback callers require exact local Host + no Origin. LAN
+        // callers additionally require the advertised Host and a constant-time
+        // bearer check. This runs before parsing any request body or creating a
+        // tool session.
+        const security = authorizePanelMcpRequest({
+          remoteAddress: req.socket.remoteAddress,
+          hostHeader: req.headers.host,
+          originHeader: typeof req.headers.origin === "string" ? req.headers.origin : undefined,
+          authorizationHeader:
+            typeof req.headers.authorization === "string" ? req.headers.authorization : undefined,
+          port,
+          publicHost,
+          bearerToken,
+        });
+        if (!security.ok) {
+          const headers: Record<string, string> = { "content-type": "application/json" };
+          if (security.status === 401) headers["www-authenticate"] = "Bearer";
+          res.writeHead(security.status, headers).end(
+            JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: security.message }, id: null }),
           );
           return;
         }
@@ -204,10 +323,16 @@ export function startPanelMcpHttpServer(
   return new Promise<PanelMcpHttpServer>((resolve, reject) => {
     httpServer.on("error", (err) => reject(err));
     httpServer.listen(port, host, () => {
-      logger.info(`[panel-mcp-http] panel_* MCP listening on http://${host}:${port}/<tabId> (loopback, Codex)`);
+      logger.info(
+        `[panel-mcp-http] panel_* MCP listening on http://${host}:${port}/<tabId>` +
+          (publicBaseUrl ? `; authenticated external base ${publicBaseUrl}` : " (loopback only)"),
+      );
       resolve({
         port,
-        urlFor: (tabId: string) => `http://${host}:${port}/${encodeURIComponent(tabId)}`,
+        // Always keep orchestrator-owned agents on loopback. Even when the
+        // listener is 0.0.0.0, they neither need nor receive the external token.
+        urlFor: (tabId: string) => `http://127.0.0.1:${port}/${encodeURIComponent(tabId)}`,
+        publicBaseUrl,
         stop: async () => {
           for (const tabSessions of tabs.values()) {
             for (const s of tabSessions.values()) {

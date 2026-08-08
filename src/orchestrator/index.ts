@@ -130,7 +130,11 @@ import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth
 import { buildStartFailureNotice } from "./start-failure-notice.js";
 import { readyBannerText, bannerCorrection } from "./ready-banner.js";
 import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
-import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
+import {
+  PANEL_MCP_BEARER_TOKEN_ENV,
+  startPanelMcpHttpServer,
+  type PanelMcpHttpServer,
+} from "./panel-mcp-http.js";
 import { resolveHttpLaneComfyToolMode } from "./http-backend-tools.js";
 import type { ToolMode } from "../transport/cli.js";
 import { dedupeAudioRefs, splitAudioAttachments } from "./audio-attachment.js";
@@ -1841,25 +1845,41 @@ export async function runPanelOrchestrator(): Promise<void> {
     ...(process.env.COMFYUI_MCP_TOOL_TRACE ? { COMFYUI_MCP_TOOL_TRACE: process.env.COMFYUI_MCP_TOOL_TRACE } : {}),
   });
 
-  // The orchestrator-hosted loopback HTTP MCP for panel_* tools. Started for the
+  // The orchestrator-hosted HTTP MCP for panel_* tools. Started for the
   // non-Claude backends (Codex + Gemini), which can't host an in-process SDK MCP
   // server the way Claude does. Port: COMFYUI_MCP_PANEL_MCP_PORT, default
-  // bridgePort+1 (loopback only).
-  // Start the loopback HTTP panel-MCP ALWAYS: with single-port multi-provider any
+  // bridgePort+1. It stays loopback-only unless an operator explicitly supplies
+  // HOST + PUBLIC_URL + a strong bearer TOKEN for external Codex sessions.
+  // Start the HTTP panel-MCP ALWAYS: with single-port multi-provider any
   // tab may pick codex/gemini at runtime, and those backends drive the canvas
   // through this server (Claude tabs use the in-process SDK server instead). The
   // per-tab session routing (`urlFor(panelTabId)`) already isolates tabs.
   let panelMcpHttp: PanelMcpHttpServer | null = null;
   {
     const panelMcpPort = Number(process.env.COMFYUI_MCP_PANEL_MCP_PORT) || bridgePort + 1;
+    const panelMcpHost = (process.env.COMFYUI_MCP_PANEL_MCP_HOST ?? "127.0.0.1").trim() || "127.0.0.1";
+    const panelMcpPublicUrl = process.env.COMFYUI_MCP_PANEL_MCP_PUBLIC_URL?.trim() || null;
+    const panelMcpBearerToken = process.env[PANEL_MCP_BEARER_TOKEN_ENV]?.trim() || null;
     try {
-      panelMcpHttp = await startPanelMcpHttpServer(bridge, panelMcpPort, "127.0.0.1", workflowTargets);
+      panelMcpHttp = await startPanelMcpHttpServer(bridge, panelMcpPort, {
+        host: panelMcpHost,
+        publicBaseUrl: panelMcpPublicUrl,
+        bearerToken: panelMcpBearerToken,
+        workflowTargets,
+      });
     } catch (err) {
       logger.error(
         `[panel-orchestrator] could not start the panel HTTP MCP on :${panelMcpPort} — codex/gemini tabs will lack live-graph tools: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
+  const panelMcpAdvertisement = panelMcpHttp?.publicBaseUrl
+    ? {
+        base_url: panelMcpHttp.publicBaseUrl,
+        auth: "bearer" as const,
+        token_env_var: PANEL_MCP_BEARER_TOKEN_ENV,
+      }
+    : null;
 
   // Loopback MCP console (control plane): OAuth, MCP mappings, service lifecycle.
   // Default port bridge+3 (9180→9183). NOT +2: bridge+2 is the phone-pairing
@@ -3223,7 +3243,17 @@ export async function runPanelOrchestrator(): Promise<void> {
       const { backends, any_ready } = allBackendReadiness(KNOWN_BACKENDS, {
         customEndpointConfigured: !!customBaseUrl,
       });
-      bridge.push({ type: "backends", backends, any_ready, console_url: consoleUrl, console_token: consoleToken }, tabId);
+      bridge.push(
+        {
+          type: "backends",
+          backends,
+          any_ready,
+          console_url: consoleUrl,
+          console_token: consoleToken,
+          panel_mcp: panelMcpAdvertisement,
+        },
+        tabId,
+      );
       // llama.cpp reality check (async re-push): the binary is often unzipped
       // anywhere (not on PATH), so static detection says "not installed" while
       // a server is HAPPILY ANSWERING. A live endpoint beats a missing binary —
@@ -3238,7 +3268,17 @@ export async function runPanelOrchestrator(): Promise<void> {
             lc.cli = true;
             lc.auth = true;
             lc.ready = true;
-            bridge.push({ type: "backends", backends, any_ready: true, console_url: consoleUrl, console_token: consoleToken }, tabId);
+            bridge.push(
+              {
+                type: "backends",
+                backends,
+                any_ready: true,
+                console_url: consoleUrl,
+                console_token: consoleToken,
+                panel_mcp: panelMcpAdvertisement,
+              },
+              tabId,
+            );
           })
           .catch(() => {});
       }
