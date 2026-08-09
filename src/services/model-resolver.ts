@@ -4,11 +4,11 @@ import { platform } from "node:os";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
 import { dirname, join, basename, normalize, resolve, relative, sep, isAbsolute, extname } from "node:path";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
-import { getClient, getSystemStats } from "../comfyui/client.js";
+import { getClient, getLogs, getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
 import { resolveEffectiveComfyUIBase, resolveLiveServerRoot } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
-import { ModelError, ValidationError } from "../utils/errors.js";
+import { ModelError, ValidationError, unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
@@ -224,8 +224,25 @@ export async function searchHuggingFaceModels(
   // Third-party API: bound the wait so a stalled response cannot wedge the
   // turn. Same class as #1026 — an unbounded metadata call has no limit at
   // all and hangs until the caller gives up.
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
+  //
+  // #1136: an unreachable HuggingFace is the failure most easily mistaken for
+  // "no such model" — this call backs model SEARCH, and its caller renders a
+  // zero-length array as "nothing found". Only errors thrown by fetch() itself
+  // take this path; an HTTP status is a real answer and keeps its own wording.
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) }).catch(
+    (err: unknown) => {
+      const { message, code } = unreachableHostMessage(err, url, "the HuggingFace model search", {
+        remedy:
+          "If huggingface.co is blocked in your region, set HF_ENDPOINT to a reachable mirror " +
+          "(e.g. https://hf-mirror.com) and retry.",
+      });
+      throw new ModelError(message, { url, code });
+    },
+  );
   if (!res.ok) {
+    // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+    // HTTP status is reported either way, so an unreadable body costs detail in the
+    // text, never a wrong conclusion. Verified there is no branch on this value.
     const body = await res.text().catch(() => "");
     throw new ModelError(
       `HuggingFace API ${res.status}: ${res.statusText}`,
@@ -370,7 +387,7 @@ async function discoverExtraCategories(
   client: ReturnType<typeof getClient>,
 ): Promise<string[]> {
   try {
-    const res = await client.fetchApi("/models");
+    const res = await comfyApiFetch("/models");
     if (!res.ok) return [];
     const json = (await res.json()) as unknown;
     if (!Array.isArray(json)) return [];
@@ -419,6 +436,13 @@ export type ModelListingCoverage = {
   /** Categories whose read failed or returned an unusable body, with why. Their
    *  emptiness is UNKNOWN, not zero. */
   unanswered: { dir: string; reason: string }[];
+  /** Categories the server answered 404 for — it does NOT register them (#1015).
+   *  A definite answer, not a gap: modern ComfyUI renamed `clip` → `text_encoders`
+   *  and `unet` → `diffusion_models`, so the old names 404 on every current
+   *  install. Kept distinct from `unanswered` so they never degrade a complete
+   *  listing to "partial", and distinct from `answered` because the server holds
+   *  no such folder at all rather than an empty one. */
+  absent?: string[];
   /** Set when HTTP listing was unavailable as a whole (no client, cloud mode,
    *  category discovery threw) — every category is then unanswered. */
   httpUnavailable?: string;
@@ -427,6 +451,28 @@ export type ModelListingCoverage = {
   /** Set when neither path could run: no HTTP answer AND no local install path
    *  to scan, which is the exact shape that produced the false "no models". */
   noSourceAvailable?: boolean;
+  /**
+   * Other categories THIS server registers, collected only when a FILTERED call
+   * came back empty (#962).
+   *
+   * The unfiltered path already discovers every registered category, and its own
+   * comment says why a filtered one skips discovery: "a FILTERED call already
+   * names its exact category". True for the lookup — and it is exactly what makes
+   * the answer misleading. The reporter called
+   * `list_local_models({model_type:"diffusion_models"})` and `{"unet"}` on a
+   * server whose UNETLoader was loading `krastBf16_v3.safetensors` at that
+   * moment. Both names answered 200 with `[]`, honestly, because the weights are
+   * registered under neither of them.
+   *
+   * So a filtered empty is a true statement about the wrong folder, and it is
+   * dressed as a fact about the install. Only when we would otherwise report
+   * "none" do we spend one `/models` call to say where else to look.
+   *
+   * Undefined means the question was never asked (a non-empty result, or the
+   * category list could not be read) — never "there are no other categories",
+   * which is what an empty array means.
+   */
+  otherRegisteredCategories?: string[];
 };
 
 /**
@@ -481,10 +527,44 @@ export async function listLocalModelsWithCoverage(
   const coverage: ModelListingCoverage = {
     answered: [],
     unanswered: [],
+    absent: [],
     usedFilesystem: false,
   };
   const models = await collectLocalModels(modelType, coverage);
+  // #962 — a filtered call that found nothing is about to say "none". Before it
+  // does, ask the server what it actually registers. Bounded to this one case,
+  // so the common paths pay nothing.
+  if (models.length === 0 && modelType !== undefined && coverage.answered.includes(modelType)) {
+    coverage.otherRegisteredCategories = await otherRegisteredCategories(modelType);
+  }
   return { models, coverage };
+}
+
+/**
+ * Categories this ComfyUI registers, minus the one already asked about (#962).
+ *
+ * Undefined on any failure: "we could not ask" must not render as "there is
+ * nowhere else to look", which is the same fold the coverage type exists for.
+ */
+async function otherRegisteredCategories(asked: string): Promise<string[] | undefined> {
+  try {
+    const res = await comfyApiFetch("/models");
+    if (!res.ok) return undefined;
+    const json = (await res.json()) as unknown;
+    if (!Array.isArray(json)) return undefined;
+    return [
+      ...new Set(
+        json.filter(
+          (c): c is string => typeof c === "string" && c.trim() !== "" && c !== asked,
+        ),
+      ),
+    ];
+  } catch (err) {
+    logger.debug("could not read the registered category list for an empty filtered listing", {
+      err,
+    });
+    return undefined;
+  }
 }
 
 export async function listLocalModels(
@@ -529,10 +609,34 @@ async function collectLocalModels(
     const dedup = makeModelDeduper();
     for (const dir of dirsToScan) {
       try {
-        const res = await client.fetchApi(`/models/${dir}`);
+        const res = await comfyApiFetch(`/models/${dir}`);
         // A non-OK status or a non-array body means we did NOT learn what this
         // category holds. Recording the reason is the whole point: continuing
         // silently is what let a warming-up server look like an empty install.
+        //
+        // …with ONE exception, and it is the opposite fold (#1015). A 404 is the
+        // server answering DEFINITIVELY that it does not serve this category —
+        // "determined not present", not "could not determine". Modern ComfyUI
+        // renamed two of the folders in MODEL_SUBDIRS (clip → text_encoders,
+        // unet → diffusion_models), so a current install 404s the old names.
+        // Reproduced on a live 0.31 server:
+        //
+        //   clip             HTTP 404 bytes=0
+        //   unet             HTTP 404 bytes=0
+        //   text_encoders    HTTP 200 bytes=297
+        //   diffusion_models HTTP 200 bytes=360
+        //
+        // Counting those as unread put a permanent "Partial listing — 2
+        // categories could not be read" on every healthy modern install, telling
+        // a user their inventory was incomplete when it was complete — and naming
+        // aliases whose real contents were already listed under the new names.
+        //
+        // Recorded as ABSENT rather than dropped silently, so an unfiltered
+        // listing can still say which categories this server does not register.
+        if (res.status === 404) {
+          (coverage.absent ??= []).push(dir);
+          continue;
+        }
         if (!res.ok) {
           coverage.unanswered.push({ dir, reason: `HTTP ${res.status}` });
           continue;
@@ -602,7 +706,13 @@ async function collectLocalModels(
     // The outer throw (no client / cloud mode / GGUF discovery) aborts before any
     // per-category read, so nothing below it was answered either.
     for (const dir of dirsToScan) {
-      if (!coverage.answered.includes(dir) && !coverage.unanswered.some((u) => u.dir === dir)) {
+      if (
+        !coverage.answered.includes(dir) &&
+        // A category already answered 404 was ANSWERED — the later outer failure
+        // does not un-answer it (#1015).
+        !(coverage.absent ?? []).includes(dir) &&
+        !coverage.unanswered.some((u) => u.dir === dir)
+      ) {
         coverage.unanswered.push({ dir, reason: coverage.httpUnavailable });
       }
     }
@@ -857,8 +967,7 @@ export async function liveCategoryListing(
   if (!category) return undefined;
   if (categoryCannotEnumerateFiles(category)) return undefined;
   try {
-    const client = getClient();
-    const res = await client.fetchApi(`/models/${encodeURIComponent(category)}`);
+    const res = await comfyApiFetch(`/models/${encodeURIComponent(category)}`);
     if (!res.ok) return undefined;
     const json = (await res.json()) as unknown;
     if (!Array.isArray(json)) return undefined;
@@ -978,6 +1087,26 @@ async function assertDestinationVisibleToLiveServer(
     if (onDisk.length === 0) continue; // nothing here to contradict anything
     const listing = await liveCategoryListing(category);
     if (listing === undefined) continue; // the server can't speak for it — no evidence
+    // #1147 — AN EMPTY LISTING IS NOT DISAGREEMENT.
+    //
+    // The #369 signature this guard exists for is a POPULATED listing that
+    // describes a different tree: 3 files on disk, 24 unrelated files live. That
+    // is positive evidence — the server demonstrably scans SOMETHING ELSE for
+    // this category.
+    //
+    // An empty listing says only that the server named nothing here, and that is
+    // equally explained by a server that reads this very directory but does not
+    // enumerate it the way a filesystem walk does. A reporter's portable install
+    // held models/birefnet/BiRefNet_lite/model.safetensors — a HuggingFace repo
+    // dump — while /models/birefnet answered empty, and the download was refused
+    // into the correct, running install, with their loras/ agreeing perfectly.
+    //
+    // So "0 live entries" cannot distinguish "wrong install" from "a category
+    // this server does not scan like we do", and this guard refuses only on
+    // positive evidence. The same reasoning the surrounding code already applies
+    // to `diffusers` (#844), whose listing contractually names no files —
+    // generalized from one hardcoded category to the condition underneath it.
+    if (listing.length === 0) continue;
     probed += 1;
     // CONTAINMENT, not overlap. If this directory really is one the server reads, it
     // SCANS it — so EVERY core-extension file in it must appear in the listing. A
@@ -1304,7 +1433,13 @@ export async function verifyManagerVisibility(
         visibility: "visible",
         note:
           `The connected ComfyUI now lists ${targetSubfolder}/${filename}, so the dispatch ` +
-          `landed somewhere it reads.`,
+          `landed somewhere it reads. That is PLACEMENT, not validity: a listing proves a file ` +
+          `of that NAME exists, and Manager writes whatever the URL returned under the name you ` +
+          `asked for. #473 is exactly this — a CivitAI login page saved as a .safetensors, ` +
+          `listed happily, and only discovered when LoraLoader failed to deserialize it. ` +
+          `Manager cannot carry this MCP's credentials, so an auth-gated URL is the case to ` +
+          `distrust: if the file is implausibly small for its kind (a login page is ~10KB), ` +
+          `treat it as failed and re-fetch it locally with COMFYUI_PATH set.`,
       };
     }
     if (has === false) asked = true;
@@ -1542,14 +1677,83 @@ export async function verifyLandedModel(
   }
   return {
     verifiedPath,
-    liveVisible: "not-visible",
-    note:
-      `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
-      `(${getComfyUIBaseUrl()}) does NOT list "${wanted}" under "${category}" — it will not be ` +
-      `usable in a workflow from there.` +
-      (liveModelsDir ? ` The models directory that server reads is ${liveModelsDir}.` : "") +
-      " Move the file into the running server's models tree (or point COMFYUI_PATH at that install and re-download).",
+    ...notVisibleVerdict({
+      verifiedPath,
+      liveModelsDir,
+      wanted,
+      category,
+      baseUrl: getComfyUIBaseUrl(),
+    }),
   };
+}
+
+/**
+ * The verdict for a file that is on disk but absent from the live listing (#1131).
+ *
+ * "Not listed" has TWO causes and they take OPPOSITE remedies. If the file sits
+ * UNDER the very models root the server reads, it is not misplaced: the server
+ * simply has not re-read that folder yet. ComfyUI caches its loader option lists
+ * and invalidates them on the directory's mtime, so a check this soon after the
+ * write routinely races it. Telling that user to "move the file into the running
+ * server's models tree" names a directory the file is ALREADY in — a remedy that
+ * cannot be followed, which is what the reporter received. Only a file OUTSIDE
+ * that root is genuinely in the wrong place.
+ *
+ * The DECISION lives here rather than at the call site so it is covered by the
+ * same tests as the wording; a branch chosen upstream and passed in as a boolean
+ * would be exactly the untested wiring this repo keeps getting caught by.
+ */
+export function notVisibleVerdict(args: {
+  verifiedPath: string;
+  liveModelsDir: string | undefined;
+  wanted: string;
+  category: string;
+  baseUrl: string;
+}): { liveVisible: "not-visible"; note: string } {
+  const { verifiedPath, liveModelsDir, wanted, category, baseUrl } = args;
+  const insideLiveRoot = liveModelsDir !== undefined && isUnderRoot(verifiedPath, liveModelsDir);
+  return {
+    // Still not VISIBLE — we did not observe it in the listing, and #369 exists
+    // because an unobserved placement must not render as confirmed. The verdict
+    // is unchanged; what changes is the explanation and the remedy.
+    liveVisible: "not-visible",
+    note: insideLiveRoot
+      ? `The file IS on disk at ${verifiedPath}, which is INSIDE the models directory the ` +
+        `connected ComfyUI reads (${liveModelsDir}) — so it is in the right place. That server ` +
+        `does not list "${wanted}" under "${category}" YET, which almost always means its ` +
+        `cached loader options have not been re-read since the write (ComfyUI invalidates them ` +
+        `on the directory's mtime). Do NOT move the file. Refresh the node/model definitions ` +
+        `— install_comfyui (action:"refresh_nodes"), or the panel's refresh — or restart ` +
+        `ComfyUI, then check list_local_models again.`
+      : `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
+        `(${baseUrl}) does NOT list "${wanted}" under "${category}" — it will not be ` +
+        `usable in a workflow from there.` +
+        (liveModelsDir ? ` The models directory that server reads is ${liveModelsDir}.` : "") +
+        " Move the file into the running server's models tree (or point COMFYUI_PATH at that install and re-download).",
+  };
+}
+
+/**
+ * Is `file` inside `root`? Compared on NORMALIZED paths (#1131).
+ *
+ * Windows mixes separators and is case-insensitive, so `C:\ComfyUI\models` and
+ * `c:/comfyui/models` name the same directory — comparing raw strings would call
+ * a correctly-placed file misplaced and print the "move it there" remedy for a
+ * file already there. The boundary check requires a separator so `…/models2`
+ * never counts as inside `…/models`.
+ */
+export function isUnderRoot(
+  file: string,
+  root: string,
+  platform: string = process.platform,
+): boolean {
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, "/").replace(/\/+$/, "");
+    return platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  const f = norm(file);
+  const r = norm(root);
+  return f === r || f.startsWith(`${r}/`);
 }
 
 /**
@@ -2108,6 +2312,231 @@ function localAuthHeadersFor(
  * dead end; list_local_models reads through the SAME roots the server reads, so a
  * file that appears there is genuinely reachable by a workflow.
  */
+/**
+ * The destination ComfyUI-Manager LOGGED for `filename`, read back from
+ * `/internal/logs` (#1086).
+ *
+ * The standing caveat says we cannot know where a Manager dispatch lands, because
+ * `extra_model_paths.yaml` lives on the target filesystem. That is true of the
+ * CONFIG — and the reporter's own evidence shows it is not true of the OUTCOME.
+ * Manager announces the absolute path it picked, in both generations:
+ *
+ *   glob/manager_server.py:1063  f"Install model '{name}' from '{url}' into '{path}'"
+ *   legacy/manager_server.py:634 (identical)
+ *
+ * which is how they discovered their Wan 2.2 file had gone to
+ * `/opt/ComfyUI/models` while the server read `/workspace/models` — a 20GB overlay
+ * that discarded it on the next pod restart.
+ *
+ * So the destination is unknowable only until we look. This looks.
+ *
+ * Returns undefined when the log could not be read OR carried no such line —
+ * DELIBERATELY not distinguished here, because the caller's remedy is identical
+ * (fall back to the caveat) and inventing a distinction the caller cannot act on
+ * would be noise. What must never happen is an unread log rendering as a
+ * destination, which is why undefined is the only other answer.
+ *
+ * Matches the LAST occurrence: a filename can be installed more than once in a
+ * session, and the newest line is the dispatch we just made.
+ */
+/**
+ * Are these two absolute paths written in the SAME path syntax? (#1086, codex review)
+ *
+ * A destination read from the REMOTE server's log is in that host's syntax, while
+ * a root resolved here has been through node's `resolve()` — which on Windows
+ * turns "/workspace/models" into "C:\workspace\models". Comparing across that
+ * boundary always answers OUTSIDE, for a destination that may be exactly right,
+ * and a false OUTSIDE is the dangerous direction: it cries wolf about a good file
+ * and contradicts a LISTED verdict in the same message.
+ *
+ * Deliberately crude — POSIX-absolute vs drive-letter is the only distinction that
+ * matters here, and anything it cannot classify is treated as incomparable rather
+ * than guessed.
+ */
+/**
+ * The extra_model_paths directories the LIVE server reads, or undefined when that
+ * could not be established (#1086, codex review).
+ *
+ * Undefined is load-bearing: "we could not read the extra roots" must not render
+ * as "there are none", which would let a destination under a perfectly good extra
+ * root be reported as unusable.
+ */
+async function liveExtraRootDirs(): Promise<string[] | undefined> {
+  try {
+    const snapshot = await resolveModelsDirWithBases();
+    const live = await getLiveExtraModelRoots(snapshot.snapshot);
+    if (!live.authoritative) return undefined;
+    return live.roots.map((r) => r.dir).filter((d): d is string => typeof d === "string");
+  } catch {
+    return undefined;
+  }
+}
+
+function samePathDomain(a: string, b: string): boolean {
+  const kind = (p: string): "posix" | "win32" | "unknown" => {
+    if (/^[A-Za-z]:[\/]/.test(p)) return "win32";
+    if (p.startsWith("\\\\")) return "win32"; // UNC
+    if (p.startsWith("/")) return "posix";
+    return "unknown";
+  };
+  const ka = kind(a);
+  const kb = kind(b);
+  return ka !== "unknown" && ka === kb;
+}
+
+/**
+ * The FILENAME a Manager dispatch actually used, from a finished job (#1086,
+ * codex review).
+ *
+ * `job.filename` is OPTIONAL — a URL-only download never sets it — and the
+ * fallback in use was `job.path.split(/[\/]/).pop()`. For a Manager dispatch
+ * `job.path` is not a path at all; it is
+ *
+ *     "checkpoints/foo.safetensors (dispatched to the remote ComfyUI via …)"
+ *
+ * so that fallback returned the whole descriptive tail. Every consumer then
+ * searched for a filename that cannot match anything: the destination read below
+ * misses, and `verifyManagerVisibility` — which used the identical fallback long
+ * before this change — probed a name the server could never list, quietly turning
+ * every URL-only Manager download into an unverifiable one.
+ *
+ * Take the leading "<subfolder>/<filename>" that descriptor is built from,
+ * stopping at the " (" the note begins with.
+ */
+export function managerJobFilename(job: {
+  filename?: string;
+  path?: string;
+}): string {
+  if (job.filename) return job.filename;
+  const head = (job.path ?? "").split(" (")[0];
+  return head.split(/[\/]/).pop() ?? "";
+}
+
+export function parseManagerInstallDestination(
+  logText: string,
+  filename: string,
+): string | undefined {
+  if (!logText || !filename) return undefined;
+  // The name is interpolated into the line inside single quotes, so match it as a
+  // whole quoted token — a bare substring would let `clip_vision_h.safetensors`
+  // be matched by a line about `clip_vision_h.safetensors.part`.
+  const esc = filename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`Install model '${esc}' from '[^']*' into '([^']+)'`, "g");
+  let last: string | undefined;
+  for (const m of logText.matchAll(re)) last = m[1];
+  return last;
+}
+
+/**
+ * Read the live server's log and report where Manager said it put `filename`,
+ * plus whether that is inside the models root the server actually reads (#1086).
+ *
+ * Never throws: this runs after a transfer, and a diagnostic that cannot be
+ * gathered must not turn a completed dispatch into an error.
+ */
+export async function describeManagerDestination(
+  filename: string,
+  opts?: {
+    /** Injectable so this is testable without a live server. */
+    readLog?: () => Promise<string | undefined>;
+    liveModelsDir?: string | undefined;
+    /** The server's extra_model_paths roots, or undefined when they could not be
+     *  established. Injectable for tests; defaults to the live read. */
+    extraRoots?: () => Promise<string[] | undefined>;
+  },
+): Promise<string | undefined> {
+  let text: string | undefined;
+  try {
+    // getLogs() already carries the reconnect-and-retry a Manager reboot needs
+    // (#399) — a restart is exactly what precedes many of these reads.
+    text =
+      opts?.readLog !== undefined
+        ? await opts.readLog()
+        : (await getLogs()).join("\n");
+  } catch {
+    return undefined;
+  }
+  if (!text) return undefined;
+  const dest = parseManagerInstallDestination(text, filename);
+  if (!dest) return undefined;
+
+  const root = opts?.liveModelsDir;
+  // #1086 (codex review, PR #1190) — ONLY compare when the comparison is
+  // trustworthy, and the two ways it is not are both dangerous in the SAME
+  // direction: a false OUTSIDE cries wolf about a file that is fine, and
+  // contradicts a LISTED verdict sitting in the same message.
+  //
+  //  - PATH DOMAIN. `dest` comes from the REMOTE server's log, so it is that
+  //    host's path syntax. `currentLiveModelsRoot()` runs its value through
+  //    node's `resolve()`, which on a WINDOWS orchestrator turns the remote
+  //    "/workspace/models" into "C:\workspace\models". Comparing those two
+  //    always says OUTSIDE — for a destination that is exactly right.
+  //  - EXTRA ROOTS. This compares one PRIMARY root, while a server can read
+  //    several. A destination under a legitimately-registered extra root would
+  //    be reported as unusable while `verifyManagerVisibility` lists it.
+  //
+  // So the INSIDE/OUTSIDE verdict is asserted only when the domains agree, and
+  // an OUTSIDE reading also has to survive the extra roots. Anything else falls
+  // back to locating the file WITHOUT judging it — which is still far more than
+  // the old "we cannot know where this lands".
+  if (root !== undefined && !samePathDomain(dest, root)) {
+    return (
+      `ComfyUI-Manager reported writing it to ${dest}. That path is on the ComfyUI ` +
+      `host and could not be compared with the models directory known here ` +
+      `(${root}) — they are written in different path syntaxes, so no INSIDE/OUTSIDE ` +
+      `verdict is claimed. Check list_local_models to confirm the server can read it.`
+    );
+  }
+  if (root === undefined) {
+    // We know WHERE, but not whether that is a place the server reads — and the
+    // second half is the one that decides whether the file is usable. Say the
+    // first without implying the second.
+    return (
+      `ComfyUI-Manager reported writing it to ${dest}. Whether that path is one the ` +
+      `connected server reads could not be established from here, so this locates the ` +
+      `file without confirming it is usable — check list_local_models.`
+    );
+  }
+  if (isUnderRoot(dest, root)) {
+    return (
+      `ComfyUI-Manager reported writing it to ${dest}, which is INSIDE the models ` +
+      `directory that server reads (${root}).`
+    );
+  }
+  // An OUTSIDE reading has to survive the EXTRA roots before it is asserted: a
+  // server reads more than one tree, and a destination under a registered extra
+  // root is fine. Unreadable extra roots mean we cannot rule that out, so the
+  // verdict is withheld rather than guessed — the same three-state discipline as
+  // everywhere else here.
+  const extra = await (opts?.extraRoots !== undefined
+    ? opts.extraRoots()
+    : liveExtraRootDirs());
+  if (extra === undefined) {
+    return (
+      `ComfyUI-Manager reported writing it to ${dest}, which is not under the primary ` +
+      `models directory the connected server reads (${root}). Whether that server also ` +
+      `reads it through an extra_model_paths entry could NOT be checked from here, so ` +
+      `this is not being called unusable — confirm with list_local_models.`
+    );
+  }
+  if (extra.some((r) => typeof r === "string" && isUnderRoot(dest, r))) {
+    return (
+      `ComfyUI-Manager reported writing it to ${dest}, which is outside the primary ` +
+      `models directory (${root}) but INSIDE an extra_model_paths root that server ` +
+      `reads — so it is reachable.`
+    );
+  }
+  return (
+    `⚠ ComfyUI-Manager reported writing it to ${dest}, which is OUTSIDE the models ` +
+    `directory the connected server reads (${root}) — so a workflow there will NOT see ` +
+    `it. This is the extra_model_paths case: Manager picks its own destination root ` +
+    `and does not necessarily honour that config. On a container the base models ` +
+    `directory is commonly an EPHEMERAL OVERLAY, which discards the file on the next ` +
+    `restart — move it into ${root} now, or re-download with COMFYUI_PATH set so this ` +
+    `MCP streams it to a destination it controls.`
+  );
+}
+
 export function managerDestinationCaveat(): string {
   return (
     "ComfyUI-Manager chooses the destination root itself and does not necessarily honour " +
@@ -2230,7 +2659,6 @@ async function downloadModelViaManagerRemote(
     authHeaders: localAuthHeadersFor(url, auth, wasHfUrl),
   });
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
-  let authGateWarning = "";
   if (probe.verdict === "non-model") {
     const what =
       probe.kind === "html"
@@ -2251,16 +2679,31 @@ async function downloadModelViaManagerRemote(
         `token is applied and the payload is validated on disk`
       : `configure the credential on the ComfyUI host, or download to a LOCAL ComfyUI where the ` +
         `credential is applied and the payload is validated on disk`;
-    authGateWarning =
-      ` WARNING: this URL is AUTHENTICATION-GATED — an unauthenticated fetch (exactly what ` +
-      `ComfyUI-Manager performs server-side, since it cannot carry the MCP's auth headers) ` +
-      `returns ${what}, while the SAME URL fetched WITH the configured credential returns a ` +
-      `real model. ComfyUI-Manager will therefore almost certainly save that auth/error page ` +
-      `under "${resolvedFilename}" as a CORRUPT model (it fails at load time, e.g. "header too ` +
-      `large" / "Expecting value") — do NOT treat it as a real model until verified. To ` +
-      `download it, ${remediation}.`;
+    // #473 — REFUSE, do not dispatch. The probe has PROVEN the gate: the same URL
+    // returns a login/error page unauthenticated and a real model with the
+    // credential, and Manager fetches server-side without our headers. Dispatching
+    // anyway is knowingly writing a corrupt file under the caller's chosen
+    // filename — it then LISTS as a model and fails much later inside a loader
+    // ("header too large" / "Expecting value"), which is how this issue was
+    // reported three times.
+    //
+    // Owner's call (2026-08-08) after weighing the false-refusal risk: a ComfyUI
+    // HOST that carries its OWN token would have succeeded, and is now blocked.
+    // That case is speculative, has two documented ways out (below), and fails
+    // LOUDLY at the point of the request; the corrupt-file case is real,
+    // recurring, and fails silently hours later on someone else's canvas.
     logger.warn(
-      "Remote model dispatch is authentication-gated; ComfyUI-Manager will fetch it unauthenticated",
+      "Refusing an authentication-gated model dispatch to ComfyUI-Manager (it cannot carry our credentials)",
+      { url: redactUrlForLogs(dispatchUrl, sensitiveParams), filename: resolvedFilename },
+    );
+    throw new ModelError(
+      `Refusing to dispatch "${resolvedFilename}" to ComfyUI-Manager: this URL is ` +
+        `AUTHENTICATION-GATED. An unauthenticated fetch returns ${what}, while the SAME URL ` +
+        `fetched WITH the configured credential returns a real model — and ComfyUI-Manager ` +
+        `fetches server-side and cannot carry this MCP's auth headers. It would therefore save ` +
+        `that auth/error page under "${resolvedFilename}" as a CORRUPT model, which lists ` +
+        `normally and only fails later at load time ("header too large" / "Expecting value"). ` +
+        `NOTHING was downloaded and nothing was written. To download it, ${remediation}.`,
       { url: redactUrlForLogs(dispatchUrl, sensitiveParams), filename: resolvedFilename },
     );
   }
@@ -2307,7 +2750,7 @@ async function downloadModelViaManagerRemote(
       "local models directory to stream into (no COMFYUI_PATH, no saved workspace, and the " +
       "running server's launch arguments did not identify one). That is a routing fallback, NOT " +
       "a claim that the server is remote; set COMFYUI_PATH to stream directly instead";
-  return `${normalizedSubfolder}/${resolvedFilename} (${routeNote} — download continues server-side. ${managerDestinationCaveat()})${authGateWarning}${authWarning}`;
+  return `${normalizedSubfolder}/${resolvedFilename} (${routeNote} — download continues server-side. ${managerDestinationCaveat()})${authWarning}`;
 }
 
 /**

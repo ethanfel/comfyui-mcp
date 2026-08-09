@@ -57,6 +57,9 @@ vi.mock("../../config.js", () => ({
 
 vi.mock("../../comfyui/fetch.js", () => ({
   comfyuiFetch: (url: string, init?: RequestInit) => hoisted.fetchMock(url, init),
+  // #1175 — the refusal now appends the panel-origin drift comparison. Stubbed
+  // empty here so these #914 assertions keep testing identification alone.
+  describeTargetDrift: () => "",
 }));
 
 vi.mock("../../comfyui/client.js", () => ({

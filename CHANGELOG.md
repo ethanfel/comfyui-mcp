@@ -6,6 +6,193 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.54] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a rebind that fails on an OLD panel says so, and names the version (#1199)
+
+
+## [0.50.53] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a 404 category is an ANSWER, not an unreadable one (#1196)
+
+
+## [0.50.52] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- report the destination ComfyUI-Manager actually chose (#1190)
+
+
+## [0.50.51] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- make the endpoint-specific !res.ok branches reachable (#1187)
+
+
+## [0.50.50] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a BACKGROUNDED phone is not a departed phone (#1185)
+
+
+## [0.50.49] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop the client library's error path eating non-JSON responses (#1178)
+
+
+## [0.50.48] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the refusal names the origin the connected panel is actually on (#1181)
+
+
+## [0.50.47] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a non-JSON /prompt reply states the delivery doubt instead of a parser message (#1179)
+- hold a turn's temp images past the turn, so a deferred read still finds them (#1177)
+
+
+## [0.50.46] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- getHistory names the endpoint instead of leaking a parser message (#1172)
+
+
+## [0.50.45] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an interrupted download leaves a findable record instead of vanishing (#1170)
+
+
+## [0.50.44] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- an EMPTY live listing is not evidence of a different install (#1168)
+- a bare JSON parse error names the tool, the likely cause, and the delivery doubt (#1166)
+- accept the video containers this codebase already recognizes (#1165)
+
+
+## [0.50.43] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- stop reporting a live download as FAILED, and stop claiming bytes moved for a 404 (#1163)
+- Save-As and new-workflow trust their OWN reply's proven uuid (#1161)
+- recent_errors:0 returns none, and says the log was not checked (#1162)
+- reopening a tab's OWN tmp: routing_key refreshes the fence (#1157)
+
+
+## [0.50.42] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a filtered empty listing says where else to look (#1158)
+- name the tool that CAN install an unregistered pack (#1156)
+- reject unrecognized argument keys instead of silently dropping them (#1153)
+- stop abandoning a WRITE sooner than a read (#1154)
+
+
+## [0.50.41] - 2026-08-08
+
+### MCP
+
+#### Added
+- attach UI workflow metadata to API-enqueued prompts (#1124)
+
+
+## [0.50.40] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a REFUSED Manager enqueue falls through to the direct git clone (#1143)
+
+
+## [0.50.39] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a RESERVED Manager update is staged, not failed (#1141)
+
+
+## [0.50.38] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- the GitHub Release body is THIS version's changelog, not every PR since forever (#1138)
+- stop telling users to move a model into the folder it is already in (#1137)
+
+
+## [0.50.37] - 2026-08-08
+
+### RunPod image
+
+#### Fixed
+- a hash that could not be COMPUTED is not a hash that DIFFERED (#1123)
+
+### MCP
+
+#### Added
+- report the ComfyUI FRONTEND version — the field #779 turned on (#1126)
+
+#### Fixed
+- REFUSE an auth-gated Manager dispatch instead of writing a corrupt model (#473) (#1134)
+- finish the #796 review — baseline reaches zero, and a comment could switch the gate off (#1125)
+
+#### Changed
+- ask for the ComfyUI FRONTEND version, and say why (#1127)
+
+
+## [0.50.36] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- a Manager listing is PLACEMENT, never validity — my 0.50.29 regression (#473) (#1120)
+
+#### Changed
+- the shipped build's data-loss guards must actually guard (#1119)
+- pin the env var our errors tell people to set (#1118)
+- the tunnel-deferral comment named a function that does not exist (#1117)
+
+
+## [0.50.35] - 2026-08-08
+
+### MCP
+
+#### Fixed
+- defer the update-restart while a phone is connected over a tunnel (#875) (#1115)
+
+
 ## [0.50.34] - 2026-08-08
 
 ### MCP

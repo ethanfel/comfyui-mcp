@@ -276,3 +276,148 @@ describe("attempt-supersession (panel#489)", () => {
     expect(emitted.some((r) => r.status === "error")).toBe(false);
   });
 });
+
+// #1150 — the (id, target) supersession key cannot see a corrected retry.
+//
+// Two 404s were re-issued with corrected URLs and the same target filenames.
+// A new URL is a new id, so the eviction never fired and both filenames flushed
+// as failures — while download_model action:"status" showed them streaming at
+// 20% and 13%. This asks the narrower question the event text actually needs:
+// is the thing I am about to call failed currently arriving?
+describe("markSupersededByLive (#1150)", () => {
+  const live = (name: string) => ({ name, status: "downloading" });
+
+  it("flags a failure whose filename is downloading RIGHT NOW", () => {
+    const settled = [{ name: "big.safetensors", status: "error" }];
+    mod.markSupersededByLive(settled, [live("big.safetensors")]);
+    expect(settled[0]).toMatchObject({ supersededByLive: true });
+  });
+
+  it("leaves a genuinely dead failure alone", () => {
+    const settled = [{ name: "gone.safetensors", status: "error" }];
+    mod.markSupersededByLive(settled, [live("other.safetensors")]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("never flags a SUCCESS — 'done' is settled regardless of what else is live", () => {
+    // A second copy of the same name streaming elsewhere does not un-complete a
+    // transfer that finished.
+    const settled = [{ name: "big.safetensors", status: "done" }];
+    mod.markSupersededByLive(settled, [live("big.safetensors")]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("ignores live rows that are not actually downloading", () => {
+    const settled = [{ name: "big.safetensors", status: "error" }];
+    mod.markSupersededByLive(settled, [
+      { name: "big.safetensors", status: "done" },
+      { name: "big.safetensors", status: "error" },
+    ]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("ignores nameless rows rather than matching them to each other", () => {
+    const settled = [{ name: "", status: "error" }];
+    mod.markSupersededByLive(settled, [{ name: undefined, status: "downloading" }]);
+    expect(settled[0].supersededByLive).toBeUndefined();
+  });
+
+  it("handles the reporter's shape: two failures, both retried", () => {
+    const settled = [
+      { name: "MiniMax-H3_FL2VA-NVFP4-HQ.safetensors", status: "error" },
+      { name: "MiniMax-H3_FL2VA-NVFP4-LQ.safetensors", status: "error" },
+    ];
+    mod.markSupersededByLive(settled, [
+      live("MiniMax-H3_FL2VA-NVFP4-HQ.safetensors"),
+      live("MiniMax-H3_FL2VA-NVFP4-LQ.safetensors"),
+    ]);
+    expect(settled.every((s) => s.supersededByLive === true)).toBe(true);
+  });
+});
+
+// #1148 — a tracked download vanished silently across an orchestrator restart.
+//
+// The persisted store exists so a reconnecting session can still resolve an
+// in-flight download by id (#529), and download_model's own status text promises
+// exactly that. But the orchestrator nonces its progress dir per start and reaps
+// every earlier dir for the port, deleting the store that promise rests on. A
+// reporter's 12GB transfer answered "No download matching id" and "No downloads
+// are being tracked" — no file, no partial, no error event. 40 minutes lost
+// invisibly, while the documented contract told their agent to keep waiting.
+//
+// The transfer really is dead (it streamed inside the exited process), so this
+// resurrects nothing. It replaces the SILENCE with a findable terminal record.
+describe("migrateInFlightJobs (#1148)", () => {
+  let oldDir: string;
+
+  beforeEach(() => {
+    oldDir = mkdtempSync(join(tmpdir(), "cm-old-"));
+  });
+  afterEach(() => {
+    rmSync(oldDir, { recursive: true, force: true });
+  });
+
+  // Built from the module's OWN prefix, not a hard-coded "job-": the real files
+  // are `control-job-…`, and a literal here would have silently written fixtures
+  // the scanner ignores — a test that passes by matching nothing.
+  const writeJob = (d: string, rec: Record<string, unknown>) =>
+    writeFileSync(
+      join(d, `${mod.CONTROL_PREFIX}job-${rec.id}-owner.json`),
+      JSON.stringify(rec),
+    );
+
+  it("carries an IN-FLIGHT record forward as a findable terminal record", () => {
+    writeJob(oldDir, {
+      id: "53012d3181fd46b6",
+      status: "downloading",
+      name: "krea2_turbo_fp8.safetensors",
+      received: 700000000,
+      total: 12010000000,
+      updated: Date.now(),
+    });
+
+    expect(mod.migrateInFlightJobs(oldDir, dir)).toBe(1);
+
+    const found = mod.readPersistedDownloadJob("53012d3181fd46b6");
+    expect(found).not.toBeNull();
+    expect(found!.status).toBe("error");
+    expect(found!.interrupted_by_restart).toBe(true);
+    // The bytes it had, so a reader can see what was lost.
+    expect(found!.received).toBe(700000000);
+  });
+
+  it("says the transfer is NOT running and will not resume itself", () => {
+    // The whole harm was an agent waiting forever on the documented contract.
+    writeJob(oldDir, { id: "abc", status: "downloading", updated: Date.now() });
+    mod.migrateInFlightJobs(oldDir, dir);
+    const msg = mod.readPersistedDownloadJob("abc")!.error ?? "";
+    expect(msg).toMatch(/INTERRUPTED/);
+    expect(msg).toMatch(/NOT running/);
+    expect(msg).toMatch(/will not resume on its own/);
+    expect(msg).toMatch(/Re-issue the download/);
+  });
+
+  it("does NOT migrate a TERMINAL record — its outcome was already delivered", () => {
+    // Re-landing a settled record would replay an event the caller already saw.
+    for (const status of ["done", "error", "cancelled"]) {
+      writeJob(oldDir, { id: `t-${status}`, status, updated: Date.now() });
+    }
+    expect(mod.migrateInFlightJobs(oldDir, dir)).toBe(0);
+  });
+
+  it("survives an unreadable record without dropping the others", () => {
+    writeFileSync(join(oldDir, `${mod.CONTROL_PREFIX}job-corrupt-owner.json`), "{not json");
+    writeJob(oldDir, { id: "good", status: "downloading", updated: Date.now() });
+    expect(mod.migrateInFlightJobs(oldDir, dir)).toBe(1);
+    expect(mod.readPersistedDownloadJob("good")).not.toBeNull();
+  });
+
+  it("returns 0 for a directory that does not exist", () => {
+    expect(mod.migrateInFlightJobs(join(oldDir, "nope"), dir)).toBe(0);
+  });
+
+  it("ignores non-job files in the old directory", () => {
+    writeFileSync(join(oldDir, `${mod.CONTROL_PREFIX}something.json`), JSON.stringify({ id: "x" }));
+    expect(mod.migrateInFlightJobs(oldDir, dir)).toBe(0);
+  });
+});

@@ -778,6 +778,33 @@ export class CodexBackend implements AgentBackend {
     }
   }
 
+  /**
+   * How long a turn's localImage files survive after the turn ends (#1152).
+   *
+   * The app-server may read a localImage well after turn/start returns, so the
+   * delete has to wait for a read whose timing we do not control. There is no
+   * signal for "the image was consumed" in the protocol, so this is a grace
+   * window rather than a handshake — chosen long enough to cover a deferred read
+   * on a busy machine, and bounded so the files do not accumulate for a session's
+   * whole lifetime.
+   */
+  private static readonly TEMP_IMAGE_GRACE_MS = 5 * 60_000;
+
+  /** Pending grace timers, so close() can clear them rather than leave them armed. */
+  private tempImageTimers = new Set<NodeJS.Timeout>();
+
+  /** Delete this turn's temp images after the grace window (#1152). */
+  private scheduleTempImageCleanup(files: string[]): void {
+    const timer = setTimeout(() => {
+      this.tempImageTimers.delete(timer);
+      void this.cleanupTempImages(files);
+    }, CodexBackend.TEMP_IMAGE_GRACE_MS);
+    // Must never keep the process alive: an orchestrator that has finished its
+    // work should exit, and close() sweeps the files regardless.
+    timer.unref?.();
+    this.tempImageTimers.add(timer);
+  }
+
   /** Delete the given temp image files (best-effort) and drop them from tracking. */
   private async cleanupTempImages(files: Iterable<string>): Promise<void> {
     for (const f of files) {
@@ -1355,10 +1382,24 @@ export class CodexBackend implements AgentBackend {
       // it during shutdown — don't resurrect a stale handler onto a dead client).
       if (client.notificationHandler && !client.exitError) client.notificationHandler = prev ?? null;
       this.turnId = null;
-      // Sweep this turn's temp image files now that the app-server has consumed
-      // them (the bytes were read at turn/start). Best-effort + non-blocking on the
-      // generator's teardown.
-      if (turnTempFiles.length) void this.cleanupTempImages(turnTempFiles);
+      // #1152 — the app-server does NOT necessarily read a localImage at
+      // turn/start, which is what this used to assume ("the bytes were read at
+      // turn/start"). A reporter saw the panel render a storyboard while the
+      // Codex turn reported the file gone:
+      //
+      //   Codex could not read the local image at …\comfyui-codex-<pid>-…png:
+      //   The system cannot find the file specified. (os error 2)
+      //
+      // Deleting at turn teardown therefore races a read that has not happened
+      // yet. Hold the files for a grace period instead: the cost of keeping a few
+      // PNGs in the OS temp dir for minutes is nothing next to an image the agent
+      // cannot see.
+      //
+      // The files stay in `tempImageFiles`, so close() still sweeps them — a
+      // pending timer is a delay, never the only thing standing between us and a
+      // leak. The timer is unref'd (it must not hold the process open) and
+      // tracked so close() can clear it.
+      if (turnTempFiles.length) this.scheduleTempImageCleanup(turnTempFiles);
     }
   }
 
@@ -1557,8 +1598,13 @@ export class CodexBackend implements AgentBackend {
         this.beginClientClose(candidate, "backend close teardown failed"),
       ),
     );
+    // #1152 — cancel the grace timers first. Their files are swept right below,
+    // so leaving them armed would only re-unlink paths that are already gone.
+    for (const t of this.tempImageTimers) clearTimeout(t);
+    this.tempImageTimers.clear();
     // Sweep any temp image files a turn didn't get to clean up (e.g. close() raced
-    // an in-flight turn). Snapshot first — cleanupTempImages mutates the set.
+    // an in-flight turn, or a grace window was still open). Snapshot first —
+    // cleanupTempImages mutates the set.
     if (this.tempImageFiles.size) {
       await this.cleanupTempImages([...this.tempImageFiles]).catch(() => {});
     }

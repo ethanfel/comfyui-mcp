@@ -192,6 +192,12 @@ function stubFetch(opts: {
   statusSequence?: unknown[];
   /** Fires when a queue op is submitted — lets a test make the install REAL. */
   onQueue?: () => void;
+  /**
+   * #1129 — status the queue op ITSELF answers with (403 = the 3.x
+   * security_level / allow_git_url_install gate, 404 = route not served here).
+   * The response describes the REQUEST, so nothing was queued.
+   */
+  queueOpStatus?: number;
 } = {}) {
   const calls: Call[] = [];
   let statusIdx = 0;
@@ -216,7 +222,21 @@ function stubFetch(opts: {
         return jsonResponse(s);
       }
       // queue ops + start return empty bodies
-      if (path.includes("/queue/")) opts.onQueue?.();
+      if (path.includes("/queue/")) {
+        // The install lands on /queue/install (3.x) or the /queue/task envelope
+        // with kind:"install" (v4) — match the OPERATION, not one route.
+        const isInstallOp =
+          path.includes("/queue/install") ||
+          (path.includes("/queue/task") &&
+            (body as { kind?: string } | undefined)?.kind === "install");
+        if (opts.queueOpStatus !== undefined && isInstallOp) {
+          return new Response(
+            "A security error has occurred. Please check the terminal logs",
+            { status: opts.queueOpStatus },
+          );
+        }
+        opts.onQueue?.();
+      }
       return new Response("", { status: 200 });
     },
   );
@@ -564,6 +584,106 @@ describe("node-management service", () => {
       const cloneEnv = (cloneCall![2] as { env?: Record<string, string> })?.env;
       expect(cloneEnv?.GIT_TERMINAL_PROMPT).toBe("0");
       expect(cloneEnv?.GIT_ASKPASS).toBe("echo");
+    });
+
+    // #1129 — a REFUSED enqueue is not the end of the road.
+    //
+    // The 3.x git-URL install is gated by security_level + allow_git_url_install,
+    // and a host that does not serve the route answers the same way. Both come
+    // back as a status on the POST, which throws — so the direct-clone fallback,
+    // which needs no Manager at all and is exactly what the user would do by
+    // hand, was unreachable in the one case it exists for. A reporter on legacy
+    // 3.x got "not reachable", then a 404 with "A security error has occurred",
+    // and was left with no install path on a machine whose custom_nodes
+    // directory was sitting right there.
+    // 405 is excluded on purpose: on this API it is the dialect-mismatch signal
+    // that the #646 self-heal retry owns, and the "no dialect self-heal" case
+    // below pins that.
+    for (const status of [403, 404]) {
+      it(`#1129: Manager REFUSES the git enqueue with ${status} → clones directly and says why`, async () => {
+        stubFetch({ installedBody: {}, queueOpStatus: status });
+        let cloned = false;
+        mockedExists.mockImplementation((p: unknown) => {
+          const s = String(p);
+          if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+          if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+          if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+          return false;
+        });
+        mockedExec.mockImplementation(((bin: string, args: string[]) => {
+          if (bin === "git" && args[0] === "clone") cloned = true;
+          return "";
+        }) as never);
+
+        const res = await installCustomNode({
+          id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        });
+
+        expect(res.mechanism).toBe("git-clone");
+        // The reason must be the REFUSAL, not "not in the registry" — that would
+        // be a wrong explanation for a correct action, and it is what a reader
+        // would go on to act on.
+        expect(res.message).toMatch(new RegExp(`REFUSED the git-URL install \\(HTTP ${status}\\)`));
+        expect(res.message).toMatch(/security_level \/ allow_git_url_install/);
+        expect(res.message).toMatch(/Nothing was queued there/);
+        expect(res.message).not.toMatch(/not in the ComfyUI-Manager registry/);
+        // And it actually cloned.
+        expect(
+          mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+        ).toBeDefined();
+      });
+    }
+
+    it("#1129: a 405 never produces a policy-refusal message", async () => {
+      // 405 is ComfyUI's frontend catchall answering a route registered under
+      // the other API generation. Cloning on it would pre-empt a Manager install
+      // that is about to succeed on the right route.
+      //
+      // Honest scope note: this pins the user-visible outcome, NOT the classifier
+      // branch. Re-admitting 405 to managerEnqueueRefusal does not change this
+      // test, because a 405 is consumed upstream — the POST-then-GET retry and
+      // then the dialect self-heal both act on it first, so it never reaches the
+      // classifier by this route. That is precisely why excluding it there is the
+      // conservative choice rather than a load-bearing one.
+      const { calls } = stubFetch({ installedBody: {}, queueOpStatus: 405 });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes(NODE_DIR_UTILS) || s.endsWith("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+      });
+
+      // It may still end up cloning (unregistered pack) — what must NOT happen is
+      // the refusal shortcut claiming a policy gate the server never asserted.
+      expect(res.message).not.toMatch(/REFUSED the git-URL install/);
+      // And the self-heal must have re-tried rather than giving up at the 405.
+      expect(calls.filter((c) => c.url.includes("/queue/")).length).toBeGreaterThan(1);
+    });
+
+    it("#1129: a 500 from the queue still THROWS — the task may have been accepted", async () => {
+      // The warrant for cloning is that nothing was queued. A 5xx says the
+      // handler fell over, which does not establish that — cloning underneath a
+      // Manager install writing to the same directory is the race this avoids.
+      stubFetch({ installedBody: {}, queueOpStatus: 500 });
+      mockedExists.mockImplementation(() => false);
+      mockedExec.mockImplementation((() => "") as never);
+
+      await expect(
+        installCustomNode({ id: "https://github.com/teskor-hub/comfyui-teskors-utils" }),
+      ).rejects.toThrow(/500/);
+      expect(
+        mockedExec.mock.calls.find((c) => c[0] === "git" && (c[1] as string[])[0] === "clone"),
+      ).toBeUndefined();
     });
 
     it("clones an unregistered git pack into opts.comfyuiPath when global COMFYUI_PATH is unset (#463)", async () => {
@@ -2057,6 +2177,31 @@ describe("node-management service", () => {
       // The URL is NOT forwarded as `id` too — the reroute off the id path is
       // the whole point; sending both leaves it to downstream precedence.
       expect(out.id).toBeUndefined();
+    });
+
+    // #789 RECURRENCE — the reroute cannot fix an UNREGISTERED pack.
+    //
+    // The original report was a registered pack with the wrong version spec, which
+    // "nightly" fixes. The recurrence was ComfyUI-MiniMaxH3-FirstBlockCache, which
+    // is in no registry: Manager v4's do_install resolves by pack ID and never by
+    // URL (3.x's files:[url] clone path does not exist there), so a v4 host has NO
+    // Manager route for it by any spelling, and the panel cannot clone — it is
+    // browser JS. The reporter was left at "not found" and had to find the working
+    // tool themselves.
+    it("names install_custom_node, the tool that CAN finish an unregistered pack", () => {
+      const out = normalizeGitUrlInstallArgs({ id: URL });
+      expect(out.note).toMatch(/install_custom_node/);
+      expect(out.note).toMatch(/source:"git"/);
+      // The trigger the caller will actually see from the Manager.
+      expect(out.note).toMatch(/not found.*not available node|not available node/);
+      // And its precondition — the clone writes to the server's filesystem.
+      expect(out.note).toMatch(/LOCAL ComfyUI/);
+    });
+
+    it("does not offer the escape hatch when the caller pinned a version", () => {
+      // No reroute happened, so there is no note at all — a pinned version is the
+      // caller's own choice and gets no advice it did not ask for.
+      expect(normalizeGitUrlInstallArgs({ id: URL, version: "8.28.3" }).note).toBeUndefined();
     });
 
     it("translates an explicit 'latest' on a git URL to 'nightly' (the #789 failure shape)", () => {

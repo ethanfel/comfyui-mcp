@@ -51,18 +51,26 @@ vi.mock("../../config.js", () => ({
   isRemoteMode: () => h.remote,
 }));
 
-vi.mock("../../comfyui/client.js", () => ({
-  getSystemStats: vi.fn(async () => ({ system: { argv: [join("ComfyUI", "main.py")] } })),
-  getClient: () => ({
-    fetchApi: async (path: string) => {
-      h.fetchCalls.push(path);
-      const category = path.replace(/^\/models\//, "");
-      const listing = h.liveListings[category];
-      if (listing === undefined) return { ok: false, json: async () => null };
-      return { ok: true, json: async () => listing };
-    },
-  }),
-}));
+vi.mock("../../comfyui/client.js", () => {
+  // Declared INSIDE the factory: `vi.mock` is hoisted above every top-level
+  // const, so a shared double defined out there is read before it exists. `h` is
+  // fine to close over — it is `vi.hoisted`.
+  const listingFetch = async (path: string) => {
+    h.fetchCalls.push(path);
+    const category = path.replace(/^\/models\//, "");
+    const listing = h.liveListings[category];
+    if (listing === undefined) return { ok: false, status: 404, json: async () => null };
+    return { ok: true, status: 200, json: async () => listing };
+  };
+  return {
+    getSystemStats: vi.fn(async () => ({ system: { argv: [join("ComfyUI", "main.py")] } })),
+    getClient: () => ({ fetchApi: listingFetch }),
+    // #385 — call sites moved from `client.fetchApi` to `comfyApiFetch`, which
+    // returns a 4xx instead of throwing. Same double, so `h.fetchCalls` records
+    // the identical routes and every assertion in this file is unchanged.
+    comfyApiFetch: listingFetch,
+  };
+});
 
 vi.mock("../../services/node-management.js", () => ({
   installModelViaManager: vi.fn(),
@@ -188,6 +196,34 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     expect(msg).toMatch(/does not read from it/);
     expect(msg).toMatch(/DIFFERENT install/);
     expect(msg).toMatch(/127\.0\.0\.1:8188/);
+  });
+
+  // #1147 — an EMPTY live listing is not disagreement.
+  //
+  // A reporter's portable install held models/birefnet/BiRefNet_lite/model.safetensors
+  // (a HuggingFace repo dump) while the running server's /models/birefnet answered
+  // empty. Their loras/ agreed with the live server perfectly and argv pointed at
+  // that very tree — and the download was refused into the correct install.
+  //
+  // The #369 signature this guard exists for is a POPULATED listing describing a
+  // DIFFERENT tree (3 on disk, 24 unrelated live). "0 live entries" cannot tell
+  // "wrong install" from "a category this server does not enumerate the way a
+  // filesystem walk does", so it is not positive evidence and must not refuse.
+  it("#1147: PROCEEDS when the live listing for a populated category is EMPTY", async () => {
+    h.onDisk = { birefnet: ["BiRefNet_lite/model.safetensors"] };
+    h.liveListings["birefnet"] = []; // registered, answers, names nothing
+    h.liveListings["loras"] = ["agreed.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBeTruthy();
+  });
+
+  it("#1147: still REFUSES when that same category lists OTHER files", async () => {
+    // The guard must not be blunted: a populated listing that omits the on-disk
+    // files is the real #369 signature and still fails closed.
+    h.onDisk = { birefnet: ["BiRefNet_lite/model.safetensors"] };
+    h.liveListings["birefnet"] = ["someone-elses.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("birefnet")).rejects.toThrow(ModelError);
   });
 
   it("REFUSES on a POPULATED SIBLING when the target category is empty (codex gate)", async () => {
@@ -416,13 +452,31 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.verifiedPath).toBe(real);
   });
 
-  it("reports NOT-VISIBLE (naming the server's real models dir) when the file is invisible", async () => {
+  // This test's own fixture writes INTO /live/ComfyUI/models — the very root the
+  // running server reported — so its original assertion ("move the file into the
+  // running server's models tree") was pinning #1131: an instruction naming the
+  // directory the file was already in. The verdict is unchanged; the remedy is
+  // the stale-listing one, and the outside-the-root case is covered below.
+  it("reports NOT-VISIBLE and blames the stale listing when the file is inside the live root", async () => {
     h.liveListings["loras"] = ["something-else.safetensors"];
     const res = await verifyLandedModel(target, "loras", { attempts: 2, retryMs: 0 });
     expect(res.liveVisible).toBe("not-visible");
     expect(res.verifiedPath).toBe(target);
+    expect(res.note).toMatch(/does not list "new\.safetensors" under "loras" YET/);
+    expect(res.note).toMatch(/Do NOT move the file/);
+    expect(res.note).not.toMatch(/Move the file into the running server's models tree/);
+    expect(res.note).toContain(resolve("/live/ComfyUI/models"));
+  });
+
+  it("still says MOVE IT when the file is outside the live models root", async () => {
+    const stray = resolve("/somewhere/else/new.safetensors");
+    realpathMock.mockImplementation(async () => stray);
+    h.liveListings["loras"] = ["something-else.safetensors"];
+    const res = await verifyLandedModel(target, "loras", { attempts: 2, retryMs: 0 });
+    expect(res.liveVisible).toBe("not-visible");
     expect(res.note).toMatch(/does NOT list "new\.safetensors"/);
     expect(res.note).toMatch(/will not be usable/);
+    expect(res.note).toMatch(/Move the file into the running server's models tree/);
     expect(res.note).toContain(resolve("/live/ComfyUI/models"));
   });
 

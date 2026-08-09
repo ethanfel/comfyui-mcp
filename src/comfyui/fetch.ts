@@ -2,7 +2,7 @@ import { getComfyUIAuthHeaders } from "../config.js";
 import { describeFetchFailure, isBareFetchFailure } from "../utils/errors.js";
 
 /** The request target, for the diagnostic. Never throws on an odd input. */
-function targetOf(input: string | URL | Request): string {
+export function targetOf(input: string | URL | Request): string {
   try {
     if (typeof input === "string") return input;
     if (input instanceof URL) return input.href;
@@ -65,7 +65,7 @@ function originOf(target: string): string | undefined {
  *                   handshake carried no usable Origin. Say nothing about drift;
  *                   an absent comparison is not a negative result.
  */
-function describeTargetDrift(target: string): string {
+export function describeTargetDrift(target: string): string {
   const origins = (() => {
     try {
       return connectedPanelOrigins?.() ?? [];

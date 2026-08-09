@@ -20,7 +20,7 @@
 
 import { ComfyUIError } from "../utils/errors.js";
 import { getComfyUIAuthHeaders, getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch } from "./fetch.js";
+import { comfyuiFetch, targetOf } from "./fetch.js";
 
 /** What answered instead of the ComfyUI JSON API. */
 export type NonJsonKind =
@@ -62,6 +62,17 @@ export function isNonJsonResponseError(err: unknown): err is NonJsonResponseErro
 }
 
 const REDACTED = "«redacted»";
+
+/**
+ * The same marker, spelled for a URL component.
+ *
+ * `«redacted»` is non-ASCII, so putting it in a query value, a path segment or
+ * userinfo gets it percent-encoded to `%C2%ABredacted%C2%BB` on the way out.
+ * That leaves one message carrying two spellings of the same word, and — the
+ * part that actually costs something — a triage grep for `«redacted»` silently
+ * misses every URL occurrence. ASCII here keeps one greppable spelling.
+ */
+const URL_REDACTED = "REDACTED";
 
 /**
  * Collapse a body to a short single-line prefix for the message.
@@ -295,6 +306,232 @@ export function scrubSecretShapedText(text: string): string | null {
   return out;
 }
 
+/**
+ * Query parameters worth PRINTING, which is the only list that can be complete.
+ *
+ * The first version of this went the other way — a list of credential-ish NAMES
+ * (`token`, `secret`, `signature`, …) to redact. Probing it with sixteen
+ * credential-carrying URLs leaked nine of them: `?t=`, `?jwt=`, `?ticket=`,
+ * `?nonce=`, `?otp=`, `?hmac=`, `?bearer=`, `?SAMLResponse=` and a
+ * `;jsessionid=` matrix parameter all sailed through, because the set of names
+ * a gateway might use for a credential is open and the set I can think of is
+ * not. That is the same failure the credential-encoding list in
+ * `reflectionVariants` documents above: enumerate a family by hand and you miss
+ * a member.
+ *
+ * So this is inverted and FAILS CLOSED. Only parameters this codebase itself
+ * sends to ComfyUI are shown; every other value is redacted whatever it is
+ * called. The cost is bounded and small — the origin, the path and every
+ * parameter NAME still print, which is what identifies the responder — while
+ * the benefit is that an unfamiliar parameter cannot leak by default.
+ */
+const SHOWABLE_PARAMS: ReadonlySet<string> = new Set([
+  "clientid",
+  "client_id",
+  "filename",
+  "subfolder",
+  "type",
+  "types",
+  "dir",
+  "recurse",
+  "split",
+  "node_id",
+  "ref",
+  "name",
+  "mode",
+  "raw",
+  "template",
+  "max_items",
+  "version_id",
+  "id",
+  "ui_id",
+  "format",
+  "channel",
+  "preview",
+  "overwrite",
+  "skip_update",
+  "blobs",
+  "input",
+  "response_type",
+  "scope",
+  "code_challenge_method",
+]);
+
+/**
+ * The subset of SHOWABLE_PARAMS whose values are legitimately LONG free text —
+ * user-supplied paths and titles — and so must not be length-checked.
+ *
+ * Everything else on the allowlist keeps the opaque-run check on its value. The
+ * names there are generic enough (`id`, `ref`, `type`, `mode`, `input`, `raw`,
+ * `channel`) that a third-party gateway is as likely to pick one as ComfyUI is,
+ * and a JWT under `?id=` or an access key under `?ref=` should not print merely
+ * because ComfyUI also happens to use that word. Dropping the check for ALL 31
+ * names — which is what the long-filename fix did — was wider than the evidence
+ * justified (review finding 2).
+ *
+ * `redirect_uri` was removed from the allowlist entirely rather than added here:
+ * its value is an arbitrary URL, so a nested `?session=…` prints whole and no
+ * length rule can see it, `:` and `?` being outside the opaque alphabet.
+ */
+const LONG_TEXT_PARAMS: ReadonlySet<string> = new Set([
+  "filename",
+  "subfolder",
+  "dir",
+  "template",
+]);
+// `name` is deliberately NOT here, though it was in the review's suggested set:
+// probing found `?name=AKIAIOSFODNN7EXAMPLEwJalrXUtnFEMI` printing in full. A
+// pack or model name long enough to trip the length check is rare and costs
+// only a redacted word in a diagnostic; an access key printing costs more.
+
+/** A single opaque run long enough to be a credential and nothing else. Reused
+ *  from the body scrubber's pass 3, but applied PER COMPONENT so an ordinary
+ *  host+path — which is one long run of exactly this alphabet — survives. */
+const OPAQUE_RUN = /^[A-Za-z0-9\-._~+/=%]{24,}$/;
+
+/**
+ * A parameter value may be printed only if we recognise the NAME, and — unless
+ * the name is one that legitimately carries long free text — only if the value
+ * is not itself credential-shaped.
+ *
+ * The long-text exemption exists because live-testing a missing `/view` produced
+ *
+ *     /view?filename=«redacted»&type=input&subfolder=
+ *
+ * — the opaque-run alphabet is letters, digits, `-`, `.` and `_`, so any
+ * filename of 24 characters or more matched it, and the message threw away the
+ * single most useful fact it had. The exemption is scoped to LONG_TEXT_PARAMS
+ * rather than applied to the whole allowlist: a JWT under `?id=` is still a JWT.
+ */
+function isShowableParam(name: string, value: string): boolean {
+  const n = name.toLowerCase();
+  if (!SHOWABLE_PARAMS.has(n)) return false;
+  return LONG_TEXT_PARAMS.has(n) || !OPAQUE_RUN.test(value);
+}
+
+/**
+ * One path segment, with the parts that can carry a credential removed.
+ *
+ * Two shapes hide in a path. A whole segment can BE a token (`/t/<40 chars>/x`),
+ * and a MATRIX PARAMETER can append one to an ordinary segment
+ * (`/logs;jsessionid=…`) — the latter is under the opaque-run threshold and was
+ * missed entirely by the first version. The head of the segment is kept either
+ * way, because that is the route and the route is the diagnosis.
+ */
+function scrubPathSegment(segment: string): string {
+  if (OPAQUE_RUN.test(segment)) return URL_REDACTED;
+  if (!segment.includes(";") && !segment.includes("=")) return segment;
+  const [head, ...matrix] = segment.split(";");
+  const eq = head.indexOf("=");
+  const safeHead = eq === -1 ? head : `${head.slice(0, eq)}=${URL_REDACTED}`;
+  return matrix.length > 0 ? `${safeHead};${URL_REDACTED}` : safeHead;
+}
+
+/**
+ * A URL that is safe to put in an error message (codex gate, finding 6).
+ *
+ * `bodyPrefixOf` scrubs the BODY, and until now nothing scrubbed the URL —
+ * which was fine while every diagnosis was built from a base URL we composed
+ * ourselves, and stopped being fine once `guardClientFetch` started reporting
+ * `Response.url`. That is the url AFTER redirects, so an identity proxy that
+ * bounces the request to an SSO endpoint (`?code=…&state=…`), or a gateway that
+ * hands back a presigned object URL (`?X-Amz-Signature=…`), puts a live
+ * credential in it. The diagnosis is shown to the agent and routinely pasted
+ * into bug reports.
+ *
+ * `scrubSecretShapedText` cannot be used for this: its opaque-run pass matches
+ * 24+ characters of an alphabet that includes `/`, `.` and `-`, so an ordinary
+ * `https://comfy.example.com/api/v1/internal/logs` collapses to `https:«redacted»`
+ * and the diagnosis loses the one fact it exists to report. This redacts by URL
+ * STRUCTURE instead, and FAILS CLOSED on the parts that can carry a secret:
+ *
+ *   - userinfo                → always redacted
+ *   - query/fragment values   → redacted unless the NAME is one this codebase
+ *                               sends (SHOWABLE_PARAMS); for those, the value is
+ *                               additionally length-checked unless the name is
+ *                               one that carries long free text (LONG_TEXT_PARAMS)
+ *   - path segments           → redacted when opaque, or when carrying a matrix
+ *                               parameter (`;jsessionid=…`); applied to a
+ *                               RELATIVE target too, not only an absolute one
+ *   - non-http(s) schemes     → refused outright rather than parsed
+ *   - origin, route, param NAMES → always kept; they are the diagnosis
+ *
+ * Residual, stated rather than papered over: a SHORT secret sitting in a bare
+ * path segment (`/t/abc123/logs`) is indistinguishable from a route and is not
+ * redacted. Redacting it would mean redacting every path, which would leave the
+ * message unable to say what was requested.
+ *
+ * Returns the ORIGINAL string when nothing needed redacting, so a clean URL is
+ * never reformatted by a round-trip through the URL parser.
+ */
+export function redactUrlForDiagnosis(raw: string): string {
+  let u: URL | null = null;
+  try {
+    const parsed = new URL(raw);
+    // `data:`, `blob:` and `about:` DO parse, but they are "cannot-be-a-base"
+    // URLs whose `pathname` setter is a spec'd silent no-op — so the path scrub
+    // below would report success and change nothing, the sole fail-OPEN path in
+    // a function documented as fail-closed (review finding 5). A ComfyUI target
+    // is always http(s); anything else is refused rather than trusted.
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") u = parsed;
+  } catch {
+    u = null;
+  }
+  if (!u) {
+    // Relative (`/settings/<id>`, a test double's target), malformed, or an
+    // opaque scheme. There is no origin to reason about, but a relative path can
+    // still carry an opaque segment or a matrix parameter, so it gets the SAME
+    // per-segment scrub as an absolute one (review finding 4) — an asymmetry
+    // here is a trap for the next caller. The query/fragment cannot be parsed
+    // safely, so it is withheld rather than printed unexamined.
+    const cut = raw.search(/[?#]/);
+    const path = cut === -1 ? raw : raw.slice(0, cut);
+    const scrubbedPath = path.split("/").map(scrubPathSegment).join("/");
+    return cut === -1 ? scrubbedPath : `${scrubbedPath} (query withheld: unparsable URL)`;
+  }
+
+  let changed = false;
+  if (u.username || u.password) {
+    u.username = URL_REDACTED;
+    u.password = "";
+    changed = true;
+  }
+  // Rebuilt rather than mutated in place: `searchParams.set` COLLAPSES repeated
+  // keys onto the first occurrence, so `?a=1&code=…&a=2` would silently lose a
+  // value while claiming only to redact one.
+  const rebuilt = new URLSearchParams();
+  let paramsChanged = false;
+  for (const [name, value] of u.searchParams) {
+    if (value && !isShowableParam(name, value)) {
+      rebuilt.append(name, URL_REDACTED);
+      paramsChanged = true;
+    } else {
+      rebuilt.append(name, value);
+    }
+  }
+  if (paramsChanged) {
+    u.search = rebuilt.toString();
+    changed = true;
+  }
+  // The FRAGMENT is where an OAuth implicit flow puts its access token, and it
+  // is never needed to identify a route. Any fragment carrying `=` goes.
+  if (u.hash.includes("=")) {
+    u.hash = URL_REDACTED;
+    changed = true;
+  }
+  // A token can also ride in the path (`/api/v1/<opaque>/logs`, or a
+  // `;jsessionid=` matrix parameter). Judge each segment on its own so a long
+  // ROUTE is not mistaken for a long secret.
+  const segments = u.pathname.split("/");
+  const scrubbed = segments.map(scrubPathSegment);
+  if (scrubbed.some((s, i) => s !== segments[i])) {
+    u.pathname = scrubbed.join("/");
+    changed = true;
+  }
+
+  return changed ? u.href : raw;
+}
+
 /** Back-compat alias: the known-value redaction is now one pass of the
  *  shape-based scrubber. Callers that only want "is this safe to print" should
  *  use `scrubSecretShapedText`/`bodyPrefixOf`. */
@@ -370,16 +607,69 @@ function looksLikeProxyErrorPage(body: string): boolean {
 }
 
 /**
+ * `503` or `503 Origin warming up` — the code, plus the reason phrase when the
+ * responder wrote one worth reading.
+ *
+ * A CUSTOM phrase is often the single most useful token in the whole response:
+ * a CDN's "Origin warming up", a gateway's "Backend read timeout". The standard
+ * phrase for a code is noise beside the code itself, so it is dropped.
+ */
+export function describeStatus(status: number, statusText?: string): string {
+  const text = (statusText ?? "").trim();
+  if (!text) return String(status);
+  if (STANDARD_REASON_PHRASES.has(text.toLowerCase())) return String(status);
+  // A phrase is a short label, not a document. Anything longer is a body that
+  // escaped into the status line and is not worth the room.
+  const clipped = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  // Reason phrases are attacker-influenceable on a hostile proxy, and this one
+  // is interpolated into a message the agent reads. Same scrub the body gets.
+  const safe = scrubSecretShapedText(clipped);
+  return safe === null ? String(status) : `${status} ${safe}`;
+}
+
+/** Reason phrases that merely restate their code. Lowercased for comparison. */
+const STANDARD_REASON_PHRASES: ReadonlySet<string> = new Set([
+  "ok",
+  "no content",
+  "moved permanently",
+  "found",
+  "not modified",
+  "bad request",
+  "unauthorized",
+  "forbidden",
+  "not found",
+  "method not allowed",
+  "request timeout",
+  "conflict",
+  "payload too large",
+  "unprocessable entity",
+  "too many requests",
+  "internal server error",
+  "not implemented",
+  "bad gateway",
+  "service unavailable",
+  "gateway timeout",
+]);
+
+/**
  * Classify a non-JSON response body. Pure (no I/O) so the classification rules
  * are unit-testable without a server.
  */
 export function classifyNonJson(args: {
   url: string;
   status: number;
+  /** The reason phrase, when the responder sent a meaningful one. `503 Origin
+   *  warming up` says more than `503`, and it was being dropped. Standard
+   *  phrases add nothing next to the code and are omitted. */
+  statusText?: string;
   contentType: string;
   body: string;
 }): NonJsonDiagnosis {
-  const { url, status, contentType, body } = args;
+  const { status, contentType, body } = args;
+  // Redacted HERE rather than at the call sites, so no future caller can
+  // reintroduce the leak by composing a url that carries a credential.
+  const url = redactUrlForDiagnosis(args.url);
+  const reason = describeStatus(status, args.statusText);
   const bodyPrefix = bodyPrefixOf(body);
   // EVIDENCE, not the header's claim. `claimsHtml` is reported as a claim; only
   // `html` (the body really is markup) may drive a diagnosis.
@@ -401,6 +691,12 @@ export function classifyNonJson(args: {
   const loginPage = html && looksLikeLoginPage(body);
   const gatewayStatus = status === 502 || status === 503 || status === 504;
   const authStatus = status === 401 || status === 403;
+  // An EMPTY body is its own observation and deserves its own sentence. It is
+  // what a parser reports as "Unexpected end of JSON input" — the message #828
+  // and #1160 were reported as — and the generic "did not parse as JSON and is
+  // not markup either" reads as though there WAS a body to inspect, sending the
+  // reader to look at a body prefix that says "(empty)".
+  const empty = body.trim() === "";
 
   let kind: NonJsonKind;
   let cause: string;
@@ -428,6 +724,20 @@ export function classifyNonJson(args: {
     cause = looksLikeComfyFrontend(body)
       ? "the ComfyUI web FRONTEND answered this path (its markers are in the body) instead of the ComfyUI HTTP API — typically a reverse proxy that forwards the UI but not the API routes, or a base URL pointing at the frontend's catch-all"
       : "some HTTP responder other than the ComfyUI JSON API answered this path; this body alone does not identify which. The usual candidates are the ComfyUI frontend's SPA catch-all, a reverse proxy that forwards the UI but not the API routes, a maintenance/WAF page, or an unrelated web app on this host";
+  } else if (empty) {
+    // A 404 with nothing in it is still "that route is not served here", and
+    // saying so is more use than a generic parse complaint.
+    kind = status === 404 ? "not-found" : "not-json";
+    cause =
+      `NOTHING was sent back — the response carried no body at all, so the ${status} status is the entire message ` +
+      `and this response does not identify what produced it. That is what a JSON parser reports as ` +
+      `"Unexpected end of JSON input", and it is equally consistent with ComfyUI itself answering the status ` +
+      `without an error document, with a proxy or gateway ending the exchange after the headers, and with a route ` +
+      `that is not served here at all. Nothing in this response distinguishes them` +
+      (status >= 200 && status < 300
+        ? `, and note the status is a SUCCESS one — an empty 2xx where a JSON document was promised points at ` +
+          `something answering on ComfyUI's behalf rather than at ComfyUI`
+        : ``);
   } else if (malformedJson) {
     kind = "not-json";
     // OBSERVED: the body starts with `{` or `[` and JSON.parse rejects it. That
@@ -453,16 +763,18 @@ export function classifyNonJson(args: {
 
   const what = html
     ? "an HTML page"
-    : malformedJson
-      ? "a body that begins like JSON but does not parse"
-      : contentType
-        ? `a ${contentType} body that did not parse as JSON`
-        : "a body that did not parse as JSON";
+    : empty
+      ? "an EMPTY body"
+      : malformedJson
+        ? "a body that begins like JSON but does not parse"
+        : contentType
+          ? `a ${contentType} body that did not parse as JSON`
+          : "a body that did not parse as JSON";
   const message =
-    `${url} answered ${status} with ${what} where JSON was expected. This means ${cause}. ` +
+    `${url} answered ${reason} with ${what} where JSON was expected. This means ${cause}. ` +
     `Content-Type: ${contentType || "(none)"}. Body starts: ${bodyPrefix || "(empty)"}. ` +
     `Confirm the configured ComfyUI base URL really is a ComfyUI API root — a URL that loads the ComfyUI UI in a browser is not proof, because the UI is served by the same catch-all that produced this page. ` +
-    `The check is that ${getComfyUIBaseUrl()}/system_stats returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong` +
+    `The check is that ${redactUrlForDiagnosis(getComfyUIBaseUrl())}/system_stats returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong` +
     // The credential instruction must follow the same evidence rule as the
     // diagnosis above. Only a body-confirmed sign-in page justifies "give it to
     // the gateway"; a bare 401/403 could equally be ComfyUI's own auth layer, and
@@ -501,32 +813,121 @@ export async function readComfyJson<T = unknown>(
     parsed = JSON.parse(body);
   } catch {
     throw new NonJsonResponseError(
-      classifyNonJson({ url: opts.url, status: res.status, contentType, body }),
+      classifyNonJson({
+        url: opts.url,
+        status: res.status,
+        statusText: res.statusText,
+        contentType,
+        body,
+      }),
     );
   }
+  // Every url that reaches a MESSAGE goes through the same redaction as the one
+  // in classifyNonJson — these two paths build their text by hand.
+  const safeUrl = redactUrlForDiagnosis(opts.url);
   if (!res.ok) {
     // Valid JSON, but an error status — surface it verbatim rather than as a
     // shape failure; the server told us something specific.
     throw new ComfyUIError(
-      `${opts.url} returned ${res.status}: ${bodyPrefixOf(body)}`,
+      `${safeUrl} returned ${describeStatus(res.status, res.statusText)}: ${bodyPrefixOf(body)}`,
       "HTTP_ERROR",
     );
   }
   if (opts.expectShape && !opts.expectShape(parsed)) {
     throw new NonJsonResponseError({
       kind: "not-json",
-      url: opts.url,
+      url: safeUrl,
       status: res.status,
       contentType,
       bodyPrefix: bodyPrefixOf(body),
       message:
-        `${opts.url} answered ${res.status} with valid JSON that is not ${opts.shapeHint ?? "the expected document"}. ` +
+        `${safeUrl} answered ${res.status} with valid JSON that is not ${opts.shapeHint ?? "the expected document"}. ` +
         `Something other than ComfyUI is very likely answering this route (an API gateway's own JSON error envelope, or a different service on this host). ` +
         `Body starts: ${bodyPrefixOf(body)}.` +
         (jsonish ? "" : ` (Content-Type was ${contentType || "(none)"}.)`),
     });
   }
   return parsed as T;
+}
+
+/**
+ * Wrap the `fetch` handed to the ComfyUI client library so the library's own
+ * error path cannot EAT the response (#828, #1160).
+ *
+ * `Client.fetchApi` does this on every status outside [200, 400):
+ *
+ *     if (status < 200 || status >= 400)
+ *       return res.json().then(body => { throw new Error(`Endpoint Bad Request (${status} ${statusText}): ${url}`) })
+ *
+ * — it reads the ERROR body as JSON in order to attach it to the error it is
+ * about to throw. When that body is not JSON, `res.json()` rejects FIRST, and
+ * its bare SyntaxError propagates in place of the library's error, so the
+ * status, the statusText and the URL are all lost. The failure is upstream of
+ * every `client.fetchApi` call site, which is why guarding them one at a time
+ * kept missing it:
+ *
+ *   - #828: a remote `/internal/logs` answered non-2xx with an empty body after
+ *     a reconnect, and surfaced as
+ *     `Failed to fetch ComfyUI logs after reconnect retry: Unexpected end of JSON input`.
+ *   - #1160: `upload_image` on an authenticated remote surfaced as a bare
+ *     `Unexpected end of JSON input` even though `uploadImageHttp`'s SUCCESS
+ *     path already runs `readComfyJson` — the auth gate's 401/403 made the
+ *     library throw before that code ever saw the response, so its own
+ *     `if (!res.ok)` branch was unreachable.
+ *
+ * The wrapper overrides `json()` on the returned Response so a parse failure
+ * throws the diagnosis instead of a SyntaxError. It deliberately does NOT read
+ * the body up front: the override consumes the stream at exactly the moment the
+ * original `json()` would have, so `text()`, `body` and `bodyUsed` are unchanged
+ * for every caller that does not call `json()` — including `readComfyJson`,
+ * which reads `text()` and keeps its own richer shape checking.
+ *
+ * KNOWN GAP, written down because the override is otherwise invisible: it is an
+ * OWN property of this Response, so it does NOT survive `res.clone()` or
+ * `new Response(res.body)` — a clone's `json()` is the prototype's again and
+ * throws a bare SyntaxError. Nothing in src/ clones a guarded response today
+ * (checked), so this is latent rather than live; anything that starts to should
+ * read `text()` and classify it directly instead.
+ *
+ * Applied to ALL statuses, not just the ones the library throws on: a 200 that
+ * carries an HTML catch-all is the same defect one layer over, and the override
+ * costs nothing on a response nobody parses.
+ */
+export function guardClientFetch(
+  base: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+): (input: string | URL | Request, init?: RequestInit) => Promise<Response> {
+  return async (input, init) => {
+    const res = await base(input, init);
+    // Bind before overriding: the override must reach the REAL reader, and
+    // `res.text` would otherwise still resolve through the prototype anyway —
+    // binding makes that independent of anything else patching the instance.
+    const readText = res.text.bind(res);
+    // `url` on a real fetch Response is the FINAL url after redirects, which is
+    // the more useful one to name. Falling back to the request target keeps the
+    // message honest for a synthesised response (a test double, a mock).
+    const url = res.url || targetOf(input);
+    Object.defineProperty(res, "json", {
+      configurable: true,
+      writable: true,
+      value: async (): Promise<unknown> => {
+        const body = await readText();
+        try {
+          return JSON.parse(body);
+        } catch {
+          throw new NonJsonResponseError(
+            classifyNonJson({
+              url,
+              status: res.status,
+              statusText: res.statusText,
+              contentType: res.headers.get("content-type") ?? "",
+              body,
+            }),
+          );
+        }
+      },
+    });
+    return res;
+  };
 }
 
 /** Fetch a ComfyUI endpoint and parse it as JSON with the guard above. */
@@ -594,6 +995,20 @@ export function redactedError(err: unknown): unknown {
  * signature of a client library that called `res.json()` itself and so gave us
  * no URL, status, or content type to report.
  */
+/**
+ * Did this error PROVE the response was not JSON?
+ *
+ * Two shapes prove it now, and code that picks between competing errors has to
+ * accept both. `looksLikeHtmlParsedAsJson` recognises a raw parser message, which
+ * was the only shape available while the client library did the parsing. Since
+ * `guardClientFetch`, that same failure arrives as a NonJsonResponseError whose
+ * message contains no parser text at all — so a predicate written against the
+ * old shape silently answers "no" for the strongest evidence we have.
+ */
+export function provesNonJsonAnswer(err: unknown): boolean {
+  return isNonJsonResponseError(err) || looksLikeHtmlParsedAsJson(err);
+}
+
 export function looksLikeHtmlParsedAsJson(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   // Require a MARKUP indicator, not merely "is not valid JSON" (codex gate,
@@ -625,7 +1040,13 @@ export async function diagnoseComfyEndpoint(url: string): Promise<NonJsonDiagnos
       JSON.parse(body);
       return null; // it parses now — we cannot claim the earlier body was HTML
     } catch {
-      return classifyNonJson({ url, status: res.status, contentType, body });
+      return classifyNonJson({
+        url,
+        status: res.status,
+        statusText: res.statusText,
+        contentType,
+        body,
+      });
     }
   } catch {
     return null; // probe failed; we learned nothing and must not invent a cause
@@ -641,6 +1062,12 @@ export async function diagnoseComfyEndpoint(url: string): Promise<NonJsonDiagnos
  * happened to be conclusive).
  */
 export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promise<never> {
+  // Already a FIRST-HAND diagnosis of the response that actually failed — since
+  // guardClientFetch, the library's own parse throws one of these. Re-probing
+  // would replace evidence from the failing response with a guess from a
+  // different, later one, which is the exact trade this function's own comment
+  // warns against.
+  if (isNonJsonResponseError(err)) throw err;
   if (looksLikeHtmlParsedAsJson(err)) {
     const diagnosis = await diagnoseComfyEndpoint(url);
     if (diagnosis) {
@@ -658,7 +1085,7 @@ export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promi
         ...diagnosis,
         message:
           `The request failed while parsing the response as JSON: ${original} ` +
-          `A follow-up probe of ${url} — a separate request, so not necessarily the same response — found: ${diagnosis.message}`,
+          `A follow-up probe of ${redactUrlForDiagnosis(url)} — a separate request, so not necessarily the same response — found: ${diagnosis.message}`,
       });
     }
   }

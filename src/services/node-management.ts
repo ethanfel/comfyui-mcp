@@ -267,6 +267,9 @@ async function managerFetch<T>(
 
   if (!res.ok) {
     if (soft) return undefined;
+    // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+    // HTTP status is reported either way, so an unreadable body costs detail in the
+    // text, never a wrong conclusion. Verified there is no branch on this value.
     const text = await res.text().catch(() => "");
     throw new NodeManagementError(
       `ComfyUI-Manager API ${res.status} ${res.statusText} for ${path}` +
@@ -2018,13 +2021,54 @@ function discardFailedClone(nodeDir: string, alreadyPresent: boolean): string {
   }
 }
 
+/**
+ * Did ComfyUI-Manager REFUSE the enqueue outright, before queueing anything? (#1129)
+ *
+ * A git-URL install is gated server-side by `security_level` and
+ * `allow_git_url_install`, and a legacy 3.x host that does not serve the route at
+ * all answers the same way. All three arrive as a status on the POST itself:
+ *
+ *   403 — "A security error has occurred" (the policy gate)
+ *   404 — the route is not registered on this build
+ *
+ * 405 is deliberately NOT here. On this API it is the DIALECT-MISMATCH signal
+ * (ComfyUI's frontend catchall answering a route registered under the other
+ * generation), and the self-heal retry in #646 already owns it — diverting to a
+ * clone would pre-empt a Manager install that is about to succeed on the right
+ * route.
+ *
+ * What matters is not which one, but that the response describes the REQUEST
+ * rather than a task: nothing was queued, so nothing is running, so a direct
+ * clone afterwards cannot race a Manager install writing to the same directory.
+ * That is the whole warrant for continuing — and it is why 5xx is excluded, where
+ * a task may well have been accepted before the handler fell over.
+ *
+ * Returns the status, or undefined when the failure is anything else (a transport
+ * error, a timeout, a 500) and must keep propagating.
+ */
+function managerEnqueueRefusal(err: unknown): number | undefined {
+  if (!(err instanceof NodeManagementError)) return undefined;
+  const status = (err.details as { status?: unknown } | undefined)?.status;
+  if (typeof status !== "number") return undefined;
+  return status === 403 || status === 404 ? status : undefined;
+}
+
 async function cloneCustomNodeFallback(
   gitId: string,
   repoName: string,
   gitRef: string | undefined,
   managerStatus: unknown,
   basePath?: string,
+  /**
+   * #1129 — why we are here, when it was NOT "the pack is unregistered". The
+   * refusal messages below name that reason by default, and stating it for a
+   * policy refusal would be a wrong explanation for a correct action; the caller
+   * that knows better passes its own.
+   */
+  opts?: { managerRefusalNote?: string },
 ): Promise<NodeOpResult> {
+  const because =
+    opts?.managerRefusalNote ?? `"${repoName}" is not in the ComfyUI-Manager registry`;
   // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
   // adopted saved-default/live root here WITHOUT mutating global config, so a
   // panel-connected local session with no COMFYUI_PATH can still clone an
@@ -2036,7 +2080,7 @@ async function cloneCustomNodeFallback(
   // connected server will never see.
   if (isRemoteMode()) {
     throw new ProcessControlError(
-      `"${repoName}" is not in the ComfyUI-Manager registry, and cloning it would write to a ` +
+      `${because}. Cloning it would write to a ` +
         `LOCAL install` +
         (comfyuiBase ? ` (${comfyuiBase})` : "") +
         ` — but this session targets a REMOTE ComfyUI (--comfyui-url), so that is not the ` +
@@ -2046,7 +2090,7 @@ async function cloneCustomNodeFallback(
   }
   if (!comfyuiBase) {
     throw new ProcessControlError(
-      `"${repoName}" is not in the ComfyUI-Manager registry and cloning it ` +
+      `${because}, and cloning it ` +
         `requires a local ComfyUI install, but no ComfyUI path is set. ` +
         `Install it on the ComfyUI host, or pass a registered pack id.`,
     );
@@ -2183,7 +2227,7 @@ async function cloneCustomNodeFallback(
 
   const base = alreadyPresent
     ? `"${repoName}" already exists in custom_nodes (${repoName}) — left it in place.`
-    : `"${repoName}" is not in the ComfyUI-Manager registry — cloned it directly into custom_nodes (${repoName}).`;
+    : `${because} — cloned it directly into custom_nodes (${repoName}).`;
   const warn = warnings.length ? ` ${warnings.join(" ")}` : "";
   return {
     mechanism: "git-clone",
@@ -2378,7 +2422,23 @@ async function installCustomNodeImpl(
     // them from the cached dialect would let a self-heal retry (#646) resend
     // 3.x-shaped params to a v4 server (or the reverse) and install the wrong
     // thing — the retry has to rebuild the body, not just re-route it.
-    const status = await queueManagerTask(
+    // #1129 — A REFUSED ENQUEUE IS NOT THE END OF THE ROAD.
+    //
+    // The 3.x git-URL install is gated by security_level + allow_git_url_install,
+    // and a host that does not serve the route answers the same way. Both come
+    // back as a status on the POST, which throws — so the direct-clone fallback
+    // twenty lines below, which needs no Manager at all and is exactly what the
+    // user would do by hand, was unreachable in the one case it exists for. A
+    // reporter on legacy 3.x got "ComfyUI-Manager not reachable", then a 404 with
+    // "A security error has occurred", and was left with no install path on a
+    // machine whose custom_nodes directory was sitting right there.
+    //
+    // Only a PRE-QUEUE refusal diverts (see managerEnqueueRefusal): the response
+    // describes the request, so nothing is running and the clone cannot race a
+    // Manager task writing to the same directory. Everything else rethrows.
+    let refusedBy: number | undefined;
+    const enqueue = async (): Promise<unknown> =>
+      await queueManagerTask(
       "install",
       (api) =>
         api !== "v2"
@@ -2412,6 +2472,29 @@ async function installCustomNodeImpl(
           },
       managerBase,
     );
+
+    let status: unknown;
+    try {
+      status = await enqueue();
+    } catch (err) {
+      refusedBy = managerEnqueueRefusal(err);
+      // A remote target keeps the original error: the clone would write to a
+      // LOCAL tree that is not the server we are connected to, so "the Manager
+      // refused" is the honest and complete answer there.
+      if (refusedBy === undefined || isRemoteMode()) throw err;
+      logger.info("Manager refused the git install enqueue — cloning directly", {
+        status: refusedBy,
+        gitId,
+      });
+      return withCliNote(
+        await cloneCustomNodeFallback(gitId, repoName, gitRef, { manager_refused: refusedBy }, cliWorkspace, {
+          managerRefusalNote:
+            `ComfyUI-Manager REFUSED the git-URL install (HTTP ${refusedBy}) — on a legacy 3.x ` +
+            `host that is its security_level / allow_git_url_install gate, or a build that does ` +
+            `not serve the route. Nothing was queued there.`,
+        }),
+      );
+    }
 
     // VERIFY: /v2/customnode/installed reflects on-disk custom_nodes, so a
     // freshly-cloned pack shows up even before a reboot. If the Manager actually
@@ -3741,6 +3824,41 @@ export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
  * `id` AND `repository` together name TWO targets (the schema presents them as
  * alternatives); that is a conflict to refuse, not a precedence to pick.
  */
+/**
+ * The route that still works when the Manager has no route at all (#789, recurrence).
+ *
+ * Rerouting a git URL to a from-source "nightly" install fixed the ORIGINAL report,
+ * where the pack was registered and only the version spec was wrong. It cannot fix
+ * the recurrence, because that pack is not in the registry:
+ *
+ *   Node 'ComfyUI-MiniMaxH3-FirstBlockCache@nightly' not found
+ *     — ManagerChannel.dev, ManagerDatabaseSource.remote
+ *
+ * Manager v4's do_install resolves a pack by its registry ID, never by URL (the
+ * 3.x `files:[url]` clone path does not exist there), so on a v4 host an
+ * unregistered repository has NO Manager route by any spelling. The panel cannot
+ * clone either — it is browser JS.
+ *
+ * `install_custom_node` can: it tries the Manager first and then clones the URL
+ * directly into custom_nodes, verifying the result is a real pack. That is the
+ * one tool that finishes this job, and the reporter had to find it by hand after
+ * being left at "not found". Naming it here costs a sentence.
+ *
+ * Stated up front rather than on the failure: the failure text comes back from
+ * the panel and matching on it would be brittle, and an agent that reads this
+ * when the install is queued needs one fewer round trip than one that reads it
+ * after the queue drains.
+ */
+function unregisteredPackEscapeHatch(): string {
+  return (
+    `If this comes back "not found" / "not available node", the pack is not in the ` +
+    `Manager's registry at all — on Manager v4 that leaves NO Manager route for a ` +
+    `repository URL, by any spelling. Use install_custom_node (source:"git") instead: ` +
+    `it clones the URL directly into custom_nodes and verifies a real pack landed. ` +
+    `Requires a LOCAL ComfyUI, since the clone writes to its filesystem.`
+  );
+}
+
 export function normalizeGitUrlInstallArgs(
   args: GitUrlInstallArgs,
 ): NormalizedGitUrlInstallArgs {
@@ -3771,7 +3889,8 @@ export function normalizeGitUrlInstallArgs(
       `"${gitTarget}" is a git repository URL, so this was queued as a from-source ` +
       `install with version "nightly" (git HEAD): ComfyUI-Manager cannot resolve a ` +
       `registry "latest" for a repository-style entry and rejects it ("not available ` +
-      `node: <repo>@<version>"). Pass an explicit version/ref to override.`;
+      `node: <repo>@<version>"). Pass an explicit version/ref to override. ` +
+      unregisteredPackEscapeHatch();
   } else {
     out.version = args.version;
   }

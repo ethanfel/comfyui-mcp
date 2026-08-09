@@ -15,7 +15,7 @@ import {
   getComfyuiTargetGeneration,
   isRemoteMode,
 } from "../config.js";
-import { comfyuiFetch } from "../comfyui/fetch.js";
+import { comfyuiFetch, describeTargetDrift } from "../comfyui/fetch.js";
 import { errorText } from "../orchestrator/error-text.js";
 import {
   acquireInstanceWitness,
@@ -3989,7 +3989,29 @@ export async function preflightLocalRestart(): Promise<{
       reason:
         `the ComfyUI this restart would stop could not be identified from here` +
         (diagnostic ? ` (${diagnostic})` : ` (nothing was found listening on port ${config.resolvedPort})`) +
-        `, so it could not be established that stopping it is something we could undo.`,
+        `, so it could not be established that stopping it is something we could undo.` +
+        // #1175 — the refusal asserted "could not be identified" while the
+        // orchestrator was holding the evidence that would identify it.
+        //
+        // A reporter's ComfyUI was started by an external Windows launcher on a
+        // port that is not 8188. Their panel was connected and live graph reads
+        // worked, so a ComfyUI demonstrably existed — but this preflight probes
+        // only `config.resolvedPort` and reported nothing listening, which reads
+        // as "ComfyUI is not running" when it plainly was.
+        //
+        // describeTargetDrift is the comparison comfyuiFetch already makes for a
+        // transport error: it asks the bridge which origins the connected tabs
+        // actually front, and says DIFFERENT / SAME / unknown. Saying which of
+        // those holds turns "we found nothing" into "we looked at the wrong
+        // address, and here is the right one".
+        //
+        // Deliberately additive. This does NOT relax the refusal: an instance we
+        // cannot identify is still an instance whose relaunch we cannot prove
+        // (#814), and restarting a server this process cannot even see would be
+        // exactly the loss that gate exists to prevent. What changes is that the
+        // caller is told where to point COMFYUI_URL instead of being told their
+        // running ComfyUI does not exist.
+        describeTargetDrift(getComfyUIBaseUrl()),
     };
   }
   if (info.isDesktopApp) {

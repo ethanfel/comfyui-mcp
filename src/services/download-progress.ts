@@ -78,6 +78,80 @@ function channelDir(): string {
 }
 const lastWriteAt = new Map<string, number>();
 
+/**
+ * Carry a dead orchestrator's IN-FLIGHT job records into the new channel dir as
+ * terminal "interrupted" records, instead of deleting them (#1148).
+ *
+ * The persisted store exists so a session that reconnects can still resolve an
+ * in-flight download by id (#529), and download_model's own status text promises
+ * exactly that. But the orchestrator nonces its progress dir per start and reaps
+ * every earlier dir for the port — so an orchestrator restart deleted the store
+ * that promise depends on. A reporter's 12GB transfer answered "No download
+ * matching id" and "No downloads are being tracked", with no file and no partial
+ * on disk and no error event: 40 minutes gone, invisibly, while the documented
+ * contract told their agent to keep waiting rather than re-issue.
+ *
+ * The transfer really is dead — it streamed inside a process that no longer
+ * exists — so this does NOT resurrect it, and pretending otherwise would be the
+ * worse bug. What it fixes is the SILENCE: a record that says the download was
+ * interrupted, which `status` can find by the id the caller was handed.
+ *
+ * Only `downloading` records migrate. A terminal record's outcome was already
+ * delivered, and re-landing it would replay a settled event. Fields are copied
+ * INDIVIDUALLY rather than spread: this reads a file written by a process that
+ * is gone, and the new record must be a record we constructed.
+ *
+ * Best-effort throughout — a failure here must never block startup.
+ */
+export function migrateInFlightJobs(fromDir: string, toDir: string): number {
+  let migrated = 0;
+  let files: string[];
+  try {
+    files = readdirSync(fromDir).filter((f) => f.startsWith(JOB_PREFIX) && f.endsWith(".json"));
+  } catch {
+    return 0;
+  }
+  for (const f of files) {
+    try {
+      const raw = JSON.parse(readFileSync(join(fromDir, f), "utf8")) as Record<string, unknown>;
+      if (!raw || typeof raw !== "object") continue;
+      if (typeof raw.id !== "string" || raw.status !== "downloading") continue;
+      const str = (k: string): string | undefined =>
+        typeof raw[k] === "string" ? (raw[k] as string) : undefined;
+      const num = (k: string): number | undefined =>
+        typeof raw[k] === "number" ? (raw[k] as number) : undefined;
+      const rec = {
+        id: raw.id,
+        status: "error" as const,
+        name: str("name"),
+        url: str("url"),
+        dest: str("dest"),
+        target: str("target"),
+        dest_key: str("dest_key"),
+        req_key: str("req_key"),
+        total: num("total"),
+        received: num("received"),
+        updated: Date.now(),
+        interrupted_by_restart: true,
+        error:
+          `This download was INTERRUPTED: the orchestrator process it was streaming ` +
+          `inside exited (a restart or a session drop), so the transfer stopped. It is ` +
+          `NOT running and will not resume on its own — nothing is waiting to finish. ` +
+          `Any partial file may also have been discarded. Re-issue the download.`,
+      };
+      writeFileSync(
+        join(toDir, `${JOB_PREFIX}${sanitizeIdPart(raw.id)}-${PERSIST_OWNER}.json`),
+        JSON.stringify(rec),
+        { mode: 0o600 },
+      );
+      migrated += 1;
+    } catch {
+      /* one unreadable record must not stop the rest */
+    }
+  }
+  return migrated;
+}
+
 /** True when running under the panel orchestrator (progress channel is active). */
 export function progressEnabled(): boolean {
   return !!PROGRESS_DIR;
@@ -244,6 +318,40 @@ export function downloadAttemptKey(row: AttemptRowLike): string | null {
   if (!id) return null;
   const target = typeof row?.target === "string" ? row.target : "";
   return `${id}\n${target}`;
+}
+
+/**
+ * Flag each settled FAILURE whose FILENAME is being downloaded right now (#1150).
+ *
+ * The supersession key above is (id, target), and it is right to be: it answers
+ * "is this the same transfer?", where a filename cannot. But a 404 retried with a
+ * CORRECTED URL is a different id writing the same filename, so the eviction
+ * cannot see it — and a reporter was woken with "Model download FAILED" for two
+ * files that `download_model action:"status"` showed streaming at 20% and 13%
+ * seconds later.
+ *
+ * This asks a different, narrower question: "is the thing I am about to call
+ * failed currently arriving?" For the human or agent reading that sentence, the
+ * NAME is the identity, so the name is the right key here even though it is the
+ * wrong key there. A false positive costs a hedge on a genuinely dead download; a
+ * false negative is the reported bug.
+ *
+ * Mutates and returns `settled` — the caller passes rows it just built.
+ */
+export function markSupersededByLive<T extends { name: string; status: string; supersededByLive?: boolean }>(
+  settled: T[],
+  liveRows: ReadonlyArray<{ name?: unknown; status?: unknown }>,
+): T[] {
+  const liveNames = new Set(
+    liveRows
+      .filter((r) => r?.status === "downloading")
+      .map((r) => (typeof r?.name === "string" ? r.name : ""))
+      .filter((n) => n !== ""),
+  );
+  for (const s of settled) {
+    if (s.status !== "done" && liveNames.has(s.name)) s.supersededByLive = true;
+  }
+  return settled;
 }
 
 /** Newest attempt epoch per (id, target) across the given rows (ANY status — a
@@ -543,6 +651,11 @@ export interface PersistedDownloadJob {
   verified_root?: string;
   /** Epoch ms of this snapshot (set on write). */
   updated: number;
+  /** Set on a terminal record MIGRATED from a dead orchestrator's channel dir
+   *  (#1148). The transfer stopped because the process it streamed inside exited,
+   *  not because the server or the URL failed — so renderers say that, and never
+   *  imply a resumable partial was deliberately left behind. */
+  interrupted_by_restart?: boolean;
   /**
    * Read-only diagnostics added when an in-flight record missed the liveness
    * heartbeat. These are never persisted: a stale heartbeat is not proof that

@@ -2476,6 +2476,48 @@ function refreshWorkflowUuid(ctx: PanelToolCtx, value: unknown): boolean {
 }
 
 /**
+ * #814 — workflow_new and workflow_save/workflow_save_as all re-point the active
+ * workflow, and each of their handlers repairs the session's command fence by
+ * calling `rebindWorkflowFence(ctx)` unconditionally — a GENERIC re-derivation
+ * that makes its OWN independent `workflow_list` round trip and has no access to
+ * the command's own reply. That read is refused by the exact fence this whole
+ * flow exists to repair (#1071), and the only remaining recovery
+ * (`unreadableOrHealed`'s check for the panel's async hello re-advertise) is
+ * timing-dependent — a reporter hit exactly this: the save reply already proved
+ * the new uuid, and the very next command still failed with
+ * root-workflow-uuid-mismatch.
+ *
+ * Each of these replies ALREADY carries `workflow_uuid` directly (#762 for
+ * workflow_new, #800 for workflow_save/save_as), published only after the
+ * panel's own FINAL SYNCHRONOUS check that this target is still the active
+ * workflow — the identical proof `workflow_open`'s reply carries, which
+ * `refreshOpenWorkflowUuid` already trusts as a fallback. Trust it FIRST here
+ * too, before ever attempting the round trip that can be refused.
+ *
+ * No corroboration gate is needed (unlike workflow_open, which must verify the
+ * reply's identity against a caller-supplied path): there is no caller target to
+ * corroborate against — this session's own tab just performed the operation that
+ * produced this exact reply.
+ *
+ * Returns null when the reply carries no adoptable uuid (an older panel build,
+ * or the panel's own check could not prove it — #716's fail-closed omission), so
+ * the caller falls back to the EXISTING rebindWorkflowFence(ctx) round trip
+ * completely unchanged.
+ */
+function refreshFenceFromOwnReply(ctx: PanelToolCtx, reply: ToolResult): WorkflowFenceRebind | null {
+  const before = currentWorkflowFence(ctx);
+  const parsed = parseToolResultJson(reply);
+  if (!parsed) return null;
+  const uuid = responseWorkflowUuid(parsed);
+  if (!uuid) return null;
+  try {
+    return refreshWorkflowUuid(ctx, parsed) ? { status: "refreshed", uuid, before } : null;
+  } catch {
+    return null; // never surface a throw here as worse than the existing fallback
+  }
+}
+
+/**
  * The stamp currently fencing this session's tab — TRI-STATE, because reading it
  * is itself an operation that can fail (codex gate).
  *
@@ -2706,6 +2748,37 @@ async function unreadableOrHealed(
   return { status: "unreadable", before, detail };
 }
 
+/**
+ * The version-gap sentence for a fence rebind that failed on an OLD panel (#1043).
+ *
+ * Empty string when the panel is new enough, or when its version is unknown —
+ * an unproven version must never be narrated as "yours is too old", which would
+ * send someone to update a panel that is already current. That is the same
+ * three-state discipline the rest of this file runs on.
+ *
+ * Never throws: this decorates an error path, and a decoration that fails must
+ * not replace the diagnosis it was meant to improve.
+ */
+function panelTooOldNote(ctx: PanelToolCtx): string {
+  try {
+    const v = ctx.bridge?.panelTooOldForReplyUuid?.(ctx.tabId);
+    if (!v?.tooOld) return "";
+    return (
+      `
+
+WHY THIS READ WAS NEEDED AT ALL: this session's panel is ${v.version}, and a ` +
+      `panel only reports the new workflow's identity ON THE REPLY from ${v.needed} ` +
+      `onwards. On ${v.needed}+ the command that re-pointed the canvas repairs the ` +
+      `fence from its own reply and never makes this read — so UPDATING THE PANEL ` +
+      `to ${v.needed} or later removes this failure rather than working around it. ` +
+      `Update it with install_comfyui (action:"panel", panel_action:"sync"), then ` +
+      `restart ComfyUI.`
+    );
+  } catch {
+    return "";
+  }
+}
+
 async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebind> {
   const tabAtStart = ctx.tabId;
   let before = currentWorkflowFence(ctx);
@@ -2849,6 +2922,13 @@ function describeFenceRebind(
    * first as the second is a bucket standing in for a cause (codex gate P1).
    */
   refusalCause?: "unroutable" | "disconnected" | "no_identity" | "capability",
+  /**
+   * #1043 — the version-gap sentence, when the connected panel is PROVABLY too
+   * old to publish the reply uuid this rebind exists to avoid needing. Passed in
+   * rather than looked up: this renderer is pure, and keeping it that way is what
+   * makes its wording testable without a bridge.
+   */
+  panelGapNote = "",
 ): {
   binding: "bound" | "reads_only" | "unverified" | "not_recovered";
   note: string;
@@ -3010,6 +3090,19 @@ function describeFenceRebind(
         note:
           ` Could NOT read the live canvas identity — the panel did not answer, so NOTHING ` +
           `about this session's graph binding was observed.` +
+          // #1043 — NAME THE VERSION GAP when that is what this is.
+          //
+          // The repair that would have avoided this read entirely
+          // (refreshFenceFromOwnReply, #1161) trusts a workflow_uuid the panel
+          // only publishes from 0.11.45. Three reports — #1043, #1077, #1174 —
+          // deadlocked here on OLDER panels: the fix is present and inert, and
+          // the message said only "could not be read", which reads as a mystery
+          // rather than as "update the panel".
+          //
+          // Only a PARSEABLE version below the minimum says this; an unknown
+          // version stays quiet rather than telling someone to update a panel
+          // that may already be current.
+          panelGapNote +
           // THREE states, not two (codex gate). "We could not read the existing
           // fence either" must not render as "it has no fence" — that absence was
           // never observed, and it is the same fold one level down.
@@ -3158,7 +3251,25 @@ async function refreshOpenWorkflowUuid(
   const openedIdentity = openedPath
     ? canonicalSavedRecordIdentity({ path: openedPath, routing_key: parsedOpen?.routing_key })
     : null;
-  if (!requestedIdentity || requestedIdentity !== openedIdentity) return;
+  if (!requestedIdentity || requestedIdentity !== openedIdentity) {
+    // #812 — the SAVED corroboration above can never succeed for an unsaved
+    // target (there is no path), so try the parallel UNSAVED identity: the
+    // caller's literal token against the panel's own proven routing_key for
+    // the tab it just opened. Exact equality only — see
+    // canonicalUnsavedWorkflowIdentity for why that carries no alias risk.
+    //
+    // Trust level matches the EXISTING "could not ask" fallback below exactly:
+    // adopt the reply's own workflow_uuid directly, which the panel published
+    // only after its own final synchronous check that this target was still
+    // the active workflow (#716). No extra workflow_list round trip — that
+    // read is itself refused by the exact wedge this exists to repair
+    // (#1071), which is the same trap `panel_new_workflow`'s recovery hit.
+    const requestedUnsaved = canonicalUnsavedWorkflowIdentity(requestedPath);
+    if (requestedUnsaved && requestedUnsaved === parsedOpen?.routing_key) {
+      refreshWorkflowUuid(ctx, parsedOpen);
+    }
+    return;
+  }
 
   // THREE outcomes for this corroborating read, not two — and conflating the last
   // two is #1071 (also #932/#1043).
@@ -3648,6 +3759,28 @@ function canonicalSavedWorkflowRoutingIdentity(value: unknown): string | null {
   if (typeof value !== "string" || !value.startsWith("wf:")) return null;
   const path = canonicalSavedWorkflowPath(value.slice(3));
   return path ? `wf:${path}` : null;
+}
+
+/**
+ * #812 — an UNSAVED workflow has no saved path, so `canonicalRequestedSavedIdentity`
+ * always returns null for it, and `refreshOpenWorkflowUuid` bails out before ever
+ * consulting the reply. `panel_open_workflow(tmp:<uuid>)` on the panel's OWN
+ * routing_key succeeded (`opened:true`) but never refreshed the fence — the ONLY
+ * documented recovery for a just-created blank tab, reported as leaving the tool
+ * "effectively unusable whenever this fires."
+ *
+ * A `tmp:<uuid>` token is not an alias needing corroboration the way a saved path's
+ * basename is (#716 P1's concern) — it is the per-tab routing id itself, unique by
+ * construction. So the identity check here is a single exact-string equality, not a
+ * lookup: does the caller's literal request match the panel's own proven routing_key
+ * for the tab it just opened? No resolution happens on either side.
+ *
+ * Strict RFC-uuid suffix (same `WORKFLOW_UUID_RE` the command-fence stamp itself is
+ * validated against) so a malformed or truncated token is never treated as a match.
+ */
+function canonicalUnsavedWorkflowIdentity(value: unknown): string | null {
+  if (typeof value !== "string" || !value.startsWith("tmp:")) return null;
+  return WORKFLOW_UUID_RE.test(value.slice(4)) ? value : null;
 }
 
 /** Stable-identity match (positive only) — used to prefer the active record among matches. */
@@ -5998,6 +6131,34 @@ export interface PanelToolDef {
   handler: (args: Record<string, unknown>, ctx: PanelToolCtx) => Promise<ToolResult>;
 }
 
+/**
+ * #754 — an unrecognized argument key was silently DROPPED, not rejected. Measured:
+ * a real call and one with an extra `utterly_bogus_param` key returned byte-identical
+ * replies. Zod's default `z.object()` is "strip" mode: unknown keys vanish before the
+ * handler ever sees them, so a caller with a misspelled or hallucinated field name gets
+ * no signal that anything was wrong — the call just quietly does less than asked.
+ *
+ * `.strict()` turns that into a validation error the caller can see and correct,
+ * which is the whole value for an LLM caller: a loud, specific failure ("Unrecognized
+ * key: X") is something a model can read and fix on the next attempt; a silent no-op
+ * is not distinguishable from "it worked but had no effect".
+ *
+ * BOTH transports' registration functions accept this directly in place of the raw
+ * shape (verified against each SDK's actual runtime behavior, not assumed from the
+ * TypeScript types — see the cast note at the Anthropic SDK call site):
+ *   - `@modelcontextprotocol/sdk`'s `registerTool({ inputSchema })` types `inputSchema`
+ *     as `AnySchema | ZodRawShapeCompat`, so a full ZodObject is accepted as-is by the
+ *     TYPE, and at runtime `normalizeObjectSchema` detects an already-built schema
+ *     (it carries `_def`/`_zod`) and passes it through unwrapped rather than
+ *     re-wrapping it — so the `.strict()` marker survives into validation.
+ *   - The Anthropic Agent SDK's `tool()` stores whatever is passed as `inputSchema`
+ *     verbatim; a `.safeParse()` probe against the returned tool definition confirmed
+ *     an unrecognized key is rejected with `Unrecognized key: "..."`.
+ */
+function strictPanelSchema(shape: z.ZodRawShape) {
+  return z.object(shape).strict();
+}
+
 const PANEL_EDIT_NODE_FIELDS = ["pos", "size", "title", "preset", "color", "bgcolor", "shape", "collapsed", "pinned", "mode"] as const;
 const NODE_COLOR_HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
@@ -8292,7 +8453,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // NEVER fails the call: the file WAS written. Retracting a completed save
         // would be the worse lie, so a fence that could not be re-established is
         // DISCLOSED instead.
-        const fenceRebind = await rebindWorkflowFence(ctx);
+        //
+        // #814 — trust THIS reply's own proven uuid first (#800), before ever
+        // attempting rebindWorkflowFence's independent workflow_list round trip,
+        // which can be refused by the exact fence this repairs.
+        const fenceRebind = refreshFenceFromOwnReply(ctx, res) ?? (await rebindWorkflowFence(ctx));
         let canMutateNow: boolean | undefined;
         let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
         try {
@@ -8307,7 +8472,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           canMutateNow = undefined;
           refusalCause = undefined;
         }
-        const fence = describeFenceRebind(fenceRebind, canMutateNow, refusalCause);
+        const fence = describeFenceRebind(fenceRebind, canMutateNow, refusalCause, panelTooOldNote(ctx));
         if (!fence || fence.binding === "bound") return res;
         return appendNote(res, `The workflow WAS saved.${fence.note}`);
       },
@@ -8557,6 +8722,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           canMutateNow = undefined; // a guard that can throw is not a guard
           refusalCause = undefined;
         }
+        // #1043 (codex review) — NO version note on THIS path, deliberately.
+        //
+        // The note claims that on 0.11.45+ "the command that re-pointed the canvas
+        // repairs the fence from its own reply and never makes this read". That is
+        // true of panel_save_workflow and panel_new_workflow, which DO carry a
+        // workflow_uuid on their reply. panel_set_workflow_target does not — it has
+        // no own-reply uuid to gain, so updating the panel would NOT remove this
+        // failure, and saying it would is a confident wrong remedy.
+        //
+        // A user may well have arrived here recovering from a save/new that hit the
+        // gap — but arriving here does not establish that, and guessing which of
+        // the two it was is exactly the kind of unearned claim this file exists to
+        // avoid. The save/new paths say it at the moment it is provable.
         const fence = fenceRebind
           ? describeFenceRebind(fenceRebind, canMutateNow, refusalCause)
           : undefined;
@@ -8595,15 +8773,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         //
         // Refresh from the panel's own live active record, the same way the open
         // path does. The panel mints the new canvas's identity EAGERLY at
-        // creation ("so the key exists BEFORE the first edit"), so it is readable
-        // by the time this runs — it is simply not carried on the workflow_new
-        // reply, which returns key/routing_key but no workflow_uuid.
+        // creation ("so the key exists BEFORE the first edit").
+        //
+        // #814/#812 — this reply DOES carry workflow_uuid directly (#762), and the
+        // stale comment that used to stand here said otherwise. Trust it first,
+        // before ever attempting rebindWorkflowFence's independent workflow_list
+        // round trip, which can be refused by the exact fence being repaired
+        // (#1071) — the same trap a reporter hit via panel_new_workflow's own
+        // recovery attempt.
         //
         // NEVER fails the call on a rebind miss: the workflow WAS created, and
         // retracting that would be the worse lie. Disclose instead, so the agent
         // learns the graph tools are not yet usable here rather than discovering
         // it one confusing mismatch at a time.
-        const fenceRebind = await rebindWorkflowFence(ctx);
+        const fenceRebind = refreshFenceFromOwnReply(ctx, res) ?? (await rebindWorkflowFence(ctx));
         let canMutateNow: boolean | undefined;
         let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
         try {
@@ -8618,7 +8801,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           canMutateNow = undefined; // a guard that can throw is not a guard
           refusalCause = undefined;
         }
-        const fence = describeFenceRebind(fenceRebind, canMutateNow, refusalCause);
+        const fence = describeFenceRebind(fenceRebind, canMutateNow, refusalCause, panelTooOldNote(ctx));
         if (!fence || fence.binding === "bound") return res;
         return appendNote(
           res,
@@ -9993,7 +10176,39 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         }>;
 
         const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"]);
-        const VIDEO_EXTS = new Set([".mp4", ".webm"]);
+        // #811 — this used to be just {.mp4, .webm}, narrower than what this
+        // codebase ALREADY treats as video elsewhere: get_image's
+        // action:"list_outputs" documents ".mp4/.webm/.mov/.mkv/.m4v/.avi", and
+        // upload_image's action:"video" accepts the identical set. A ProRes
+        // .mov produced by VHS/standard ComfyUI video nodes was refused here
+        // even though every other tool in this codebase already calls it a
+        // valid video output. Aligned to the same set both of those already use.
+        //
+        // This widens the CONTAINER-extension gate only — it does not and
+        // cannot guarantee browser-side codec decode (a ProRes stream inside
+        // that .mov may still not play natively outside Safari). That is a
+        // downstream browser limitation, not a reason to refuse the file
+        // upfront: the panel's video path already degrades gracefully when a
+        // codec can't be decoded (falls back to a native <video> element,
+        // which surfaces the browser's own playback error, rather than
+        // silently failing) — an honest browser failure is a strictly better
+        // outcome than a blanket refusal at this gate for every .mov file,
+        // most of which (H.264/H.265-encoded) play back completely fine.
+        const VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".mkv", ".m4v", ".avi"]);
+        // Real IANA subtypes. The old code built video MIME by naive
+        // `"video/" + ext.slice(1)`, which only ever worked for .mp4/.webm by
+        // COINCIDENCE (their extension equals their MIME subtype) — extended to
+        // .mov/.mkv/.avi it would have produced invalid types (`video/mov`
+        // instead of `video/quicktime`), and a wrong MIME can make a browser
+        // refuse to even ATTEMPT playback before the codec is ever considered.
+        const VIDEO_MIME: Record<string, string> = {
+          ".mp4": "video/mp4",
+          ".webm": "video/webm",
+          ".mov": "video/quicktime",
+          ".mkv": "video/x-matroska",
+          ".m4v": "video/x-m4v",
+          ".avi": "video/x-msvideo",
+        };
         const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
 
         const resolved: Array<Record<string, unknown>> = [];
@@ -10048,7 +10263,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               mime = ext === ".jpg" ? "image/jpeg" : "image/" + ext.slice(1);
               kind = "image";
             } else if (VIDEO_EXTS.has(ext)) {
-              mime = "video/" + ext.slice(1);
+              mime = VIDEO_MIME[ext];
               kind = "video";
             } else {
               return fail(
@@ -10268,7 +10483,21 @@ export function createPanelMcpServer(
   // to the SDK's tool-list element type so the heterogeneous array type-checks.
   type SdkTool = ReturnType<typeof tool>;
   const tools = defs.map((d) =>
-    tool(d.name, d.description, d.schema, (args: Record<string, unknown>) => d.handler(args, ctx)),
+    tool(
+      d.name,
+      d.description,
+      // #754 — strict() so an unrecognized arg key is a loud validation error,
+      // not a silent drop. tool()'s TS signature requires a bare ZodRawShape
+      // (`Schema extends AnyZodRawShape`), which a strict ZodObject instance does
+      // NOT structurally satisfy (it has methods like `.parse`, not just field
+      // schemas) — but at RUNTIME the SDK stores whatever is passed as
+      // `inputSchema` verbatim (confirmed by constructing a tool this way and
+      // calling `.safeParse` on the returned definition: unknown keys are
+      // rejected). The cast documents that the type is being widened past what
+      // TS can express here, not past what the SDK actually accepts.
+      strictPanelSchema(d.schema) as unknown as typeof d.schema,
+      (args: Record<string, unknown>) => d.handler(args, ctx),
+    ),
   ) as unknown as SdkTool[];
   const server = createSdkMcpServer({
     name: "comfyui-panel",
@@ -10296,9 +10525,12 @@ export function registerPanelTools(server: McpServer, ctx: PanelToolCtx): void {
       d.name,
       {
         description: d.description,
-        // The MCP SDK accepts a zod raw shape as inputSchema (same shape the
-        // Anthropic SDK tool() takes), so the shared schema drops straight in.
-        inputSchema: d.schema,
+        // #754 — strict() so an unrecognized arg key is a loud validation error,
+        // not silently stripped. The MCP SDK types `inputSchema` as a full zod
+        // schema OR a raw shape (`AnySchema | ZodRawShapeCompat`), so passing the
+        // already-built ZodObject needs no cast here — unlike the Anthropic SDK
+        // call site, which types inputSchema as a bare raw shape only.
+        inputSchema: strictPanelSchema(d.schema),
       },
       (async (args: Record<string, unknown>) => {
         const res = await d.handler(args ?? {}, ctx);

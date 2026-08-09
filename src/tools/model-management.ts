@@ -5,6 +5,8 @@ import {
   searchHuggingFaceModels,
   listLocalModels,
   listLocalModelsWithCoverage,
+  describeManagerDestination,
+  managerJobFilename,
   currentLiveModelsRoot,
   verifyManagerVisibility,
   MODEL_SUBDIRS,
@@ -707,9 +709,8 @@ async function downloadAction(args: {
           // ONE placement policy for every consumer (#369): only a file the running
           // ComfyUI actually lists may be called a success. A Manager dispatch, a
           // still-pending check and an inconclusive check are all unconfirmed.
-          const placement = describePlacement(job, {
-            liveModelsDir: await currentLiveModelsRoot(),
-          });
+          const liveRoot = await currentLiveModelsRoot();
+          const placement = describePlacement(job, { liveModelsDir: liveRoot });
           // #1086 — ASK the server instead of telling the caller to. The Manager
           // branch could only ever say "confirm with list_local_models yourself",
           // and a reporter who did not lost a multi-GB model to an ephemeral
@@ -724,16 +725,60 @@ async function downloadAction(args: {
           const managerSeen = job.viaManager
             ? await verifyManagerVisibility(
                 job.target_subfolder,
-                job.filename ?? (job.path ?? "").split(/[\\/]/).pop() ?? "",
+                // #1086 (codex review) — was `job.filename ?? path.split(…).pop()`.
+                // For a Manager dispatch `job.path` is a DESCRIPTOR, not a path, so
+                // that returned the whole trailing note and made every URL-only
+                // download unverifiable. Pre-existing; exposed by the review.
+                managerJobFilename(job),
                 { attempts: 1 },
               ).catch(() => undefined)
             : undefined;
+          // #1086 — the destination is unknowable only until we LOOK.
+          //
+          // The standing caveat says we cannot know where a Manager dispatch
+          // lands, because extra_model_paths.yaml lives on the target filesystem.
+          // True of the CONFIG; not true of the OUTCOME — Manager logs the
+          // absolute path it chose, which is how a reporter found their Wan 2.2
+          // file in /opt/ComfyUI/models while the server read /workspace/models,
+          // a 20GB overlay that discarded it on the next pod restart.
+          //
+          // unknown-ok: undefined here means "no destination line was read" —
+          // from an unreadable log, a Manager build that logs differently, or a
+          // throw — and every one of those leads to the SAME correct behaviour:
+          // append nothing, and leave managerDestinationCaveat()'s standing "this
+          // has NOT established where the file lands" as the answer. That caveat
+          // is already the honest unknown; a second one saying the same thing
+          // would be noise. The state that must never collapse is the opposite
+          // one — a destination we DID read must never be dropped — and that is a
+          // string, never undefined. Verified there is no branch on this value
+          // beyond "append it if present".
+          const managerDest = job.viaManager
+            ? await describeManagerDestination(managerJobFilename(job), {
+                liveModelsDir: liveRoot,
+              }).catch(() => undefined)
+            : undefined;
           const text = job.viaManager
             ? `Download DISPATCHED to the remote ComfyUI via ComfyUI-Manager (server-side fetch):\n${job.path}\n\n` +
+              // #473 — "CONFIRMED" was WRONG here, and it was my regression in
+              // 0.50.29. A listing proves a file of that NAME exists; Manager
+              // writes whatever the URL returned under the name you asked for,
+              // and it cannot carry this MCP's credentials. A reporter on 0.50.34
+              // got six byte-identical 10,038-byte CivitAI login pages saved as
+              // models, and said this check "sometimes upgraded the
+              // filename-presence check to CONFIRMED" — which is precisely the
+              // fabricated success #473 has now been reported for three times.
+              //
+              // The word stays out of the Manager branch entirely. LISTED is the
+              // observation; validity is not established here and must not be
+              // implied by the label.
               (managerSeen?.visibility === "visible"
-                ? `CONFIRMED: ${managerSeen.note}`
+                ? `LISTED (placement only, NOT validity): ${managerSeen.note}`
                 : `NOTE: ${placement.warning}` +
-                  (managerSeen ? `\n\n${managerSeen.note}` : ""))
+                  (managerSeen ? `\n\n${managerSeen.note}` : "")) +
+              // Appended to BOTH Manager arms: a listed file whose destination is
+              // outside the live root is exactly the #1086 shape, so the "LISTED"
+              // arm needs this every bit as much as the unverified one.
+              (managerDest ? `\n\n${managerDest}` : "")
             : placement.confirmed
               ? `Model downloaded successfully to${placement.pathQualifier}:\n${job.path}`
               : placement.wrongPlace
@@ -887,7 +932,13 @@ async function statusAction(args: {
                   ? `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}`
                   : `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}\n    ${placement.wrongPlace ? "WARNING" : "NOTE"}: ${placement.warning}`
               : j.status === "error"
-                ? `\n    failed: ${j.error}`
+                ? j.interruptedByRestart
+                  ? // #1148 — NOT a transfer failure. The process it streamed
+                    // inside exited, which the previous behaviour rendered as
+                    // "No download matching id": the job silently ceased to exist
+                    // while the contract told the caller to keep waiting.
+                    `\n    INTERRUPTED — ${j.error}`
+                  : `\n    failed: ${j.error}`
                 : j.status === "cancelled"
                   ? (j.reclaimedDead
                       ? // #858: NO live transfer was aborted — the writer was already
@@ -1092,13 +1143,92 @@ async function cancelAction(args: { id: string; tray_id?: string }): Promise<Cal
  *
  * Exported for tests: the distinction is the fix, so it is pinned directly.
  */
+/**
+ * ComfyUI folder names that were RENAMED, and what they became (#1015).
+ *
+ * These are still in MODEL_SUBDIRS so an OLDER server that serves them keeps
+ * working. On a current server they 404 — which is the definite answer this
+ * change teaches the scan to read, and the reason a caller asking for the old
+ * name deserves to be pointed at the new one rather than told their server
+ * might be broken.
+ */
+const LEGACY_CATEGORY_RENAMES: Record<string, string> = {
+  clip: "text_encoders",
+  unet: "diffusion_models",
+};
+
 export function describeEmptyModelListing(
   modelType: string | undefined,
   coverage: ModelListingCoverage,
 ): string {
   const scope = modelType ? `${modelType} models` : "local models";
+  // #1015 — a 404 is a definite "this server does not register that category",
+  // and treating it as one is the whole fix. But if EVERY category came back 404
+  // and none was ever answered, the definite thing established is not "you have
+  // no models" — it is that this server serves none of these routes at all (an
+  // old build, or something in front of it). Saying "No local models found" there
+  // would be a fabricated negative, which is the same defect this change exists
+  // to remove, pointing the other way.
+  //
+  // Scoped tightly: only when NOTHING was answered, NOTHING was unreadable, and
+  // at least one 404 came back. An unreadable category still belongs to the
+  // "could not determine" path below, which says more.
+  const absent = coverage.absent ?? [];
+  if (coverage.answered.length === 0 && coverage.unanswered.length === 0 && absent.length > 0) {
+    // A FILTERED call is a different question with a different answer, and
+    // bucketing them hands the caller a remedy they cannot act on. Asking for
+    // ONE category and getting a 404 means THAT category is not registered here
+    // — most often because it was RENAMED, which is the whole origin of #1015.
+    // Blaming "an older ComfyUI or a proxy" would send someone to check a URL
+    // that is working perfectly.
+    if (modelType) {
+      const modern = LEGACY_CATEGORY_RENAMES[modelType];
+      return (
+        `The connected ComfyUI does not serve a "${modelType}" model category — it ` +
+        `answered 404 for that route, which is a definite answer, not a failed read.\n\n` +
+        (modern
+          ? `"${modelType}" is the LEGACY name for this folder; current ComfyUI calls it ` +
+            `"${modern}". Ask for "${modern}" instead — the models you are looking for are ` +
+            `almost certainly listed there.`
+          : `Run list_local_models with NO model_type to see every category this server ` +
+            `does register.`)
+      );
+    }
+    return (
+      `Could not determine which ${scope} are installed. The connected ComfyUI answered ` +
+      `404 for every category asked about (${absent.slice(0, 8).join(", ")}` +
+      `${absent.length > 8 ? `, …and ${absent.length - 8} more` : ""}) ` +
+      `and served none of them, so NOTHING was learned about the install — this is NOT ` +
+      `the same as having no models.\n\n` +
+      `A server that serves no /models/<category> route at all is usually an older ` +
+      `ComfyUI, or a proxy answering in front of it. Check the ComfyUI URL with ` +
+      `get_system_stats (action:"health") before concluding anything about the install.`
+    );
+  }
   if (coverage.unanswered.length === 0) {
-    // Verified: the server was asked and said zero.
+    // Verified: the server was asked and said zero. For a FILTERED call that is
+    // a true statement about ONE folder, and #962 is what it costs when it is
+    // read as a fact about the install: a reporter's UNETLoader was loading
+    // krastBf16_v3.safetensors while "diffusion_models" and "unet" both
+    // answered 200 with []. The weights were registered under neither name.
+    //
+    // The unfiltered path discovers every registered category; a filtered one
+    // skips discovery precisely because it "already names its exact category".
+    // So say which other folders this server actually has.
+    const others = coverage.otherRegisteredCategories;
+    if (modelType && others !== undefined && others.length > 0) {
+      const shown = others.slice(0, 20).join(", ");
+      const more = others.length > 20 ? `, …and ${others.length - 20} more` : "";
+      return (
+        `No models in "${modelType}" — ComfyUI answered for that category and it is empty.\n\n` +
+        `That is a fact about ONE folder, not about this install. This server also registers: ` +
+        `${shown}${more}.\n\n` +
+        `Weights a custom node, a fork, or an extra_model_paths entry registered under another ` +
+        `key are loadable in a workflow while being absent from "${modelType}" — so if a loader ` +
+        `on the canvas is offering a file, it is coming from one of those. Run list_local_models ` +
+        `with NO model_type to list every registered category, or name one of the above.`
+      );
+    }
     return modelType ? `No ${modelType} models found.` : "No local models found.";
   }
 

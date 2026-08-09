@@ -16,10 +16,15 @@ import {
 } from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
 import {
+  bodyPrefixOf,
   classifyNonJson,
+  describeStatus,
   fetchComfyJson,
+  guardClientFetch,
+  isNonJsonResponseError,
   looksLikeHtmlParsedAsJson,
   NonJsonResponseError,
+  provesNonJsonAnswer,
   readComfyJson,
   redactErrorMessage,
   rethrowWithJsonDiagnosis,
@@ -81,13 +86,55 @@ export function getClient(): Client {
       clientId: "comfyui-mcp",
       // Inject generic auth headers (COMFYUI_AUTH_*) on the library's own HTTP
       // calls; a no-op when unset. Node 22+ provides global WebSocket.
-      fetch: comfyuiFetch,
+      //
+      // Wrapped so the library's non-2xx path — which calls `res.json()` on the
+      // ERROR body and lets a bare SyntaxError replace its own error, losing the
+      // status and the URL with it — reports what actually answered instead
+      // (#828, #1160). See guardClientFetch.
+      fetch: guardClientFetch(comfyuiFetch),
     });
     logger.info("ComfyUI client created", {
       host: getComfyUIApiHost(),
     });
   }
   return clientInstance;
+}
+
+/**
+ * `client.fetchApi`, minus the part that makes a status branch unreachable (#385).
+ *
+ * `Client.fetchApi` THROWS for every status outside [200, 400) — it never returns
+ * a 4xx response. So every `if (!res.ok)` / `if (res.status === 404)` written
+ * after a `fetchApi` call is dead code, and the endpoint-specific answers behind
+ * those checks have never once run. That is not a theoretical concern:
+ *
+ *   - `fetchImage`'s IMAGE_NOT_FOUND — added by #435 for issue #385 itself, naming
+ *     the filename and pointing at the listing tool — never fired for a missing
+ *     output file.
+ *   - `getSetting` treats a 404 as "unset (frontend default applies)", because
+ *     some ComfyUI builds 404 the per-id settings route. Those builds threw.
+ *   - `loadLockFromLibrary` treats a 404 as "no lock present", which is the
+ *     ORDINARY case for an unlocked workflow. It threw.
+ *
+ * This keeps the library's URL and header construction verbatim — `apiURL` adds
+ * the api_base prefix and the clientId, `apiHeaders` adds comfy-user and merges
+ * the caller's — so a proxied, prefixed or multi-user target resolves exactly as
+ * before. The ONLY difference is that the Response comes back instead of being
+ * turned into an exception, which is what lets the caller classify it.
+ *
+ * `userdataFetch` in services/userdata-library.ts arrived at this same shape
+ * independently for one route (panel #202); this is that fix generalised.
+ *
+ * Not a replacement for `comfyuiFetch`: use that when you are composing the URL
+ * yourself (as `getSystemStats` and `enqueuePrompt` do). Use this when you want
+ * the library's routing and a Response you can read.
+ */
+export async function comfyApiFetch(route: string, init: RequestInit = {}): Promise<Response> {
+  const client = getClient();
+  return await client.fetch(client.apiURL(route), {
+    ...init,
+    headers: client.apiHeaders(init),
+  });
 }
 
 export async function connectClient(): Promise<Client> {
@@ -266,7 +313,14 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
         // only the retry would downgrade a known #828 diagnosis to "server
         // unavailable" and send the user to check whether ComfyUI is running
         // (codex gate, round 8, finding 2).
-        const toReport = looksLikeHtmlParsedAsJson(retryErr) ? retryErr : looksLikeHtmlParsedAsJson(err) ? err : retryErr;
+        //
+        // `provesNonJsonAnswer`, not `looksLikeHtmlParsedAsJson`: since
+        // guardClientFetch the library's parse failure arrives as a
+        // NonJsonResponseError carrying no parser text, so the old predicate
+        // answered "no" for the strongest evidence available and this picker
+        // fell through to `retryErr` every time — reintroducing the very
+        // downgrade round 8 fixed.
+        const toReport = provesNonJsonAnswer(retryErr) ? retryErr : provesNonJsonAnswer(err) ? err : retryErr;
         return await rethrowWithJsonDiagnosis(toReport, `${getComfyUIBaseUrl()}/object_info`);
       }
     }
@@ -461,11 +515,41 @@ export async function enqueuePrompt(
   if (!res.ok) {
     throw await buildEnqueueError(res);
   }
-  const data = (await res.json()) as {
-    prompt_id: string;
-    number?: number;
-    node_errors?: Record<string, unknown>;
-  };
+  // A bare res.json() here is the worst place in the codebase for one, and the
+  // same family as #1149/#1160/#828. This is a MUTATING POST that already
+  // succeeded at the HTTP layer: if the body will not parse, the prompt may well
+  // be queued and running, and `Unexpected end of JSON input` says nothing about
+  // that — a caller reads it as "the run failed" and re-submits, queueing the
+  // render twice.
+  //
+  // So: classify what actually answered (readComfyJson names the URL, status,
+  // content type and body prefix), and state the delivery doubt explicitly. The
+  // expectShape check is what catches the shape that matters — a gateway's own
+  // JSON error envelope is valid JSON with no prompt_id, and reading
+  // `data.prompt_id` off it would hand back `undefined` as a prompt id and let
+  // every downstream poll chase a job that was never queued.
+  let data: { prompt_id: string; number?: number; node_errors?: Record<string, unknown> };
+  try {
+    data = await readComfyJson<{
+      prompt_id: string;
+      number?: number;
+      node_errors?: Record<string, unknown>;
+    }>(res, {
+      url: "/prompt",
+      expectShape: (v: unknown) =>
+        !!v && typeof v === "object" && typeof (v as { prompt_id?: unknown }).prompt_id === "string",
+      shapeHint: "the enqueue result ({ prompt_id, … })",
+    });
+  } catch (err) {
+    throw new ComfyUIError(
+      `${err instanceof Error ? err.message : String(err)} ` +
+        `OUTCOME UNDETERMINED: the POST to /prompt was accepted (HTTP ${res.status}) and the ` +
+        `workflow MAY ALREADY BE QUEUED — this is not proof it failed. Check queue ` +
+        `(action:"status") or get_history BEFORE re-submitting; a blind retry can run the ` +
+        `same workflow twice.`,
+      "ENQUEUE_UNVERIFIED",
+    );
+  }
   // NB: `data.number` is ComfyUI's monotonic priority counter (and is NEGATIVE
   // for front-inserted jobs) — NOT the remaining queue depth. The old SDK path
   // returned exec_info.queue_remaining; to preserve an accurate count now that
@@ -533,6 +617,9 @@ async function queueRemainingCount(): Promise<number | undefined> {
  * the expected validation JSON (#485).
  */
 async function buildEnqueueError(res: Response): Promise<ComfyUIError> {
+  // unknown-ok: "" only routes to the GENERIC status message, which reports the
+  // HTTP status and claims nothing about node errors. An unread body and an empty
+  // body get the same honest fallback rather than a fabricated validation result.
   const bodyText = await res.text().catch(() => "");
   const generic = `ComfyUI /prompt returned ${res.status} ${res.statusText}`;
 
@@ -697,6 +784,12 @@ export async function getLogs(): Promise<string[]> {
     try {
       text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
     } catch (err2) {
+      // A DIAGNOSED non-JSON answer is not a connection failure — the server (or
+      // whatever is in front of it) replied, and the diagnosis already names the
+      // endpoint, the status and what answered. Wrapping it in a ConnectionError
+      // titled "Failed to fetch" contradicted its own contents and sent readers
+      // to check whether ComfyUI was up when it demonstrably was (#828).
+      if (isNonJsonResponseError(err2)) throw err2;
       const detail = err2 instanceof Error ? err2.message : String(err2);
       throw new ConnectionError(
         `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
@@ -763,7 +856,7 @@ function settingsVersionDriftError(): ComfyUIError {
 export async function getSettings(): Promise<Record<string, unknown>> {
   requireLocalMode("settings");
   const client = getClient();
-  const res = await client.fetchApi("/settings");
+  const res = await comfyApiFetch("/settings");
   if (res.status === 404) throw settingsVersionDriftError();
   return await readComfyJson<Record<string, unknown>>(res, {
     url: "/settings",
@@ -792,8 +885,25 @@ export async function getSetting(id: string): Promise<unknown> {
   requireLocalMode("settings");
   const client = getClient();
   const url = `/settings/${encodeURIComponent(id)}`;
-  const res = await client.fetchApi(url);
+  const res = await comfyApiFetch(url);
   if (res.status === 404) return undefined;
+  // ONLY 404 means "unset". Every other error status must throw (review finding 1).
+  //
+  // This branch could not run before #385 made it reachable, and without it the
+  // function reopens the exact hole its own docstring says was closed: a 403 or
+  // 500 carrying a gateway's JSON error envelope parses fine and is RETURNED AS
+  // THE STORED VALUE, and a 502 with an empty body reports "unset (frontend
+  // default applies)" for a setting nobody read. `set_ui` echoes this call as
+  // `previous:`, so a user who then writes a value is told the old one was unset
+  // and cannot restore it.
+  if (!res.ok) {
+    throw new ComfyUIError(
+      `ComfyUI ${url} answered ${describeStatus(res.status, res.statusText)}, so this setting could ` +
+        `NOT be read. That is not a report that it is unset — nothing was read. Only a 404 means ` +
+        `"unset (frontend default applies)" on builds that 404 the per-id route.`,
+      "HTTP_ERROR",
+    );
+  }
   const text = await res.text();
   if (text.trim() === "") return undefined;
   try {
@@ -808,6 +918,7 @@ export async function getSetting(id: string): Promise<unknown> {
       classifyNonJson({
         url,
         status: res.status,
+        statusText: res.statusText,
         contentType: res.headers.get("content-type") ?? "",
         body: text,
       }),
@@ -824,16 +935,24 @@ export async function getSetting(id: string): Promise<unknown> {
 export async function setSetting(id: string, value: unknown): Promise<void> {
   requireLocalMode("settings");
   const client = getClient();
-  const res = await client.fetchApi(`/settings/${encodeURIComponent(id)}`, {
+  const res = await comfyApiFetch(`/settings/${encodeURIComponent(id)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(value),
   });
   if (res.status === 404) throw settingsVersionDriftError();
   if (!res.ok) {
+    // unknown-ok: "" is interpolated into an ERROR MESSAGE and nothing else — the
+    // HTTP status is reported either way, so an unreadable body costs detail in the
+    // text, never a wrong conclusion. Verified there is no branch on this value.
+    //
+    // #385 made this branch REACHABLE, and it was printing 500 raw bytes. A
+    // reflecting gateway answers `invalid token: Bearer <ours>` and that went
+    // straight into a tool result (review finding 2). Body and reason phrase both
+    // go through the scrubbers now, as everywhere else.
     const body = await res.text().catch(() => "");
     throw new ConnectionError(
-      `ComfyUI /settings/${id} returned ${res.status} ${res.statusText}: ${body.slice(0, 500)}`,
+      `ComfyUI /settings/${id} returned ${describeStatus(res.status, res.statusText)}: ${bodyPrefixOf(body)}`,
     );
   }
 }
@@ -855,8 +974,23 @@ export async function getHistory(
   if (isCloudMode()) return cloudClient.getHistory(promptId);
   const client = getClient();
   const path = promptId ? `/history/${promptId}` : "/history";
-  const res = await client.fetchApi(path);
-  return res.json() as Promise<Record<string, HistoryEntry>>;
+  const res = await comfyApiFetch(path);
+  // #1149 — this was a bare res.json(), the last unguarded parse on the media
+  // read paths. A reporter on a remote H100 got `Unexpected end of JSON input`
+  // from get_history and get_image after a completed video render, which
+  // get_image then wrapped as HISTORY_UNREADABLE: a raw parser message standing
+  // in for a diagnosis, naming no endpoint and no status, for a render that had
+  // demonstrably succeeded.
+  //
+  // readComfyJson is what every sibling read already uses (#918/#946/#952): it
+  // names the URL, the status, the content type and a body prefix, so an empty
+  // body, an auth gate's login page and a proxy's HTML are each said out loud
+  // rather than collapsing into one parser error.
+  //
+  // No expectShape: /history's value is an object keyed by prompt id, and `{}`
+  // is a perfectly valid EMPTY history. Asserting a shape here would turn a
+  // legitimately empty answer into a fabricated failure — the opposite defect.
+  return readComfyJson<Record<string, HistoryEntry>>(res, { url: path });
 }
 
 /**
@@ -871,7 +1005,7 @@ export async function fetchImage(
   if (isCloudMode()) return cloudClient.fetchImage(filename, type, subfolder);
   const client = getClient();
   const params = new URLSearchParams({ filename, type, subfolder });
-  const res = await client.fetchApi(`/view?${params.toString()}`);
+  const res = await comfyApiFetch(`/view?${params.toString()}`);
   if (!res.ok) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
@@ -917,13 +1051,31 @@ export async function uploadImageHttp(
   formData.append("type", "input");
   formData.append("overwrite", "true");
   if (subfolder) formData.append("subfolder", subfolder);
-  const res = await client.fetchApi("/upload/image", {
+  const res = await comfyApiFetch("/upload/image", {
     method: "POST",
     body: formData,
   });
   if (!res.ok) {
+    // This branch only became REACHABLE with #385, and reaching it must not cost
+    // the #1160 diagnosis. An auth gate answering 401 with a sign-in page is the
+    // reported case, and "returned 401: <!DOCTYPE html>…" is strictly worse than
+    // naming the gate and saying which layer wants the credential.
+    //
+    // It must also not dump a RAW body: a gateway that reflects the request can
+    // put our own credential in it, which is exactly what bodyPrefixOf exists to
+    // prevent. Both problems are solved by classifying rather than interpolating.
+    // unknown-ok: "" only means an unreadable body, which classifyNonJson reports
+    // as an empty one — a loss of detail, never a wrong conclusion.
     const text = await res.text().catch(() => "");
-    throw new Error(`ComfyUI /upload/image returned ${res.status}: ${text}`);
+    throw new NonJsonResponseError(
+      classifyNonJson({
+        url: "/upload/image",
+        status: res.status,
+        statusText: res.statusText,
+        contentType: res.headers.get("content-type") ?? "",
+        body: text,
+      }),
+    );
   }
   // Never let a parser message stand in for a diagnosis: a proxy or a
   // still-starting server answering 200 with HTML used to surface as a raw

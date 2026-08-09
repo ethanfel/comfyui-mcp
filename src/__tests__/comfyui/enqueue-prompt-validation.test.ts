@@ -226,3 +226,58 @@ describe("#1037: a 200 can still carry rejected output branches", () => {
     expect(rejectedOutputs).toContain("node 2");
   });
 });
+
+// The same family as #1149/#1160/#828, at the worst possible place for it.
+//
+// A bare res.json() here sits AFTER a mutating POST that already succeeded at the
+// HTTP layer. If the body will not parse, the prompt may well be queued and
+// running — and `Unexpected end of JSON input` says nothing about that. A caller
+// reads it as "the run failed" and re-submits, queueing the render twice.
+describe("a 200 whose body is not the enqueue result", () => {
+  beforeEach(() => {
+    comfyuiFetch.mockReset();
+  });
+
+  it("does not leak a bare parser message for an empty body", async () => {
+    comfyuiFetch.mockResolvedValue(res(200, "", "OK"));
+    const err = (await enqueuePrompt({}, undefined).catch((e: unknown) => e)) as Error;
+    expect(err.message).not.toMatch(/^Unexpected end of JSON input/);
+    expect(err.message).toMatch(/\/prompt/);
+  });
+
+  it("states the DELIVERY DOUBT — the workflow may already be queued", async () => {
+    // The whole point. "It errored" must not read as "nothing happened" after a
+    // POST the server accepted.
+    comfyuiFetch.mockResolvedValue(res(200, "<!doctype html><html>login</html>", "OK"));
+    const err = (await enqueuePrompt({}, undefined).catch((e: unknown) => e)) as Error;
+    expect(err.message).toMatch(/OUTCOME UNDETERMINED/);
+    expect(err.message).toMatch(/MAY ALREADY BE QUEUED/);
+    expect(err.message).toMatch(/BEFORE re-submitting/);
+    expect(err.message).toMatch(/run the same workflow twice/i);
+  });
+
+  it("does NOT use the OUTCOME UNKNOWN sentinel, which other code matches on", async () => {
+    // rebootDropped()/isReconnectDrop() classify a POST-WRITE drop with
+    // /disconnected mid-command|OUTCOME UNKNOWN/i. Reusing that exact phrase here
+    // would silently reclassify a proxy's HTML answer as a reboot drop.
+    comfyuiFetch.mockResolvedValue(res(200, "", "OK"));
+    const err = (await enqueuePrompt({}, undefined).catch((e: unknown) => e)) as Error;
+    expect(err.message).not.toMatch(/OUTCOME UNKNOWN/);
+  });
+
+  it("rejects valid JSON that carries no prompt_id, instead of returning undefined", async () => {
+    // A gateway's own JSON error envelope parses fine. Reading prompt_id off it
+    // would hand back `undefined` as an id and send every downstream poll chasing
+    // a job that was never queued.
+    comfyuiFetch.mockResolvedValue(res(200, { error: "upstream unavailable" }, "OK"));
+    const err = (await enqueuePrompt({}, undefined).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(ComfyUIError);
+    expect(err.message).toMatch(/OUTCOME UNDETERMINED/);
+  });
+
+  it("still returns the prompt_id on a normal success", async () => {
+    comfyuiFetch.mockResolvedValue(res(200, { prompt_id: "p-42", number: 3 }, "OK"));
+    const out = await enqueuePrompt({}, undefined);
+    expect(out.prompt_id).toBe("p-42");
+  });
+});

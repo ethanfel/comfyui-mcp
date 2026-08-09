@@ -134,6 +134,10 @@ export interface DownloadJob {
    *  in-flight record whose writer was PROVEN dead (#858) — no live transfer was
    *  aborted, so no renderer may claim a resumable partial was deliberately left. */
   reclaimedDead?: boolean;
+  /** #1148 — this terminal record was carried forward from a dead orchestrator's
+   *  channel dir. The transfer stopped because its PROCESS exited, not because the
+   *  server or URL failed. */
+  interruptedByRestart?: boolean;
 }
 
 interface Entry {
@@ -836,6 +840,7 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
     reclaimedDead: rec.reclaimed_dead,
+    interruptedByRestart: rec.interrupted_by_restart,
   };
 }
 

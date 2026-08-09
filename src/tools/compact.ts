@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { errorToToolResult } from "../utils/errors.js";
+import { ComfyUIError, errorToToolResult } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import type { CatalogedTool, ToolCatalog } from "./catalog.js";
 import { retiredToolMessage } from "./vocabulary.js";
@@ -248,9 +248,59 @@ export function registerCompactTools(
       try {
         return await tool.handler(validated.data as Record<string, unknown>);
       } catch (err) {
-        return errorToToolResult(err);
+        return errorToToolResult(contextualizeBareParseError(err, name));
       }
     },
+  );
+}
+
+/**
+ * A BACKSTOP for a bare `JSON.parse` message reaching a caller (#1160).
+ *
+ * The repo's own request paths classify this properly: readComfyJson names the
+ * URL, status, content type and body prefix; `/upload/image` and `/view` both
+ * report a non-OK status before parsing; the argument parser above catches its
+ * own JSON.parse. Every one of those was checked against this report and none of
+ * them is the source.
+ *
+ * A reporter on an AUTHENTICATED remote still got `Unexpected end of JSON input`
+ * from `upload_image` AND `get_image` — identical text from two different
+ * endpoints, which points at a layer below all of that (the ComfyUI client
+ * library's own fetch, or an auth proxy answering somewhere the guards do not
+ * reach). Without their server I cannot say which.
+ *
+ * What I can say is that the message is useless wherever it comes from: it names
+ * no endpoint, no status, and — for an upload — does not say whether the POST was
+ * delivered. So this catches the shape at the one choke point every compact call
+ * passes through and attaches what IS known: the tool, and the fact that a POST's
+ * outcome is undetermined.
+ *
+ * Deliberately narrow. Only a bare `SyntaxError` whose message is one of V8's
+ * JSON-parse forms is rewritten, and the original text is kept at the front so
+ * anything matching on it still matches. A properly classified error (a
+ * NonJsonResponseError, a ComfyUIError) passes through untouched — this must not
+ * paper over the diagnostics that already work.
+ */
+export function contextualizeBareParseError(err: unknown, toolName: string): unknown {
+  if (!(err instanceof SyntaxError)) return err;
+  const msg = err.message ?? "";
+  const isJsonParse =
+    /^Unexpected end of JSON input$/.test(msg) ||
+    /^Unexpected (?:token|non-whitespace character).*JSON/i.test(msg) ||
+    /^JSON\.parse:/.test(msg);
+  if (!isJsonParse) return err;
+  return new ComfyUIError(
+    `${msg} — while running ${toolName}. A JSON response could not be parsed and the ` +
+      `failure escaped without naming the endpoint, so this is NOT a problem with your ` +
+      `arguments. The usual cause is something other than ComfyUI answering the request: ` +
+      `an auth gate or proxy returning an empty body, a login page, or a redirect. Check ` +
+      `that the configured COMFYUI_URL is reachable WITHOUT a browser session — a panel ` +
+      `that works proves the browser is authenticated, not that this server is. ` +
+      `get_system_stats (action:"health") exercises the same path and reports the status. ` +
+      `IMPORTANT: if ${toolName} sends data (an upload), the request may or may not have ` +
+      `been delivered — verify before retrying rather than assuming nothing happened.`,
+    "NON_JSON_RESPONSE",
+    { tool: toolName, original: msg },
   );
 }
 

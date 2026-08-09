@@ -10,6 +10,7 @@ import type {
 } from "../comfyui/types.js";
 import { logger } from "../utils/logger.js";
 import { JobWatcher } from "./job-watcher.js";
+import { convertApiToUi, isUiFormat } from "./workflow-converter.js";
 
 export interface EnqueueWorkflowOptions {
   disable_random_seed?: boolean;
@@ -129,6 +130,58 @@ async function randomizeSeeds(
   return copy;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+async function withWorkflowMetadata(
+  workflow: WorkflowJSON,
+  extraData?: Record<string, unknown>,
+): Promise<Record<string, unknown> | undefined> {
+  // Present but not an object (an array, a string) — we cannot merge into it,
+  // and spreading it would DISCARD whatever the caller put there. Attaching this
+  // metadata is an enhancement; silently dropping a field the caller set would be
+  // a regression, so leave the request exactly as it came.
+  if (extraData?.extra_pnginfo !== undefined && !isRecord(extraData.extra_pnginfo)) {
+    logger.debug("extra_pnginfo is not an object; leaving it untouched (no UI metadata attached)", {
+      type: Array.isArray(extraData.extra_pnginfo) ? "array" : typeof extraData.extra_pnginfo,
+    });
+    return extraData;
+  }
+
+  const extraPngInfo = isRecord(extraData?.extra_pnginfo)
+    ? extraData.extra_pnginfo
+    : {};
+
+  // A valid caller-provided canvas is authoritative. Do not spend time fetching
+  // object_info or replace layout/provenance the caller already supplied.
+  if (isUiFormat(extraPngInfo.workflow)) return extraData;
+
+  try {
+    // Reuse the client's existing TTL cache and single-flight request. Seed
+    // randomization may already have warmed this exact snapshot.
+    const objectInfo = await clientGetObjectInfo();
+    const { workflow: uiWorkflow, warnings } = convertApiToUi(workflow, objectInfo);
+    if (warnings.length > 0) {
+      logger.warn("Workflow UI metadata conversion completed with warnings", {
+        warnings,
+      });
+    }
+    return {
+      ...(extraData ?? {}),
+      extra_pnginfo: {
+        ...extraPngInfo,
+        workflow: uiWorkflow,
+      },
+    };
+  } catch (err) {
+    logger.warn("Workflow UI metadata conversion failed; enqueueing without it", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return extraData;
+  }
+}
+
 /**
  * Fire-and-forget workflow enqueue. Returns prompt_id immediately
  * without waiting for execution to complete.
@@ -144,10 +197,12 @@ export async function enqueueWorkflow(
         new Set(options?.preserve_seed_inputs ?? []),
       );
 
+  const extraData = await withWorkflowMetadata(workflow, options?.extra_data);
+
   logger.info("Enqueueing workflow (fire-and-forget)");
   const result = await clientEnqueuePrompt(
     workflow as Record<string, unknown>,
-    options?.extra_data,
+    extraData,
   );
   logger.info("Workflow enqueued", {
     prompt_id: result.prompt_id,

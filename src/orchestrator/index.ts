@@ -150,7 +150,7 @@ import {
 import { AskAnswers, preview as previewQuestion } from "./ask-answer-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
-import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey } from "../services/download-progress.js";
+import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey, markSupersededByLive, migrateInFlightJobs } from "../services/download-progress.js";
 import { hasActiveTrainingJob, reconcileStaleTrainingJobs } from "../services/training-jobs.js";
 import {
   buildQueueStatusFrame,
@@ -1063,6 +1063,20 @@ export async function runPanelOrchestrator(): Promise<void> {
   let pairToken: string | null = envPairToken;
   let pairListenerStarted = false;
   let pairTunnel: { url: string; stop: () => void } | null = null;
+  /**
+   * #875 — is a phone paired over a TUNNEL right now?
+   *
+   * Gates the self-restarter (see its allIdle below). A tunnel URL cannot survive
+   * a restart: cloudflared mints a fresh quick-tunnel hostname per run and there
+   * is no way to pin it, so restarting under a live tunnel breaks a phone that is
+   * connected at that moment. A LAN URL is fine — the token persists now — which
+   * is why this is narrowed to the tunnel rather than to pairing in general.
+   */
+  // Requires BOTH: a tunnel exists AND a client is connected through it right
+  // now. `pairTunnel` alone is not liveness — nothing stops the tunnel until the
+  // process exits, so gating on it would postpone every future update after a
+  // single pairing, rather than deferring to the next disconnect as intended.
+  const tunnelPairingLive = (): boolean => pairTunnel !== null && bridge.hasLiveHeadlessClient();
   // #875 — the token is PERSISTED, not per-session. It used to be minted fresh on
   // every run, so a self-restart (on by default, hourly npm check) invalidated the
   // URL the phone had saved. The reporter experienced that as "updating the npm
@@ -1317,6 +1331,28 @@ export async function runPanelOrchestrator(): Promise<void> {
   try {
     for (const d of readdirSync(tmpdir())) {
       if (d.startsWith(`comfyui-mcp-progress-${bridgePort}-`) && join(tmpdir(), d) !== progressDir) {
+        // #1148 — carry any IN-FLIGHT download records forward before deleting.
+        //
+        // The persisted store exists so a reconnecting session can still resolve
+        // an in-flight download by id (#529), and download_model's status text
+        // promises exactly that. This reap deleted the store that promise rests
+        // on: a reporter's 12GB transfer answered "No download matching id" and
+        // "No downloads are being tracked", with no file, no partial, and no
+        // error event — 40 minutes lost invisibly while the documented contract
+        // told their agent to wait rather than re-issue.
+        //
+        // The transfer IS dead (it streamed inside the exited process), so this
+        // resurrects nothing. It replaces the silence with a terminal record
+        // saying the download was interrupted, which status can find by the id
+        // the caller already holds. Runs BEFORE the delete, and its failure is
+        // never allowed to skip the delete.
+        try {
+          mkdirSync(progressDir, { recursive: true, mode: 0o700 });
+          const n = migrateInFlightJobs(join(tmpdir(), d), progressDir);
+          if (n > 0) logger.info(`Carried ${n} interrupted download record(s) forward`);
+        } catch {
+          /* best-effort */
+        }
         rmSync(join(tmpdir(), d), { recursive: true, force: true });
       }
     }
@@ -5323,6 +5359,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       // a queued terminal cancelled by a newer live attempt. Don't fire an empty
       // "download_done" turn in that case.
       if (settled.length === 0) continue;
+      // #1150 — a corrected retry of a 404 is a DIFFERENT id writing the SAME
+      // filename, so the (id, target) eviction above cannot see it. The live rows
+      // are already in hand this tick; markSupersededByLive asks them by name.
+      markSupersededByLive(settled, downloads);
       // #884 — a download has no originating TAB (its row names the owning
       // conversation), so its turn INHERITS the conversation's LAST
       // ESTABLISHED origin — never the active tab (confirming gate 2, P0 rule:
@@ -5916,7 +5956,24 @@ export async function runPanelOrchestrator(): Promise<void> {
       // …and the same for an ask answer the user actually gave that has not
       // reached the agent yet (#486). Restarting would destroy it silently.
       !AskAnswers.hasOutstanding() &&
-      !QueueMonitor.isBusy(),
+      !QueueMonitor.isBusy() &&
+      // #875 — a LIVE TUNNEL PAIRING SESSION defers the restart to the next
+      // disconnect. The token now persists, so a LAN URL survives a restart; a
+      // tunnel URL cannot, because cloudflared mints a fresh quick-tunnel
+      // hostname every run and there is no way to pin it. Restarting under a live
+      // tunnel therefore breaks a phone that is connected RIGHT NOW, to install
+      // an update nobody asked for at that moment — which is what the reporter
+      // experienced and (reasonably) blamed on the npm version.
+      //
+      // Deferral, not cancellation: the update check still runs and the restart
+      // stays armed, so it fires as soon as the tunnel goes away. The cost is
+      // that a tunnel left up indefinitely postpones updates indefinitely, so it
+      // is DISCLOSED — in pair-durability's tunnel note, which the panel shows at
+      // pair time. Deliberately not announced from here: this is a predicate the
+      // restarter polls, and emitting from it would either fire repeatedly or
+      // need its own state to suppress itself. Pair time is also where the user
+      // is actually looking (#1077: an orchestrator log may be unreachable).
+      !tunnelPairingLive(),
     announce: (text) => void bridge.push({ type: "say", text }),
     teardown: teardownCore,
   });

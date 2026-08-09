@@ -1035,9 +1035,67 @@ export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown }): boolea
   return ACTIVE_WORKFLOW_MUTATORS.has(name);
 }
 
-/** Tight default reply timeout for a MUTATING command with no explicit timeout —
- *  fail fast so the agent isn't blocked on a stuck write. */
-export const BRIDGE_DEFAULT_TIMEOUT_MS = 6000;
+/**
+ * Default reply timeout for a MUTATING command with no explicit timeout.
+ *
+ * This was 6000 ms — the flat pre-#574 default, kept when reads were raised to
+ * 20 s, on the rationale "fail fast so the agent isn't blocked on a stuck write".
+ * That rationale had the asymmetry backwards, and #694's recurrence is what it
+ * costs: `panel_set_node_mode` timed out at 6 s on a live tab, and an immediate
+ * `panel_query_graph` showed the mode HAD been set.
+ *
+ * The reason reads got 20 s applies to writes with more force, not less. It is the
+ * same busy-but-alive main thread — a write does strictly more of that work, since
+ * it mutates, re-renders, and answers the workflow-stamp check — and the two
+ * failures are not equally expensive:
+ *
+ *   - A read abandoned too early costs a retry. Nothing is ambiguous.
+ *   - A write abandoned too early is UNRECOVERABLE ambiguity. The command was
+ *     already delivered, so it may have applied; the bridge deliberately refuses
+ *     to auto-retry it (#334), and the caller is left to verify by hand before it
+ *     can safely do anything. Which is exactly the manual step the reporter
+ *     performed.
+ *
+ * So the cheap failure got the patience and the expensive one got the hair
+ * trigger. Writes now wait as long as reads. This lowers how OFTEN a live tab is
+ * declared unknown; it does not make an unknown recoverable — that needs the
+ * caller-supplied retry identity #694 is actually about.
+ *
+ * Never below the read bound: see the invariant test.
+ */
+export const BRIDGE_DEFAULT_TIMEOUT_MS = 20_000;
+
+/**
+ * How long after a headless client's socket closes it still counts as present
+ * for the #875 restart-deferral gate (#1176).
+ *
+ * Chosen from what the window has to cover and what it costs if it is wrong.
+ *
+ * It must cover: a phone whose screen went off, which the mobile OS suspends
+ * within seconds and which reconnects when the user next picks it up. That is a
+ * pocket interval — minutes to hours, unbounded in principle.
+ *
+ * It costs: a deferred auto-update, for this long, after a phone genuinely
+ * leaves. Nothing is lost — the update applies at the next check — so the price
+ * of being generous is a delay, while the price of being stingy is the reported
+ * bug: a rotated tunnel hostname and a phone that cannot get back in.
+ *
+ * Asymmetric, so lean generous. Thirty minutes covers a meeting or a commute and
+ * still lets an install that has truly lost its phone update within the hour,
+ * with no unpairing step and no user action — which is the property that made the
+ * sticky `isHeadless()` unacceptable for this gate.
+ */
+export const HEADLESS_RECENCY_MS = 30 * 60_000;
+
+/**
+ * The first panel version whose save / new-workflow replies carry `workflow_uuid`
+ * (panel #800) — the value `refreshFenceFromOwnReply` (#1161) needs to repair a
+ * session fence without the round trip the fence itself refuses.
+ *
+ * Verified against the panel repo rather than assumed: #800 landed after the
+ * 0.11.44 release commit and first shipped in 0.11.45.
+ */
+export const PANEL_MIN_VERSION_REPLY_UUID = "0.11.45";
 /** More tolerant default for a READ (idempotent) command with no explicit timeout.
  *  A legitimately busy-but-alive panel main thread — e.g. Preview3D parsing a large
  *  FBX — can take many seconds to service a graph_query; failing it at the tight
@@ -2319,6 +2377,12 @@ export class UiBridge {
       let wasPrimary = false;
       if (tabId && this.conns.get(tabId)?.sock === sock) {
         wasPrimary = true;
+        // #1176 — start the recency clock BEFORE the conn is dropped, while its
+        // `headless` flag is still readable. This is the only place that knows a
+        // headless socket just closed; after the delete the information is gone.
+        if (this.conns.get(tabId)?.headless === true) {
+          this.lastHeadlessDisconnectAt = performance.now();
+        }
         this.conns.delete(tabId);
         if (this.lastActiveTabId === tabId) this.setLastActiveTab(null);
         // The mirrored desktop tab is gone — detach its viewers so their input
@@ -2446,6 +2510,51 @@ export class UiBridge {
     // state to a human should use tabGraphMutationCapability instead — see below.
     const r = this.tabGraphMutationCapability(tabId);
     return r.known ? r.canMutate : false;
+  }
+
+  /**
+   * Is the connected panel PROVABLY too old to publish a workflow_uuid on the
+   * replies the fence recovery trusts? (#1043)
+   *
+   * `refreshFenceFromOwnReply` (#1161) repairs the session fence from the
+   * command's OWN reply, before attempting the round trip the fence refuses.
+   * That depends on the panel putting `workflow_uuid` on a save / new-workflow
+   * reply, which is panel #800 — first shipped in panel 0.11.45.
+   *
+   * Three reports (#1043, #1077, #1174) hit the same deadlock on panels BELOW
+   * that: the recovery finds nothing to adopt, falls back to the fenced read, and
+   * the user is told only that the identity "could not be read". The fix is
+   * present and inert, and the message names none of that.
+   *
+   * TRI-STATE, and the distinction is load-bearing: an UNKNOWN version must not
+   * render as "your panel is too old", which would send someone to update a panel
+   * that is already current. Only a parseable version below the minimum returns
+   * `{ tooOld: true }`.
+   */
+  panelTooOldForReplyUuid(tabId: string): {
+    tooOld: boolean;
+    version?: string;
+    needed: string;
+  } {
+    const needed = PANEL_MIN_VERSION_REPLY_UUID;
+    let version: string | undefined;
+    let advertised = false;
+    try {
+      const t = this.resolveTarget(tabId);
+      version = t.panelVersion;
+      // #1043 (codex review) — the version must come from THIS connection's own
+      // hello. A re-hello that omits `panel_version` INHERITS the previous value,
+      // so a panel that was updated and reloaded without re-advertising would
+      // still show its old version — and we would tell someone to update a panel
+      // they just updated. `panelVersionAdvertised` exists for exactly this, and
+      // the proactive command gate already refuses to act on an inherited value.
+      advertised = t.panelVersionAdvertised === true;
+    } catch {
+      version = undefined;
+    }
+    if (!advertised) return { tooOld: false, needed };
+    if (!version || !SEMVER_RE.test(version.trim())) return { tooOld: false, needed };
+    return { tooOld: compareSemver(version, needed) < 0, version, needed };
   }
 
   /**
@@ -2718,6 +2827,77 @@ export class UiBridge {
 
   /** True when the tab advertised itself as a canvas-less (mobile/remote) client
    *  in its `hello`. Unknown tabs → false. */
+  /**
+   * #875 — is any CURRENTLY-CONNECTED client headless (a paired phone / mirror)?
+   *
+   * Deliberately NOT `isHeadless()`, which is STICKY by design: a tab that ever
+   * connected headless stays "headless" while offline so a render finishing
+   * during a disconnect is byte-inlined for the mailbox. That is right for
+   * rendering decisions and wrong for a LIVENESS gate — using it would report a
+   * phone that paired once and left as still connected, and the self-restarter
+   * would defer updates forever.
+   */
+  hasLiveHeadlessClient(): boolean {
+    for (const c of this.conns.values()) if (c.headless === true) return true;
+    // #1176 — A BACKGROUNDED PHONE IS NOT A DEPARTED PHONE.
+    //
+    // `conns` holds currently-OPEN sockets. A phone at work with its screen off
+    // has had its WebSocket suspended or closed by the mobile OS, so the loop
+    // above answers false and the restart gate opens — and the restart mints a
+    // NEW cloudflared hostname. A reporter picked their phone up to:
+    //
+    //   Failed host lookup: 'cameron-timing-face-spies.trycloudflare.com'
+    //   (No address associated with hostname, errno = 7)
+    //
+    // Not a timeout and not a refusal: the hostname no longer existed.
+    //
+    // The sticky `isHeadless()` was rejected for this gate, correctly — a phone
+    // that paired once and left would defer updates forever. But "socket open
+    // right now" and "ever paired" are not the only options, and the state
+    // between them is not an edge case: a phone in a pocket is the EXPECTED
+    // condition for someone who paired it to use at work.
+    //
+    // So: a bounded recency window. It keeps the property that killed the sticky
+    // option — a phone that genuinely left stops deferring, on its own, without
+    // anyone unpairing anything — while covering the normal mobile case.
+    return this.recentHeadlessWithin(HEADLESS_RECENCY_MS);
+  }
+
+  /** Was a headless client connected within `ms`? (#1176) Reads the disconnect
+   *  clock, so it answers true for a phone whose socket the OS suspended and
+   *  false for one that has genuinely been gone longer than the window. */
+  private recentHeadlessWithin(ms: number): boolean {
+    if (this.lastHeadlessDisconnectAt === undefined) return false;
+    return performance.now() - this.lastHeadlessDisconnectAt < ms;
+  }
+
+  /**
+   * When a headless client last held an open socket (#1176), on the MONOTONIC
+   * clock — `performance.now()`, not `Date.now()`.
+   *
+   * This measures ELAPSED TIME, and the wall clock is not a measure of elapsed
+   * time: an NTP correction can move it. On Windows a step of more than the
+   * window would make a phone that disconnected seconds ago look long gone, and
+   * the restart would rotate the tunnel hostname — the exact bug this window
+   * exists to prevent, reintroduced by the clock rather than by the logic. A
+   * backward step would defer far longer than intended. (codex review, PR #1185)
+   *
+   * `performance.now()` is monotonic from process start, which is the right
+   * lifetime here: the value is only ever compared against another reading from
+   * the same process, and a restart clears it — after which there is no phone
+   * this process has seen, which is the correct answer anyway.
+   *
+   * Undefined until a headless client actually disconnects, so an install that
+   * has never seen a phone can never defer.
+   */
+  private lastHeadlessDisconnectAt: number | undefined;
+
+  /** Test seam: place the recency clock in the past without sleeping. Takes a
+   *  `performance.now()`-based reading, matching the field. */
+  markHeadlessDisconnectForTests(at: number): void {
+    this.lastHeadlessDisconnectAt = at;
+  }
+
   isHeadless(tabId: string): boolean {
     // Sticky: a tab that EVER connected headless stays "headless" even while
     // offline, so a render finishing during a disconnect is byte-inlined (not a

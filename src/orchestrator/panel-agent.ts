@@ -623,7 +623,7 @@ export class PanelAgent {
       images?: ImageRef[];
       error?: string;
       note?: string;
-      downloads?: Array<{ name: string; status: string }>;
+      downloads?: Array<{ name: string; status: string; supersededByLive?: boolean }>;
       /** #468 — run identity + how it correlates to a run this session queued. */
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
@@ -768,7 +768,16 @@ export class PanelAgent {
       const dl = (ev.downloads ?? []).filter((d) => d && d.name);
       if (dl.length === 0) return false;
       const done = dl.filter((d) => d.status === "done").map((d) => d.name);
-      const failed = dl.filter((d) => d.status !== "done").map((d) => d.name);
+      // #1150 — a FAILED attempt whose filename is being downloaded RIGHT NOW by
+      // a newer attempt. The two share a name but not an id, so the panel#489
+      // supersession key never matched and the eviction never fired: a reporter
+      // was woken with "Model download FAILED: <name>" for two files that
+      // download_model action:"status" showed streaming at 20% and 13% seconds
+      // later. Naming them the same way as a real failure is what made the agent
+      // report a false failure to the user.
+      const failedDead = dl.filter((d) => d.status !== "done" && !d.supersededByLive);
+      const failedRetried = dl.filter((d) => d.status !== "done" && d.supersededByLive);
+      const failed = [...failedDead, ...failedRetried].map((d) => d.name);
       const parts: string[] = [];
       // This event is raised by the TRANSFER, which finishes BEFORE the placement
       // check against the connected ComfyUI does. Saying "finished" here would be a
@@ -776,15 +785,32 @@ export class PanelAgent {
       // install the running server never reads — so the wording says only what the
       // event actually proves and points at download_model action:"status" for the verdict.
       if (done.length) parts.push(`transfer completed: ${done.join(", ")}`);
-      if (failed.length) parts.push(`FAILED: ${failed.join(", ")}`);
+      if (failedDead.length) parts.push(`FAILED: ${failedDead.map((d) => d.name).join(", ")}`);
+      if (failedRetried.length) {
+        parts.push(
+          `an EARLIER attempt failed for ${failedRetried.map((d) => d.name).join(", ")}, but a ` +
+            `NEWER download of that name is IN FLIGHT right now — do NOT report these as failed`,
+        );
+      }
       const plural = dl.length > 1 ? "these downloads" : "it";
       text =
         `[panel event] Model download ${parts.join("; ")}. ` +
-        `The bytes finished transferring; whether the connected ComfyUI can actually LOAD ` +
-        `${plural} is confirmed separately. If you were waiting on ${plural} to continue a task, ` +
+        // The claim was UNCONDITIONAL, so a FAILED-only batch asserted that bytes
+        // transferred — for a 404, zero bytes moved. Worse, it argued against the
+        // correct reading: the reporter's agent had a sentence insisting the
+        // transfer completed while the file was still streaming (#1150). It is
+        // only ever a statement about the `done` entries.
+        (done.length
+          ? `The bytes finished transferring for the completed one${done.length > 1 ? "s" : ""}; ` +
+            `whether the connected ComfyUI can actually LOAD ${plural} is confirmed separately. `
+          : `NOTHING is claimed to have transferred here. `) +
+        `If you were waiting on ${plural} to continue a task, ` +
         `call download_model action:"status" FIRST for the verified path and placement verdict${failed.length ? " or the error detail" : ""} — ` +
-        `do not tell the user a model is ready until download_model action:"status" confirms it. ` +
-        `Otherwise reply with ONE short sentence acknowledging it and no tool calls.`;
+        `do not tell the user a model is ready until download_model action:"status" confirms it` +
+        (failedRetried.length
+          ? `, and do not tell them one failed until status shows no live attempt for that name`
+          : "") +
+        `. Otherwise reply with ONE short sentence acknowledging it and no tool calls.`;
     }
     if (!text) return false;
     this.busy = true;
@@ -2282,7 +2308,7 @@ export class PanelAgentManager {
       images?: ImageRef[];
       error?: string;
       note?: string;
-      downloads?: Array<{ name: string; status: string }>;
+      downloads?: Array<{ name: string; status: string; supersededByLive?: boolean }>;
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
       replayed?: boolean;

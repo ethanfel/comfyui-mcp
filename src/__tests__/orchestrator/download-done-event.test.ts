@@ -128,3 +128,105 @@ describe("download-completion agent event (#547)", () => {
     expect(delivered).toBe(false);
   });
 });
+
+// #1150 — the event told a user two downloads had FAILED while they were
+// actively streaming at 20% and 13%.
+//
+// Two 404s were retried with corrected URLs and the same target filenames. The
+// panel#489 supersession key is (id, target), and a corrected retry has a
+// DIFFERENT id, so the eviction never fired and both filenames flushed as
+// failures. The event text carried no id, URL, or error — only the name — so
+// nothing distinguished the dead attempt from the live one.
+//
+// And "The bytes finished transferring" was unconditional, so a FAILED-only
+// batch asserted that bytes moved. For a 404, zero did — and that sentence
+// actively argued against the correct reading.
+describe("a failed attempt superseded by a live retry (#1150)", () => {
+  it("does NOT present a name that is currently downloading as a plain failure", async () => {
+    const backend = new TurnRecordingBackend();
+    const manager = makeManager(backend);
+    manager.send("tab-retry", "hi");
+    await waitFor(() => backend.turns.length >= 1);
+
+    manager.injectEvent("tab-retry", {
+      kind: "download_done",
+      downloads: [
+        { name: "MiniMax-H3.safetensors", status: "error", supersededByLive: true },
+      ],
+    });
+
+    await waitFor(() => backend.turns.length >= 2);
+    const t = backend.turns[1];
+    expect(t).toContain("MiniMax-H3.safetensors");
+    // The instruction that keeps an agent from reporting the false failure.
+    expect(t).toMatch(/do NOT report these as failed/);
+    expect(t).toMatch(/IN FLIGHT right now/);
+    // It must not read as a settled failure.
+    expect(t).not.toMatch(/FAILED: MiniMax-H3\.safetensors/);
+  });
+
+  it("claims NOTHING transferred when the whole batch failed", async () => {
+    const backend = new TurnRecordingBackend();
+    const manager = makeManager(backend);
+    manager.send("tab-404", "hi");
+    await waitFor(() => backend.turns.length >= 1);
+
+    manager.injectEvent("tab-404", {
+      kind: "download_done",
+      downloads: [{ name: "gone.safetensors", status: "error" }],
+    });
+
+    await waitFor(() => backend.turns.length >= 2);
+    const t = backend.turns[1];
+    expect(t).toContain("FAILED: gone.safetensors");
+    // The sentence that was false for a 404.
+    expect(t).not.toMatch(/bytes finished transferring/);
+    expect(t).toMatch(/NOTHING is claimed to have transferred/);
+  });
+
+  it("still claims the transfer for the entries that ACTUALLY completed", async () => {
+    const backend = new TurnRecordingBackend();
+    const manager = makeManager(backend);
+    manager.send("tab-mixed", "hi");
+    await waitFor(() => backend.turns.length >= 1);
+
+    manager.injectEvent("tab-mixed", {
+      kind: "download_done",
+      downloads: [
+        { name: "ok.safetensors", status: "done" },
+        { name: "bad.safetensors", status: "error" },
+      ],
+    });
+
+    await waitFor(() => backend.turns.length >= 2);
+    const t = backend.turns[1];
+    // Scoped to the completed ones — not withdrawn, and not over-claimed.
+    expect(t).toMatch(/bytes finished transferring for the completed one/);
+    expect(t).toContain("transfer completed: ok.safetensors");
+    expect(t).toContain("FAILED: bad.safetensors");
+  });
+
+  it("separates a genuinely dead failure from a retried one in the same batch", async () => {
+    const backend = new TurnRecordingBackend();
+    const manager = makeManager(backend);
+    manager.send("tab-both", "hi");
+    await waitFor(() => backend.turns.length >= 1);
+
+    manager.injectEvent("tab-both", {
+      kind: "download_done",
+      downloads: [
+        { name: "dead.safetensors", status: "error" },
+        { name: "retried.safetensors", status: "error", supersededByLive: true },
+      ],
+    });
+
+    await waitFor(() => backend.turns.length >= 2);
+    const t = backend.turns[1];
+    // The FAILED list itself runs to the next "; " separator — the retried name
+    // must not be inside it, however the rest of the sentence reads.
+    const failedList = /FAILED: ([^;]*)/.exec(t)?.[1] ?? "";
+    expect(failedList).toContain("dead.safetensors");
+    expect(failedList).not.toContain("retried.safetensors");
+    expect(t).toMatch(/EARLIER attempt failed for retried\.safetensors/);
+  });
+});

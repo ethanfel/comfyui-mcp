@@ -13,6 +13,7 @@ import {
   isCapabilityRefusal,
   defaultBridgeTimeoutMs,
   BRIDGE_DEFAULT_TIMEOUT_MS,
+  HEADLESS_RECENCY_MS,
   BRIDGE_READ_DEFAULT_TIMEOUT_MS,
   BRIDGE_READONLY_CMDS,
   isMutatingGraphCommand,
@@ -3326,7 +3327,28 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     // Preview3D loaded a large FBX on a busy-but-alive main thread.
     expect(defaultBridgeTimeoutMs("graph_query")).toBe(20_000);
     expect(defaultBridgeTimeoutMs("graph_query")).toBeGreaterThan(6000);
-    expect(defaultBridgeTimeoutMs("graph_query")).toBeGreaterThan(defaultBridgeTimeoutMs("graph_run"));
+  });
+
+  it("a WRITE is never abandoned sooner than a read (#694)", () => {
+    // This inverts what #574 left in place, and the inversion is the point.
+    //
+    // A read abandoned too early costs a retry. A write abandoned too early is
+    // unrecoverable ambiguity: it was already delivered so it may have applied,
+    // the bridge refuses to auto-retry it (#334), and the caller must go verify by
+    // hand. The cheap failure had the patience and the expensive one had the hair
+    // trigger — a reporter's panel_set_node_mode timed out at 6s on a live tab
+    // that had already applied it.
+    //
+    // Asserted as an INVARIANT rather than a number so re-tightening writes fails
+    // here no matter which constant someone edits.
+    for (const write of ["graph_run", "graph_add_node", "graph_set_node_mode", "workflow_save"]) {
+      expect(BRIDGE_READONLY_CMDS.has(write)).toBe(false);
+      expect(defaultBridgeTimeoutMs(write)).toBeGreaterThanOrEqual(
+        defaultBridgeTimeoutMs("graph_query"),
+      );
+      // And still past the old flat cutoff that produced the false unknowns.
+      expect(defaultBridgeTimeoutMs(write)).toBeGreaterThan(6000);
+    }
   });
 
   it("a no-timeout READ stays alive PAST the old 6s cutoff (end-to-end) (#357)", async () => {
@@ -4712,5 +4734,59 @@ describe("UiBridge.connectedServerOrigins (#952)", () => {
 
   it("is empty with nothing connected, and never throws", () => {
     expect(bridge.connectedServerOrigins()).toEqual([]);
+  });
+});
+
+// #875 — the liveness signal the self-restarter's tunnel gate depends on.
+//
+// isHeadless() is STICKY on purpose (a tab that ever connected headless stays so
+// while offline, so a render finishing during a disconnect is byte-inlined for
+// the mailbox). That is right for rendering and WRONG for liveness: using it
+// would report a phone that paired once and left as still connected, and the
+// restarter would defer updates forever instead of until the next disconnect.
+describe("#875: hasLiveHeadlessClient reports the LIVE set, not the sticky one", () => {
+  it("is false with no connections at all", async () => {
+    const { bridge: b } = await startBridgeOnFreePort();
+    expect(b.hasLiveHeadlessClient()).toBe(false);
+    await b.stop();
+  });
+
+  // The POSITIVE case, and the one that makes this suite non-vacuous: without it
+  // every assertion here would pass with the accessor hardcoded to false — a
+  // mutation to the STICKY isHeadless() killed nothing until this existed.
+  it("is TRUE while a headless client is connected, and false once it leaves", async () => {
+    const sock = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      sock.on("open", () => res());
+      sock.on("error", rej);
+    });
+    sock.send(JSON.stringify({ type: "hello", tab_id: "phone-live", title: "phone", headless: true }));
+    await new Promise((r) => setTimeout(r, 80));
+
+    expect(bridge.hasLiveHeadlessClient()).toBe(true);
+
+    sock.close();
+    await new Promise((r) => setTimeout(r, 150));
+    // #1176 — 150ms after the socket closed is NOT "the phone is gone". It is
+    // exactly the backgrounded case: the mobile OS suspends the socket within
+    // seconds of the screen going off. This assertion used to demand `false`
+    // here, and that is the bug — a reporter's restart rotated the cloudflared
+    // hostname during a pocket interval and their phone came back to a dead URL.
+    expect(bridge.hasLiveHeadlessClient()).toBe(true);
+
+    // The property that killed the sticky isHeadless() is still intact: a phone
+    // that has genuinely been gone longer than the window stops deferring, on
+    // its own, with no unpairing step and no user action.
+    bridge.markHeadlessDisconnectForTests(performance.now() - HEADLESS_RECENCY_MS - 1);
+    expect(bridge.hasLiveHeadlessClient()).toBe(false);
+  });
+
+  it("is false for a connected NON-headless (canvas) tab", async () => {
+    const sock = await connectPanel("tab-desktop");
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(bridge.hasLiveHeadlessClient()).toBe(false);
+
+    sock.close();
   });
 });

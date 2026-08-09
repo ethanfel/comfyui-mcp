@@ -4,7 +4,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolCatalog } from "../../tools/catalog.js";
-import { buildManifest, registerCompactTools, summarize } from "../../tools/compact.js";
+import {
+  buildManifest,
+  contextualizeBareParseError,
+  registerCompactTools,
+  summarize,
+} from "../../tools/compact.js";
 import { collectToolCatalog, registerFullTools } from "../../tools/index.js";
 import { TOOL_NAMES } from "../../tools/vocabulary.js";
 
@@ -576,4 +581,122 @@ describe("collectToolCatalog (real tool surface)", () => {
     const manifest = buildManifest(catalog);
     expect(manifest.length).toBeLessThan(30_000);
   }, 30_000);
+});
+
+// #1160 — a bare JSON.parse message reaching a caller.
+//
+// On an AUTHENTICATED remote, upload_image AND get_image both returned the raw
+// `Unexpected end of JSON input` — identical text from two different endpoints,
+// with no endpoint, status, content type, or delivery state. Every request path
+// in this repo that the report named is already guarded (readComfyJson names all
+// four; /upload/image and /view report a non-OK status before parsing; the args
+// parser catches its own JSON.parse), so the message escapes from a layer below
+// those. This is the backstop at the choke point every compact call passes.
+describe("a bare JSON parse error is contextualized (#1160)", () => {
+  function messageOf(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+  }
+
+  it("names the tool and says it is NOT an argument problem", () => {
+    const out = contextualizeBareParseError(
+      new SyntaxError("Unexpected end of JSON input"),
+      "upload_image",
+    );
+    const m = messageOf(out);
+    expect(m).toContain("upload_image");
+    expect(m).toMatch(/NOT a problem with your arguments/);
+  });
+
+  it("keeps the original text at the front so existing matchers still match", () => {
+    const m = messageOf(
+      contextualizeBareParseError(new SyntaxError("Unexpected end of JSON input"), "get_image"),
+    );
+    expect(m.startsWith("Unexpected end of JSON input")).toBe(true);
+  });
+
+  it("names the auth-gate reading, and that a working panel proves nothing about this server", () => {
+    // The reporter's exact situation: browser-authenticated panel fine, headless
+    // COMFYUI_URL 401. "The panel works" is the reasoning that hides it.
+    const m = messageOf(contextualizeBareParseError(new SyntaxError("Unexpected end of JSON input"), "upload_image"));
+    expect(m).toMatch(/auth gate or proxy/);
+    expect(m).toMatch(/WITHOUT a browser session/);
+    expect(m).toMatch(/get_system_stats/);
+  });
+
+  it("warns that an upload's delivery is UNDETERMINED", () => {
+    // A parse failure says nothing about whether the POST landed; "it errored"
+    // must not read as "nothing happened".
+    const m = messageOf(contextualizeBareParseError(new SyntaxError("Unexpected end of JSON input"), "upload_image"));
+    expect(m).toMatch(/may or may not have been delivered/);
+    expect(m).toMatch(/verify before retrying/);
+  });
+
+  it("covers the other V8 JSON-parse spellings", () => {
+    for (const msg of [
+      "Unexpected token '<', \"<!doctype \"... is not valid JSON",
+      "Unexpected non-whitespace character after JSON at position 4",
+    ]) {
+      expect(messageOf(contextualizeBareParseError(new SyntaxError(msg), "get_image"))).toMatch(
+        /NOT a problem with your arguments/,
+      );
+    }
+  });
+
+  it("does NOT rewrite a non-SyntaxError, however its message reads", () => {
+    // The instanceof check is a second guard on top of the message match: a
+    // library that reports a parse failure as a plain Error is not something we
+    // should be re-narrating as an auth-gate diagnosis.
+    const err = new Error("Unexpected end of JSON input");
+    expect(contextualizeBareParseError(err, "get_image")).toBe(err);
+  });
+
+  it("does NOT touch a SyntaxError that is not a JSON parse failure", () => {
+    const err = new SyntaxError("Invalid regular expression: missing /");
+    expect(contextualizeBareParseError(err, "get_image")).toBe(err);
+  });
+
+  it("does NOT paper over an error that is already diagnosed", () => {
+    // The guards that work must keep their own wording — this is a backstop, not
+    // a wrapper.
+    const err = new Error("/upload/image returned 401: <html>login</html>");
+    expect(contextualizeBareParseError(err, "upload_image")).toBe(err);
+  });
+});
+
+// THE WIRING. The unit tests above call contextualizeBareParseError directly, so
+// they cannot see the dispatcher dropping it — which is exactly the call-site
+// blindness this suite keeps getting caught by. Drive the real call_tool.
+describe("call_tool applies the parse backstop (#1160)", () => {
+  function catalogThatThrows(err: unknown): ToolCatalog {
+    const catalog = new ToolCatalog();
+    const registrar = catalog.asRegistrar();
+    catalog.setCategory("media");
+    registrar.tool("upload_image", "Upload a file.", {}, async () => {
+      throw err;
+    });
+    return catalog;
+  }
+
+  it("a handler throwing a bare JSON SyntaxError comes back contextualized", async () => {
+    const client = await compactPair(catalogThatThrows(new SyntaxError("Unexpected end of JSON input")));
+    const res = (await client.callTool({ name: "call_tool", arguments: { name: "upload_image" } })) as {
+      content?: Array<{ type: string; text?: string }>;
+    };
+    const t = textOf(res);
+    expect(t).toContain("Unexpected end of JSON input");
+    expect(t).toMatch(/NOT a problem with your arguments/);
+    expect(t).toMatch(/may or may not have been delivered/);
+  });
+
+  it("a handler throwing an already-diagnosed error keeps its own wording", async () => {
+    const client = await compactPair(
+      catalogThatThrows(new Error("/upload/image returned 401: <html>login</html>")),
+    );
+    const res = (await client.callTool({ name: "call_tool", arguments: { name: "upload_image" } })) as {
+      content?: Array<{ type: string; text?: string }>;
+    };
+    const t = textOf(res);
+    expect(t).toContain("returned 401");
+    expect(t).not.toMatch(/NOT a problem with your arguments/);
+  });
 });
