@@ -30,9 +30,9 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe("panel-settings nsfw consent", () => {
-  it("defaults to OFF when never set", () => {
-    expect(getNsfwConsent()).toEqual({ allowed: false });
+describe("panel-settings adult-content mode", () => {
+  it("defaults to ON when never set", () => {
+    expect(getNsfwConsent()).toEqual({ allowed: true });
     expect(existsSync(settingsPath)).toBe(false); // reading doesn't create the file
   });
 
@@ -52,10 +52,21 @@ describe("panel-settings nsfw consent", () => {
     expect(getNsfwConsent().allowed).toBe(false);
   });
 
+  it("preserves an explicit OFF decision across fresh reads", () => {
+    setNsfwConsent(false);
+    expect(getNsfwConsent().allowed).toBe(false);
+    expect(typeof getNsfwConsent().decidedAt).toBe("string");
+  });
+
   function writeRawSettings(json: string): void {
     mkdirSync(dirname(settingsPath), { recursive: true });
     writeFileSync(settingsPath, json);
   }
+
+  it("FAILS CLOSED on an unreadable settings file instead of applying the ON default", () => {
+    writeRawSettings("{not-json");
+    expect(getNsfwConsent()).toEqual({ allowed: false });
+  });
 
   it("FAILS CLOSED on a non-boolean on-disk allowed (tampered/legacy file) — #390", () => {
     // read() casts arbitrary JSON, so a truthy STRING or number could otherwise

@@ -3888,10 +3888,10 @@ const KNOWN_BROWSING_LEVELS = [1, 2, 4, 8, 16];
 const ADULT_BROWSING_LEVELS = [4, 8, 16];
 
 /**
- * SERVER-SIDE enforcement of the persistent NSFW consent gate on any
+ * SERVER-SIDE enforcement of the persistent adult-content mode on any
  * agent-supplied browsing levels. The agent can pass arbitrary bitmask values;
  * this walls them before they reach the panel so adult content is never
- * surfaced without consent (matching panel_get_content_mode / the consent gate).
+ * surfaced while the mode is off (matching panel_get_content_mode).
  *
  * - Rejects unknown levels (not in the PG..XXX enum).
  * - Rejects a supplied-but-empty array.
@@ -3919,7 +3919,7 @@ function sanitizeBrowsingLevels(levels: unknown): number[] | undefined {
   const safe = [...new Set(nums.filter((n) => !ADULT_BROWSING_LEVELS.includes(n)))];
   if (safe.length === 0) {
     throw new Error(
-      "Adult content (R/X/XXX) requires consent, which the user hasn't granted. Call panel_request_adult_consent first, or request SFW levels only (PG=1, PG-13=2).",
+      "Adult content (R/X/XXX) is disabled for this user. Call panel_request_adult_consent first, or request SFW levels only (PG=1, PG-13=2).",
     );
   }
   return safe;
@@ -7910,7 +7910,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_get_content_mode",
-      "Query the persistent adult-content (NSFW) consent state for this user. Returns { nsfw_allowed, decided_at }. ALWAYS check this before surfacing any adult/NSFW models, prompts, workflows, or imagery. It defaults to FALSE (SFW-only) until the user passes the consent gate (panel_request_adult_consent). Read-only.",
+      "Query the persistent adult-content (NSFW) mode for this user. Returns { nsfw_allowed, decided_at }. ALWAYS check this before surfacing any adult/NSFW models, prompts, workflows, or imagery. In this single-user fork it defaults to TRUE until explicitly disabled; an explicit choice persists across reloads. Read-only.",
       {},
       async () => {
         try {
@@ -7923,7 +7923,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_request_adult_consent",
-      "Show the user the adult-content consent gate and persist their decision. Call this ONLY when a request clearly intends NSFW/adult work AND panel_get_content_mode shows it's not already allowed. It renders a card asking the user to confirm they are 18+ AND that adult content is legal in their region; an affirmative answer turns the mode ON persistently (across reloads), a negative keeps it SFW. Returns the resulting { nsfw_allowed } state. Never assume consent — this tool is the only way to enable it.",
+      "Show the user the adult-content consent gate and persist their decision. Call this ONLY when adult mode was explicitly disabled, a request clearly intends NSFW/adult work, and panel_get_content_mode still reports false. It renders a card asking the user to confirm they are 18+ AND that adult content is legal in their region; an affirmative answer turns the mode ON persistently (across reloads), a negative keeps it SFW. Returns the resulting { nsfw_allowed } state.",
       {
         reason: z
           .string()

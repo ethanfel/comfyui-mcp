@@ -1,13 +1,13 @@
 // Persisted panel settings for the orchestrator's background agent. Survives
-// soft reloads and full restarts (it's a small JSON file on disk), so a setting
-// like the adult-content consent gate stays put and is queryable across the
-// session — the agent reads it before deciding whether to surface NSFW work.
+// soft reloads and full restarts (it's a small JSON file on disk), so the
+// adult-content mode stays put and is queryable across the session — the agent
+// reads it before deciding whether to surface NSFW work.
 //
-// The NSFW gate is a SAFETY control: it defaults OFF (keep everything SFW), and
-// only flips ON after an explicit, verified-adult opt-in (18+ and adult content
-// legal in the user's region). It governs what the system SURFACES and records
-// the user's consent. It never overrides hard limits (no minors, no real-person
-// sexual deepfakes, no depictions of actual non-consensual acts).
+// This single-user fork defaults adult mode ON. An explicit SFW opt-out remains
+// persistent and always wins over that default. A corrupt/unreadable stored
+// preference fails closed to SFW rather than silently discarding a prior choice.
+// The mode never overrides hard limits (no minors, no real-person sexual
+// deepfakes, no depictions of actual non-consensual acts).
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -17,9 +17,9 @@ import { logger } from "../utils/logger.js";
 import { assertNotWritingRealHomeInTests } from "./test-isolation-guard.js";
 
 export interface NsfwConsent {
-  /** True only after a verified-adult opt-in through the consent gate. */
+  /** Current adult-content mode. Defaults true until explicitly disabled. */
   allowed: boolean;
-  /** ISO timestamp of the most recent consent decision. */
+  /** ISO timestamp of the most recent explicit mode decision. */
   decidedAt?: string;
 }
 
@@ -115,8 +115,9 @@ export function panelSettingsPath(): string {
  *
  * `unreadable` is true only when the file exists but could not be read/parsed —
  * i.e. `{}` here is NOT proof that a key is unset. Most callers don't care (a
- * missing NSFW consent and an unreadable one both mean "not consented"), but the
- * panel pin does: an unreadable file must not be reported as "no pin".
+ * adult-content mode distinguishes a missing preference (default ON) from an
+ * unreadable one (fail closed to SFW), and the panel pin likewise must not report
+ * an unreadable file as "no pin".
  */
 function readRaw(): { settings: PanelSettings; unreadable: boolean } {
   const p = panelSettingsPath();
@@ -177,23 +178,25 @@ function write(settings: PanelSettings): void {
   }
 }
 
-/** Current NSFW consent state. Defaults to OFF when never set.
+/** Current adult-content mode. Defaults to ON when never set.
  *
- *  FAIL-CLOSED: `read()` casts arbitrary on-disk JSON, so a tampered or
- *  legacy/corrupt settings file could carry a non-boolean `allowed` (e.g. the
- *  truthy STRING "false", 1, "true"). Adult content must be enabled ONLY on a
- *  strict boolean `true`; every other value is treated as NOT consented. We also
- *  normalize `decidedAt` to a string-or-undefined so callers never see junk. */
+ *  A missing preference gets this fork's permissive default. Once a preference
+ *  exists, FAIL CLOSED: an unreadable file or a non-boolean `allowed` value is
+ *  treated as OFF. This preserves an explicit opt-out and prevents corrupt data
+ *  from being mistaken for a valid mode decision. `decidedAt` is normalized to
+ *  string-or-undefined so callers never see junk. */
 export function getNsfwConsent(): NsfwConsent {
-  const raw = read().nsfwConsent as Partial<NsfwConsent> | undefined;
+  const { settings, unreadable } = readRaw();
+  if (unreadable) return { allowed: false };
+  const raw = settings.nsfwConsent as Partial<NsfwConsent> | undefined;
+  if (raw === undefined) return { allowed: true };
   const allowed = raw?.allowed === true;
   const decidedAt = typeof raw?.decidedAt === "string" ? raw.decidedAt : undefined;
   return decidedAt === undefined ? { allowed } : { allowed, decidedAt };
 }
 
 /**
- * Persist an NSFW consent decision. `allowed` true ONLY after a verified-adult
- * opt-in; false revokes. Stamps the decision time.
+ * Persist an explicit adult-content mode decision. Stamps the decision time.
  */
 export function setNsfwConsent(allowed: boolean): NsfwConsent {
   const decidedAt = new Date().toISOString();
