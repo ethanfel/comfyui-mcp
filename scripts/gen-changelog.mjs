@@ -77,7 +77,8 @@ function prevTag() {
  *  squash-merge form GitHub writes from a PR titled with the bare version — `0.49.6 (#849)`.
  *  Only the first was recognised, so the second fell through to the non-conventional
  *  path and was silently dropped along with everything else there. */
-const isReleaseSubject = (s) => /^release:/i.test(s) || /^v?\d+\.\d+\.\d+\s*(\(#\d+\))?$/.test(s);
+// #1309 — three shapes are needed; see scripts/lib/release-subject.mjs.
+import { isReleaseSubject } from "./lib/release-subject.mjs";
 
 /** Parsed commits since `range`, newest-first, minus noise.
  *

@@ -19,7 +19,7 @@
 // diagnosis costs more than an honest "the body is HTML; here is its first line".
 
 import { ComfyUIError } from "../utils/errors.js";
-import { getComfyUIAuthHeaders, getComfyUIBaseUrl } from "../config.js";
+import { config, getComfyUIAuthHeaders, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch, targetOf } from "./fetch.js";
 
 /** What answered instead of the ComfyUI JSON API. */
@@ -89,6 +89,62 @@ const URL_REDACTED = "REDACTED";
  * value: anything credential-shaped goes, whether or not we can prove it is
  * ours. A diagnostic that can print a secret is not worth the diagnosis.
  */
+/**
+ * Redact credentials from log lines before they reach a tool result (#1206).
+ *
+ * A ComfyUI log is a plausible place for one to appear: a custom node logging
+ * the URL it fetched (CivitAI and HuggingFace download URLs routinely carry a
+ * token in the query string), ComfyUI-Manager logging an install URL, or any
+ * node logging a request header on failure. `get_system_stats action:"logs"` is
+ * a DIAGNOSTIC tool, so it is called exactly when something is wrong — and its
+ * output is what a user pastes into a bug report.
+ *
+ * PER LINE, deliberately. The log line is the thing being asked for, so this
+ * keeps the line and redacts the match. Scrubbing the whole blob as one string
+ * would let a single unscrubbable line withhold the ENTIRE log, and a diagnostic
+ * that refuses to diagnose is not an improvement.
+ *
+ * Fail-closed is VISIBLE: a line that cannot be scrubbed safely (the credential
+ * is too short to substitute without mangling unrelated text, or it arrived
+ * line-wrapped) is REPLACED by a marker rather than dropped — so the log keeps
+ * its line count and the reader can see that something was withheld, instead of
+ * silently receiving a shorter log.
+ */
+export function scrubLogLines(lines: string[]): string[] {
+  const URL_RE = /https?:\/\/[^\s"'<>]+/g;
+  return lines.map((line) => {
+    // URLs and the rest of the line need DIFFERENT redactors, and running one
+    // over the other is what destroys the diagnostic.
+    //
+    //  - scrubSecretShapedText's opaque-run pass matches 24+ chars of an
+    //    alphabet including `/`, `.` and `-`, so an ordinary log URL collapses to
+    //    `https:«redacted»` — and a log line whose URL is gone has lost the fact
+    //    it exists to report ("which model was it fetching?").
+    //  - redactUrlForDiagnosis was built for exactly that: it keeps origin,
+    //    route and parameter NAMES and fails closed on userinfo, opaque path
+    //    segments and unknown query values — which is where a token lives.
+    //
+    // So: URLs go through the URL redactor, everything BETWEEN them through the
+    // shape/known-value scrubber, and the pieces are rejoined. Neither pass ever
+    // sees text the other owns.
+    const urls = line.match(URL_RE) ?? [];
+    const gaps = line.split(URL_RE);
+    const safeGaps: string[] = [];
+    for (const gap of gaps) {
+      const safe = scrubSecretShapedText(gap);
+      // Fail closed for the whole LINE, not the gap: a half-redacted line is
+      // harder to reason about than one that says it was withheld.
+      if (safe === null) return "(log line withheld: it contains a configured credential)";
+      safeGaps.push(safe);
+    }
+    let out = safeGaps[0] ?? "";
+    for (let i = 0; i < urls.length; i++) {
+      out += redactUrlForDiagnosis(urls[i]) + (safeGaps[i + 1] ?? "");
+    }
+    return out;
+  });
+}
+
 export function bodyPrefixOf(body: string): string {
   const redacted = scrubSecretShapedText(body);
   if (redacted === null) {
@@ -246,11 +302,41 @@ function reflectionPatterns(value: string): { pattern: RegExp; length: number }[
  * Passes 2 and 3 run whether or not a credential is configured: a reflected
  * body can carry someone else's secret too, and this text goes to an agent.
  */
+/**
+ * Every credential this process is configured with, as raw values (#1191).
+ *
+ * Deliberately broader than `getComfyUIAuthHeaders()`, which is about what to
+ * SEND: this is about what must never come BACK. A reflected body can echo any
+ * of them, and the scrubber should not have to know which endpoint it is looking
+ * at to redact the right one.
+ *
+ * Empty values are dropped by the caller's own guard; nothing here is logged.
+ */
+function knownCredentialValues(): string[] {
+  const out = Object.values(getComfyUIAuthHeaders());
+  for (const v of [config.comfyuiApiKey, config.huggingfaceToken, config.civitaiApiToken]) {
+    if (typeof v === "string" && v.trim()) out.push(v.trim());
+  }
+  return out;
+}
+
 export function scrubSecretShapedText(text: string): string | null {
   let out = text;
 
   // 1. Known configured values, in every encoding we can anticipate.
-  for (const headerValue of Object.values(getComfyUIAuthHeaders())) {
+  //
+  // #1191 (codex review) — getComfyUIAuthHeaders() carries ONLY the ComfyUI auth
+  // token and the Cloudflare Access pair. It does NOT carry the Comfy Cloud API
+  // key, which cloud-client sends as `X-API-Key` — so the cloud enqueue error
+  // path, the one whose body is most likely to reflect that key back, had no
+  // known-value pass for it at all. The by-name pass below catches a LABELLED
+  // reflection, but an unlabelled echo of a short key has neither a recognized
+  // label nor the 24-char opaque-run shape, and would have gone straight out.
+  //
+  // The download tokens are here for the same reason: a reflected body on any of
+  // these paths reaches the agent, and which credential leaked is not something
+  // to decide per call site.
+  for (const headerValue of knownCredentialValues()) {
     if (!headerValue) continue;
     // The header value may be "Bearer <token>"; handle the whole thing and the
     // bare token, so neither form survives.
@@ -298,12 +384,151 @@ export function scrubSecretShapedText(text: string): string | null {
       `${name}${sep}${scheme ? `${scheme}${gap ?? " "}` : ""}${REDACTED}`,
   );
 
+  // 2b. A credential introduced by its AUTH SCHEME rather than by a field name.
+  //     `Bearer <token>` in a log line has no `=` or `:`, so pass 2 never saw it
+  //     — the flat opaque-run rule was carrying it by accident, and narrowing
+  //     that rule is what made the gap visible (codex review of #1223).
+  //
+  //     Named schemes only, and only for a value long enough and mixed enough to
+  //     be a credential: `Bearer` is also an ordinary English word, and a rule
+  //     that fires on "token authentication failed" would be the same class of
+  //     mistake in the other direction.
+  out = out.replace(
+    /\b(bearer|basic)(\s+)([A-Za-z0-9\-._~+/=%]{16,})/gi,
+    (whole, scheme: string, gap: string, value: string) =>
+      /^[a-z]+$/.test(value) ? whole : `${scheme}${gap}${REDACTED}`,
+  );
+
   // 3. Long opaque runs of the credential alphabet (base64 / hex / url-safe /
   //    percent-encoded). Ordinary prose and HTML break well before 24 chars —
   //    tags, spaces and punctuation are all outside this class.
-  out = out.replace(/[A-Za-z0-9\-._~+/=%]{24,}/g, REDACTED);
+  //
+  //    But a FILESYSTEM PATH and a DOTTED MODULE NAME do not (#1223): `/`, `.`,
+  //    `-` and `_` are all in this alphabet, so `/basedir/custom_nodes/ComfyUI-
+  //    LTXVideo` and `kornia.geometry.transform.pyramid` matched whole and left
+  //    `«redacted»`. See `redactOpaqueRun` — it keeps the structure and redacts
+  //    only the parts that are actually opaque.
+  out = out.replace(/[A-Za-z0-9\-._~+/=%]{24,}/g, redactOpaqueRun);
 
   return out;
+}
+
+/**
+ * Redact the credential-shaped PARTS of a long run, keeping the structure.
+ *
+ * #1223 — the flat 24-char rule assumed "ordinary prose breaks well before 24
+ * chars". True of prose; false of a LOG, where paths and dotted module names are
+ * the dominant content and routinely run past 24. So the pass that exists to
+ * catch an unanticipated credential encoding erased the diagnosis instead:
+ *
+ *     [INFO]  0.0 seconds (IMPORT FAILED): «redacted»
+ *       - «redacted»: ImportError: cannot import name 'pad' from '«redacted»'
+ *
+ * That is 100% of the content of an IMPORT FAILED line — which pack failed and
+ * which module the missing symbol came from are the only two things the line is
+ * for. The reporter had to bypass the tool and curl ComfyUI directly.
+ *
+ * So the run is split on the separators that give it STRUCTURE (`/` and `.`) and
+ * each part judged on its own. A part is kept when it is a WORD rather than a
+ * blob — its `-`/`_`/`+`/`=`/`~`/`%` chunks are each letters-then-optional-digits
+ * (`ComfyUI`, `AnimateDiff`, `python3`, `v1`) or all digits, and none is longer
+ * than a plausible word. A credential fails this: its digits interleave with its
+ * letters (`aBcD3fGh1jKlMnOpQrStUvWxYz`), or it starts with one
+ * (`9f2b7c41aa6e4d0e8b3f5a1c`).
+ *
+ * WHAT THIS DOES AND DOES NOT WEAKEN. Only this pass, and only for unlabelled
+ * runs of unknown value. A configured credential is still matched by VALUE in
+ * pass 1 (exactly, in every encoding, failing closed when it cannot be replaced
+ * safely), and anything introduced by its own name — `token=`, `api_key:`,
+ * `Authorization: Bearer` — is still redacted by pass 2 whatever its shape. What
+ * is newly allowed through is a run that carries no credential label, matches no
+ * configured value, and is spelled like a path or an identifier.
+ *
+ * ACCEPTED RESIDUAL, stated precisely because a redaction rule that overstates
+ * its own coverage is worse than one that admits a gap: an unlabelled secret
+ * that this process does not hold, whose separator-delimited parts are EVERY ONE
+ * of them alphabetic (or digit-edged) and under 20 characters, reads as a name
+ * and survives — `ABCDEFGHIJKLMNOPQRS/TUVWXYZabcdefghijklm`.
+ *
+ * No shape rule can close that: a token spelled entirely in path-like parts IS
+ * shaped like a path, and the same rule that redacts it redacts
+ * `/models/upscale_models/4x-UltraSharp.pth`. Base64 and hex reach it with low
+ * probability — every part alphabetic, no digits anywhere — and a credential
+ * that IS held, or that arrives with a name or an auth scheme in front of it, is
+ * caught by passes 1, 2 and 2b regardless of shape. That is the trade, and it is
+ * the right one for a tool whose entire purpose is naming the thing that broke.
+ */
+function redactOpaqueRun(run: string): string {
+  const parts = run.split(/([/.])/);
+  // No separator: one unbroken blob, which is the shape this pass was built for.
+  if (parts.length === 1) return REDACTED;
+
+  // The interleave allowance is BUDGETED across the whole run, not granted per
+  // part (codex review of #1223). Granted per part, four of them in a row spell
+  // a credential that every individual test waves through:
+  //
+  //     Bearer AbcD3fGh.IjKl9mNo.PqRs7tUv.WxYz2aBc
+  //
+  // Every chunk there is eight characters of mixed case and digits — a shape a
+  // real name reaches at most once (`t5xxl_fp16`, `umt5_xxl_fp8_e4m3fn`), and a
+  // random token reaches every time. So one is a name and several is a blob.
+  const budget = { mixed: 1 };
+  const kept = parts.map((part) =>
+    part === "/" || part === "." || part === "" || looksLikeWords(part, budget)
+      ? part
+      : REDACTED,
+  );
+  // Over budget means the run was never a name — redact it whole rather than
+  // leave the parts that happened to be judged before the budget ran out.
+  return budget.mixed < 0 ? REDACTED : kept.join("");
+}
+
+/** Longest chunk still plausibly a word and not a blob. `AnimateDiff` is 11. */
+const MAX_WORD_CHUNK = 20;
+
+/**
+ * Longest chunk allowed to INTERLEAVE letters and digits and still read as a
+ * name — `t5xxl`, `x4v3`, `sd3m`.
+ *
+ * Model filenames do this constantly (`t5xxl_fp16.safetensors`,
+ * `umt5_xxl_fp8_e4m3fn.safetensors`), and an interleave rule without this
+ * allowance redacts them — the same class of mistake as the flat 24-char rule,
+ * one level down. Kept SHORT because interleaving is otherwise the strongest
+ * signal of a blob: at eight characters a run carries too little entropy to be
+ * worth protecting on its own, and anything longer must justify itself by having
+ * its digits at the edges like a real name does.
+ */
+const MAX_MIXED_CHUNK = 8;
+
+/**
+ * Is this a human-written identifier rather than an opaque blob?
+ *
+ * Chunk-wise, because real names are compounds: `comfyui-easy-use`,
+ * `custom_nodes`, `sd_xl_base_1`. A chunk is a word when its digits sit at the
+ * EDGES — `python3`, `v1`, `4x`, `768` — and a blob when they INTERLEAVE, which
+ * is what `d41d8cd98f00b204` and `aBcD3fGh1jKl` do and what no human name does.
+ *
+ * The leading-digit half of that is not hypothetical: mutation testing showed
+ * this rule started as letters-then-digits, which reads `4x-UltraSharp` as a
+ * blob — so `/basedir/models/upscale_models/4x-UltraSharp.pth` would have gone
+ * out as `/basedir/models/upscale_models/«redacted».pth`, reintroducing exactly
+ * the bug being fixed on some of the most common filenames in a ComfyUI log.
+ */
+function looksLikeWords(part: string, budget: { mixed: number }): boolean {
+  const chunks = part.split(/[-_+=~%]/).filter((c) => c.length > 0);
+  if (chunks.length === 0) return false;
+  // `every` would short-circuit and stop spending, which would make the budget
+  // depend on which part happened to fail first.
+  return chunks.map((c) => isNameChunk(c, budget)).every(Boolean);
+}
+
+function isNameChunk(c: string, budget: { mixed: number }): boolean {
+  if (c.length > MAX_WORD_CHUNK) return false;
+  if (/^\d+$/.test(c)) return true; // 768, 12
+  if (/^\d*[A-Za-z]+\d*$/.test(c)) return true; // ComfyUI, python3, 4x, v1
+  if (c.length > MAX_MIXED_CHUNK) return false;
+  budget.mixed -= 1; // t5xxl, x4v3 — see MAX_MIXED_CHUNK and redactOpaqueRun
+  return budget.mixed >= 0;
 }
 
 /**

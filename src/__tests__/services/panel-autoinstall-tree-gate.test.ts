@@ -37,11 +37,18 @@ const workspace = vi.hoisted(() => ({
   liveArgv: undefined as string[] | undefined,
   reachable: false,
 }));
+const argvRoot = vi.hoisted(() => (argv: string[] | undefined) => {
+  const main = argv?.find((a) => a.endsWith("main.py"));
+  return main ? main.slice(0, main.length - "/main.py".length) : undefined;
+});
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: () => workspace.base,
-  liveRootFromArgv: (argv: string[] | undefined) => {
-    const main = argv?.find((a) => a.endsWith("main.py"));
-    return main ? main.slice(0, main.length - "/main.py".length) : undefined;
+  liveRootFromArgv: (argv: string[] | undefined) => argvRoot(argv),
+  // Two-tier, faithful to the real resolver (#1133). No observed-process tier is
+  // exercised here: these tests are about the argv path.
+  resolveLiveServerRoot: (argv: string[] | undefined) => {
+    const fromArgv = argvRoot(argv);
+    return fromArgv ? { root: fromArgv, source: "argv" } : { source: "unresolved" };
   },
   getLiveServerSnapshot: async () => ({
     reachable: workspace.reachable,

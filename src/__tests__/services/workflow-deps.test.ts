@@ -9,6 +9,7 @@ import {
   type WorkflowDepsDeps,
   type ManagerNodePack,
   defaultWorkflowDepsDeps,
+  installWorkflowDependenciesForAnalysis,
 } from "../../services/workflow-deps.js";
 import { resetManagerApiCacheForTests } from "../../services/node-management.js";
 import { setPanelVersionPin } from "../../services/panel-settings.js";
@@ -340,5 +341,160 @@ describe("installWorkflowDependencies", () => {
     expect(result.alreadyInstalled).not.toContain("Remote-Only-Pack");
     expect(result.alreadyInstalled).toEqual(["ComfyUI-Impact-Pack"]);
     expect(deps.queueInstall).not.toHaveBeenCalled();
+  });
+});
+
+// #1136 — an EMPTY Manager catalogue must not read as "these packs do not exist".
+//
+// This is the reported user's actual path. They were told to search ComfyUI
+// Manager, the registry was unreachable FROM THE COMFYUI HOST, and Manager
+// returned a healthy 200 with an empty cache. Every pack then fell to
+// `unresolved` and rendered as "neither installed nor known to ComfyUI-Manager".
+// We cannot see their DNS failure -- it happened in another process -- but an
+// empty legacy catalogue is a strong local signal, because a healthy one
+// carries thousands of entries.
+describe("empty Manager catalogue is flagged, not read as absence (#1136)", () => {
+  const base = {
+    analysis: {
+      requiredPacks: [],
+      missingPacks: ["some-pack"],
+      unresolved: ["SomeNodeType"],
+      dependencies: [],
+    },
+  };
+
+  it("sets catalogue_unavailable when a non-local channel returns zero packs", async () => {
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({ channel: "default", packs: [] }),
+      queueInstall: async () => "legacy",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeTruthy();
+    expect(res.catalogue_unavailable).toMatch(/NOT evidence that these\s+packs do not exist|NOT evidence/i);
+    expect(res.unresolved).toContain("SomeNodeType");
+  });
+
+  it("does NOT flag a local channel — an empty local list is a real answer", async () => {
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({ channel: "local", packs: [] }),
+      queueInstall: async () => "legacy",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+
+  it("does NOT flag a Manager v4 host — directInstall is the ONLY production over-fire", async () => {
+    // S1 from the re-review. fetchManagerList returns {packs: [], directInstall:
+    // true} for EVERY v4 host (workflow-deps.ts:188), so `!directInstall` is the
+    // only clause standing between v4 users and this note on every install. My
+    // two original negatives (a `local` channel, a populated catalogue) covered
+    // neither -- dropping `!directInstall` killed zero tests, while the commit
+    // claimed they "keep an over-firing version honest".
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({ channel: "default", packs: [], directInstall: true }),
+      queueInstall: async () => "v4",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+
+  it("does not set catalogue_unavailable when nothing is unresolved", async () => {
+    // Round 3: a comment claimed this gate existed; it did not.
+    const res = await installWorkflowDependenciesForAnalysis(
+      { requiredPacks: [], missingPacks: [], unresolved: [], dependencies: [] } as never,
+      {
+        fetchManagerList: async () => ({ channel: "default", packs: [] }),
+        queueInstall: async () => "legacy",
+        resetQueue: async () => undefined,
+        startQueue: async () => undefined,
+        queueStatus: async () => undefined,
+      } as never,
+    );
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+
+  it("does NOT flag a catalogue that actually returned entries", async () => {
+    const res = await installWorkflowDependenciesForAnalysis(base.analysis as never, {
+      fetchManagerList: async () => ({
+        channel: "default",
+        packs: [{ id: "other-pack", title: "Other" }],
+      }),
+      queueInstall: async () => "legacy",
+      resetQueue: async () => undefined,
+      startQueue: async () => undefined,
+      queueStatus: async () => undefined,
+    } as never);
+    expect(res.catalogue_unavailable).toBeUndefined();
+  });
+});
+
+// P0-1 from the re-review: extract_deps is the READ action the tool description
+// tells callers to use FIRST, and its `unresolved` comes from the MAPPINGS
+// endpoint — whose failure was caught, logged at warn, and discarded, after
+// which we asserted "not known to ComfyUI-Manager". Stronger evidence thrown
+// away than the getlist case: there we infer from an empty list; here we were
+// holding the exception.
+describe("extract_deps flags an unanswered mappings lookup (#1136)", () => {
+  const wf = { nodes: [{ type: "SomeMissingNodeType" }] };
+  const objectInfo = {};
+
+  const mk = (fetchManagerMappings: () => Promise<unknown>) =>
+    ({
+      fetchObjectInfo: async () => objectInfo,
+      fetchManagerMappings,
+      fetchInstalledPacks: async () => [],
+    }) as never;
+
+  it("sets mappings_unavailable when the lookup THROWS", async () => {
+    const err = new TypeError("fetch failed");
+    (err as unknown as { cause: unknown }).cause = Object.assign(new Error("ENOTFOUND"), {
+      code: "ENOTFOUND",
+    });
+    const res = await extractWorkflowDependencies(wf as never, mk(async () => {
+      throw err;
+    }));
+    expect(res.unresolved.length).toBeGreaterThan(0);
+    expect(res.mappings_unavailable).toBeTruthy();
+    expect(res.mappings_unavailable).toMatch(/NOT evidence/i);
+  });
+
+  it("sets it for an EMPTY mappings response too — a 200 carrying nothing", async () => {
+    const res = await extractWorkflowDependencies(wf as never, mk(async () => ({})));
+    expect(res.mappings_unavailable).toBeTruthy();
+  });
+
+  it("says 'no usable entries', NOT 'came back EMPTY', for an unparseable shape", async () => {
+    // buildMappingIndex skips non-Array values, so a v4 shape difference yields
+    // an empty index from a NON-empty body. Claiming the response was empty
+    // asserts something we never checked -- the defect class this issue is
+    // about, one endpoint over.
+    const res = await extractWorkflowDependencies(
+      wf as never,
+      mk(async () => ({ "some-pack": { nodes: ["SomeMissingNodeType"] } })),
+    );
+    expect(res.mappings_unavailable).toBeTruthy();
+    expect(res.mappings_unavailable).not.toMatch(/came back EMPTY/);
+    expect(res.mappings_unavailable).toMatch(/no usable entries/i);
+  });
+
+  it("does not set the note when there is nothing unresolved to mislead about", async () => {
+    // H3 — the producer gate I described in review and had not pinned.
+    const res = await extractWorkflowDependencies({ nodes: [] } as never, mk(async () => ({})));
+    expect(res.unresolved).toEqual([]);
+    expect(res.mappings_unavailable).toBeUndefined();
+  });
+
+  it("stays quiet when the mappings lookup actually answered", async () => {
+    const res = await extractWorkflowDependencies(
+      wf as never,
+      mk(async () => ({ "some-pack": [["SomeMissingNodeType"], { title_aux: "Some Pack" }] })),
+    );
+    expect(res.mappings_unavailable).toBeUndefined();
   });
 });

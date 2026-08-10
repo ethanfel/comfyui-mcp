@@ -18,6 +18,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
+import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
   describePanelUpdateRecovery,
   type PanelBundleSkew,
@@ -25,6 +26,7 @@ import {
 import { primePanelBase, verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 import { SHARED_SESSION_SCOPE, isScopeAddress } from "./session-scope.js";
+import type { ScopeRepinOutcome } from "../orchestrator/turn-origins.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
 
@@ -106,9 +108,16 @@ interface Conn {
    * panel registration rather than mistaking the pre-restart socket for a reconnect. */
   helloGeneration: number;
   /** Browser-tab-scoped session identity supplied by current panel builds.
-   * Unlike `tabId`, which is commonly derived from a saved workflow path and
-   * can therefore recur in a second browser tab, this stays with one browser
-   * tab across a ComfyUI restart. It is used only as an accidental-routing
+   * Unlike `tabId` — a bridge ROUTE, `wf:<tabRouteId>:<path>`, whose shape is
+   * defined by the panel's own bridge-route.js (#640) and which can recur when a
+   * tab route id is reused — this stays with one browser tab across a ComfyUI
+   * restart.
+   *
+   * #1285 — this used to say a tabId is "commonly derived from a saved workflow
+   * path". That is the HANDLE (`wf:<path>`), which bridge-route.js explicitly
+   * marks as NOT a route because two browser tabs can show the same file. A
+   * reader believed this sentence, derived `wf:<path>`, compared it against
+   * `bridge.tabs()`, and shipped a fix that never matched anything. It is used only as an accidental-routing
    * correctness proof for restart readiness; absence fails that proof closed. */
   tabSessionId?: string;
   /**
@@ -1269,7 +1278,8 @@ function mutatedButUnacked(ctx: SendCtx): string {
 /**
  * Key for a pending "is this tab gone?" clock (#486).
  *
- * (tab id, INCARNATION) — a `wf:<hash>` tab id recurs, so it names a workflow,
+ * (tab id, INCARNATION) — a `wf:` route recurs (#1285: it is
+ * `wf:<tabRouteId>:<path>`, not a hash), so it names a workflow,
  * not a browser tab. The incarnation is the panel's sessionStorage-backed
  * `tab_session_id`: unique per browser tab and stable across a reload, which is
  * exactly the distinction the clock has to draw. JSON-encoded so neither part
@@ -1389,7 +1399,7 @@ export class UiBridge {
    *  in-flight turn onto the tab that is active now (the documented
    *  panel_set_workflow_target({mode:"current"}) consent). Returns the tab it
    *  repinned to, or undefined when nothing is resolvable. */
-  private scopeRepinHandler: ((scopeId: string) => string | undefined) | null = null;
+  private scopeRepinHandler: ((scopeId: string, preferredWorkflowPath?: string) => ScopeRepinOutcome) | null = null;
   /** #884 — orchestrator-injected: normalize a hello's raw `backend` value the
    *  same way the orchestrator does (unknown/absent → the default backend), so
    *  the backend-qualified scope-buffer replay matches the conversation the
@@ -1513,7 +1523,7 @@ export class UiBridge {
    * Which (tab, incarnation) each live socket registered as.
    *
    * The close handler needs this because "was I the primary connection?" is the
-   * WRONG question: when a second tab takes over a recurring `wf:<hash>` key the
+   * WRONG question: when a second tab takes over a recurring `wf:` route key the
    * bridge closes the first socket, and by the time that close fires the map
    * already points at the newcomer — so the departing tab was never armed at all
    * and could never be declared gone. The socket knows who it was; ask it.
@@ -1527,6 +1537,42 @@ export class UiBridge {
    *  (its grace poll lives well under 5 minutes), and the durable copy is the
    *  journal the sink feeds — so this stays short. */
   private static readonly LATE_ASK_TTL_MS = 5 * 60 * 1000;
+  /**
+   * Mutations whose reply timer fired (rid -> what it was), so a reply arriving
+   * afterwards can be RECOGNISED as the late completion of a known write rather
+   * than an unknown rid to drop (#694).
+   *
+   * Deliberately narrow, and the negatives matter more than the positive:
+   *  - MUTATIONS only. A read that is abandoned costs nothing because you just
+   *    retry it (#1154's asymmetry); retaining reads would make this unbounded
+   *    noise for no recoverable information.
+   *  - populated only when the TIMER fires. A mutation that replies in time
+   *    resolves its caller directly and has nothing to report later.
+   */
+  private timedOutMutations = new Map<string, { cmd: string; tabId: string; ts: number }>();
+  /** Installed by the retry-token layer; see setLateMutationFilter. Null means
+   *  retain nothing. */
+  private lateMutationFilter: ((cmdName: string) => boolean) | null = null;
+  /** Late completions of timed-out mutations (rid -> outcome), drained once via
+   *  takeLateMutation(). Success only: see the recordLateMutation comment. */
+  private lateMutations = new Map<
+    string,
+    { ok: true; cmd: string; tabId: string; ts: number; lateByMs: number }
+  >();
+  /**
+   * TTL for both maps above.
+   *
+   * Unlike the ask mapping below this one CAN have a clock, because the thing it
+   * enables is bounded: telling a caller "your earlier write did land" is only
+   * useful while that caller is still working on the same thing. Ten minutes
+   * comfortably covers an agent turn. Past it the honest state is the one the
+   * caller already has -- outcome unknown, verify by observation -- which is
+   * what the timeout disclosure told them to do in the first place.
+   */
+  private static readonly LATE_MUTATION_TTL_MS = 10 * 60 * 1000;
+  /** Hard cardinality bound, so a pathological tab timing out in a loop cannot
+   *  grow either map without limit even inside the TTL. */
+  private static readonly MAX_LATE_MUTATIONS = 256;
   /**
    * Ask cards whose rid→ask_id mapping is retained.
    *
@@ -1774,8 +1820,14 @@ export class UiBridge {
    * exact same hello/rid/tab-routing logic a direct loopback socket gets. From
    * here on the relay shim is indistinguishable from a real connection.
    */
-  attachRelayConnection(sock: BridgeSocket): void {
-    this.handleConnection(sock);
+  /**
+   * @param serverOrigin The origin to scope this connection's workflow identity
+   *   to. A relay socket has no handshake to observe one from (#1077), so the
+   *   caller supplies the one it already knows — see `setupRelayBridge`. Omitting
+   *   it leaves the connection unable to ever adopt a workflow fence.
+   */
+  attachRelayConnection(sock: BridgeSocket, serverOrigin?: string): void {
+    this.handleConnection(sock, false, serverOrigin);
   }
 
   /**
@@ -1842,9 +1894,14 @@ export class UiBridge {
    *   and any LAN/pairing listener are all `false` — a browser reaching those can
    *   sit on a DIFFERENT machine yet advertise its OWN 127.0.0.1 ComfyUI, which
    *   must never be treated as the orchestrator's local host (#509).
-   * @param serverOrigin SERVER-OBSERVED handshake `Origin` (scheme://host:port), captured
-   *   from the WebSocket upgrade — NOT client-supplied. Undefined for non-browser/relay
-   *   connections. Bound to the tab so the reboot self-probe can trust which page it fronts.
+   * @param serverOrigin The origin (scheme://host:port) this connection's workflow
+   *   identity is scoped to, and which the reboot self-probe trusts to know which page
+   *   it fronts. NEVER client-supplied. Normally SERVER-OBSERVED, captured from the
+   *   WebSocket upgrade's `Origin` header. A relay socket has no upgrade to observe, so
+   *   `attachRelayConnection` passes the one the orchestrator DERIVES from its own
+   *   COMFYUI_URL (#1077) — the panel page is served by that ComfyUI, so it is the same
+   *   origin a browser would send. Undefined only when neither is available, which
+   *   leaves the connection unable to adopt a workflow fence.
    */
   private handleConnection(sock: BridgeSocket, local = false, serverOrigin?: string): void {
     // Track from ACCEPT, not from hello: an anonymous socket is still a socket,
@@ -1859,7 +1916,7 @@ export class UiBridge {
     // hellos is client-controlled, so a headless viewer could otherwise flip it to
     // `false` to pass the same-kind takeover check and seize a desktop tab's id.
     let socketHeadless: boolean | null = null;
-    // #422: capability proven under a PRE-MIGRATION tab id (tmp:<uuid> → wf:<hash>,
+    // #422: capability proven under a PRE-MIGRATION tab id (tmp:<uuid> → wf:<tabRouteId>:<path>,
     // same socket/panel) so the veto survives the id change. The retiring conn is
     // deleted during migration below; without carrying this, a graph-edit-triggered
     // migration + undercutting-version hello would reintroduce the false "too old" gate.
@@ -1887,11 +1944,11 @@ export class UiBridge {
         // the newly-targeted view (frames carry no tab_id — the socket is the tab).
         if (tabId && tabId !== msg.tab_id && this.conns.get(tabId)?.sock === sock) {
           // PATH-COMPRESS the migration map: the reported field failure chains
-          // ids (random UUID → tmp:<uuid> → wf:<hash>). A single-hop lookup on
+          // ids (random UUID → tmp:<uuid> → wf:<tabRouteId>:<path>). A single-hop lookup on
           // the ORIGINAL id would land on the dead intermediate — rewrite every
           // entry pointing at the id being retired so any historical id resolves
           // to the LIVE tab in one step, and the map never grows chains. Entries
-          // are SOCKET-SCOPED (codex review): wf:<hash> ids are deterministic and
+          // are SOCKET-SCOPED (codex review): wf:<tabRouteId>:<path> ids are deterministic and
           // recur across reconnects, so a migration must only ever route to the
           // socket that created it — compression too stays within this socket.
           for (const [from, entry] of this.tabMigrations) {
@@ -1997,7 +2054,7 @@ export class UiBridge {
         // #486 — THIS tab is back. Cancel its pending "is it gone?" clock, so an
         // ordinary reload never retires state only this tab can be told about.
         //
-        // Matched on the BROWSER-TAB SESSION, not the key: a `wf:<hash>` key
+        // Matched on the BROWSER-TAB SESSION, not the key: a `wf:` route key
         // recurs, so a DIFFERENT tab opening the same saved workflow takes it
         // over. Keyed on the id alone, that stranger's hello would cancel the
         // departed tab's clock — and a later result from the stranger could then
@@ -2088,7 +2145,7 @@ export class UiBridge {
           // window.location the browser was served from — the ComfyUI instance THIS
           // tab fronts. Preserved across a SAME-SOCKET re-hello that omits it, but
           // NEVER inherited by a DIFFERENT socket reusing this (possibly recurring
-          // wf:<hash>) tab id — that could let an unrelated instance's origin certify
+          // wf:<tabRouteId>:<path>) tab id — that could let an unrelated instance's origin certify
           // this tab's restart (#509, codex: cross-ownership inheritance).
           originUrl:
             typeof (msg as { comfyui_url?: unknown }).comfyui_url === "string" &&
@@ -2248,6 +2305,7 @@ export class UiBridge {
               }
             }
           }
+          this.recordLateMutation(rid, msg);
           return;
         }
         clearTimeout(p.timer);
@@ -2668,16 +2726,34 @@ export class UiBridge {
   }
 
   /** #884 — inject the explicit-repin recovery handler (see the field doc). */
-  setScopeRepinHandler(fn: (scopeId: string) => string | undefined): void {
+  setScopeRepinHandler(fn: (scopeId: string, preferredWorkflowPath?: string) => ScopeRepinOutcome): void {
     this.scopeRepinHandler = fn;
   }
 
   /** #884 — EXPLICIT recovery consent (panel_set_workflow_target
    *  mode:"current" on a scope-bound session): re-pin the conversation's
    *  in-flight turn onto the tab that is active now, escaping a dead or
-   *  ambiguous pin. Returns the repinned tab id, or undefined. */
-  repinScopeToActive(scopeId: string): string | undefined {
+   *  ambiguous pin. Returns the repinned tab id, or — when nothing was
+   *  repinned — WHY (#1077 Finding 2). A bare undefined was indistinguishable
+   *  across four different refusals, and a session wedged on any of them was
+   *  told only that the adoption was refused. */
+  repinScopeToActive(scopeId: string): ScopeRepinOutcome {
     return this.scopeRepinHandler?.(scopeId);
+  }
+
+  /**
+   * #888 — the same EXPLICIT recovery, aimed at a NAMED workflow's tab instead
+   * of "the active one".
+   *
+   * Same handler, so the P0 gate is shared by construction: a pin that still
+   * reaches a live tab of this conversation is never displaced, however explicit
+   * the request. What a NAME adds is recovery in the state where "current" is
+   * legitimately refused — several eligible tabs and no active one among them —
+   * which is precisely the state that refusal already tells the agent to escape
+   * by naming a workflow. Until now nothing made the pin follow the name.
+   */
+  repinScopeToWorkflow(scopeId: string, workflowPath: string): ScopeRepinOutcome {
+    return this.scopeRepinHandler?.(scopeId, workflowPath);
   }
 
   /** #884 — inject the hello-backend normalizer (see the field doc). */
@@ -2916,6 +2992,74 @@ export class UiBridge {
 
   /** Drop expired late-ask entries (buffered answers + unresolved rid mappings) so
    *  an abandoned card never leaks memory. Cheap; called on each ask send/take. */
+  /**
+   * A reply landed for an rid nothing is waiting on. If it is the late
+   * completion of a mutation we abandoned, keep it (#694).
+   *
+   * SUCCESS ONLY, and that asymmetry is the point. A late `ok:false` says the
+   * write was refused -- which is not news: the caller was already told it did
+   * not complete, and they were told truthfully. Promoting it to "it failed"
+   * would convert "we never found out" into a verdict we did not earn, the same
+   * fold as #796 pointing the other way. Only `ok:true` carries information the
+   * caller does not already have.
+   */
+  private recordLateMutation(rid: string, msg: { ok?: unknown }): void {
+    const started = this.timedOutMutations.get(rid);
+    if (!started) return;
+    this.timedOutMutations.delete(rid);
+    if (msg.ok !== true) return;
+    const now = Date.now();
+    this.pruneLateMutations();
+    this.lateMutations.set(rid, {
+      ok: true,
+      cmd: started.cmd,
+      tabId: started.tabId,
+      ts: now,
+      lateByMs: now - started.ts,
+    });
+    logger.debug(
+      `[ui-bridge] "${started.cmd}" on tab ${started.tabId} completed ${now - started.ts} ms AFTER its reply timeout — retained for the caller (#694)`,
+    );
+  }
+
+  /**
+   * Drain the late outcome for `rid`, if the write landed after its timeout.
+   *
+   * Drains once: this exists so a caller can be TOLD, and telling them twice
+   * would read as two separate recoveries of the same write.
+   */
+  takeLateMutation(
+    rid: string,
+  ): { ok: true; cmd: string; tabId: string; lateByMs: number } | undefined {
+    this.pruneLateMutations();
+    const hit = this.lateMutations.get(rid);
+    if (!hit) return undefined;
+    this.lateMutations.delete(rid);
+    return { ok: true, cmd: hit.cmd, tabId: hit.tabId, lateByMs: hit.lateByMs };
+  }
+
+  /** TTL + cardinality bound for both #694 maps. */
+  private pruneLateMutations(): void {
+    const now = Date.now();
+    for (const [rid, e] of this.timedOutMutations) {
+      if (now - e.ts > UiBridge.LATE_MUTATION_TTL_MS) this.timedOutMutations.delete(rid);
+    }
+    for (const [rid, e] of this.lateMutations) {
+      if (now - e.ts > UiBridge.LATE_MUTATION_TTL_MS) this.lateMutations.delete(rid);
+    }
+    // Map iteration is insertion-ordered, so dropping from the front drops the
+    // oldest. Quiet, unlike the ask-mapping overflow: losing one of 256 late
+    // completions costs the caller a notice they can still get by looking, where
+    // losing an ask mapping loses a user's answer outright.
+    for (const map of [this.timedOutMutations, this.lateMutations]) {
+      while (map.size > UiBridge.MAX_LATE_MUTATIONS) {
+        const oldest = map.keys().next();
+        if (oldest.done) break;
+        map.delete(oldest.value);
+      }
+    }
+  }
+
   private pruneLateAsk(): void {
     const now = Date.now();
     for (const [id, e] of this.lateAskReplies) {
@@ -2979,6 +3123,26 @@ export class UiBridge {
     this.lateAskSink = sink;
   }
 
+  /**
+   * Declare which commands are worth retaining a late completion for (#694).
+   *
+   * FAIL CLOSED: with no filter installed nothing is retained, because nothing
+   * could drain it either -- the drainer and the filter are the same layer.
+   *
+   * The bridge cannot answer this itself, and the first attempt at this proved
+   * why. It gated on `ctx.mutating`, i.e. `!BRIDGE_READONLY_CMDS.has(cmd)` --
+   * the discriminator this very file documents (see BRIDGE_READONLY_CMDS) as
+   * misclassifying graph_find_nodes, graph_list_subgraphs, graph_screenshot,
+   * graph_canvas, graph_select_nodes, graph_enter/exit_subgraph and
+   * graph_copy_nodes. That is #778, and re-asking it retained seven reads under
+   * a comment claiming reads were excluded. The real question is not "does this
+   * mutate" but "can this rid ever come back to us as a retry token", which only
+   * the retry-token layer knows. So it tells us.
+   */
+  setLateMutationFilter(fn: ((cmdName: string) => boolean) | null): void {
+    this.lateMutationFilter = fn;
+  }
+
   /** Notified when a tab's PRIMARY connection is dropped and it leaves the
    *  connection map (#486). Lets per-tab bookkeeping that can only ever be
    *  delivered to that tab be surfaced and retired, instead of accumulating for
@@ -3018,7 +3182,7 @@ export class UiBridge {
   private armTabGone(tabId: string, incarnation: string): void {
     if (!this.onTabGone) return;
     // Keyed per INCARNATION, so two browser tabs that share a recurring
-    // `wf:<hash>` key each get their own clock. Keyed by tab id alone, the
+    // `wf:` route key each get their own clock. Keyed by tab id alone, the
     // second tab's departure would silently drop the first tab's pending
     // signal and it would never be declarable gone at all.
     const slot = tabIncarnationSlot(tabId, incarnation);
@@ -3067,7 +3231,7 @@ export class UiBridge {
    * THIS tab is back (or is being torn down deliberately) — it is not gone.
    *
    * Only the SAME incarnation cancels. A different browser tab taking over a
-   * recurring `wf:<hash>` key must leave the departed tab's clock running, or
+   * recurring `wf:` route key must leave the departed tab's clock running, or
    * the departed tab becomes permanently undeclarable and its disclosure can be
    * settled by a conversation that never owned it. `undefined` cancels
    * unconditionally, for the deliberate teardown path that has no incarnation to
@@ -3095,7 +3259,7 @@ export class UiBridge {
 
   /** The incarnation currently holding `tabId` — the identity every structure
    *  that stores per-tab state must scope to, so a different browser tab taking
-   *  over a recurring `wf:<hash>` key cannot read, settle or inherit it (#486). */
+   *  over a recurring `wf:` route key cannot read, settle or inherit it (#486). */
   tabIncarnation(tabId: string): string | undefined {
     return this.conns.get(tabId)?.incarnationId;
   }
@@ -3248,7 +3412,7 @@ export class UiBridge {
       // Tab-id migration fallback — checked AFTER prefix matching (codex
       // review: a stale alias must never shadow a legitimately connected
       // prefix match), and only honored when the live connection is STILL the
-      // socket that created the migration (wf:<hash> ids recur — an unrelated
+      // socket that created the migration (wf:<tabRouteId>:<path> ids recur — an unrelated
       // later tab reusing the id must not inherit someone else's alias).
       if (prefixed.length === 0) {
         const migrated = this.tabMigrations.get(tabId);
@@ -3335,7 +3499,7 @@ export class UiBridge {
    *  socket, else the socket-scoped migration target it was renamed to (tmp:→wf:). Used
    *  by the #422 proven-supported bookkeeping so an in-flight reply that lands AFTER a
    *  same-socket re-hello migration records/clears on the migrated connection — and NEVER
-   *  on an UNRELATED tab that reused the (recurring wf:<hash> / recycled tmp:) id on a
+   *  on an UNRELATED tab that reused the (recurring wf:<tabRouteId>:<path> / recycled tmp:) id on a
    *  DIFFERENT socket, which the socket check rejects (codex round-4/7 P1). Returns
    *  undefined when neither resolves for this socket. */
   private liveConnForTab(tabId: string, sock: BridgeSocket): Conn | undefined {
@@ -3778,6 +3942,14 @@ export class UiBridge {
     };
     const timer = setTimeout(() => {
       this.pending.delete(rid);
+      // #694 — remember that THIS rid was a mutation we stopped waiting for. The
+      // panel may still reply; without this the reply is an unknown rid and the
+      // message loop drops it, which is precisely how a write that landed stays
+      // invisible to the caller who was told "outcome unknown".
+      if (this.lateMutationFilter?.(cmd.cmd)) {
+        this.pruneLateMutations();
+        this.timedOutMutations.set(rid, { cmd: cmd.cmd, tabId: ctx.tabId, ts: Date.now() });
+      }
       // This timer only fires AFTER sock.send() below returned successfully — the command
       // WAS WRITTEN to the socket; the tab (possibly backgrounded/frozen) merely didn't
       // reply in time and may still apply it. So this is a POST-write outcome: tag it
@@ -3906,7 +4078,10 @@ export class UiBridge {
       ctx.reject(
         markDispatched(
           new Error(
-            `panel tab ${short} disconnected mid-command ("${cmd}") — OUTCOME UNKNOWN: the command was already sent, so the panel may have applied it (for a run, ComfyUI may already be rendering). Verify before retrying (e.g. check queue action:"list" / get_image (action:"list_outputs")) instead of re-issuing it blindly.`,
+            // #952 — the remedy depends on WHAT was interrupted. An interactive
+            // card cannot be checked with queue/get_image, and a retry after a
+            // reconnect duplicates it in front of a human.
+            midCommandDisconnectMessage({ short, cmd }),
           ),
           true,
         ),

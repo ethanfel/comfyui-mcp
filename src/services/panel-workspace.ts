@@ -47,10 +47,13 @@ import {
   isLocalMode,
 } from "../config.js";
 import { parsePyproject } from "./node-authoring.js";
-import { parseBaseDirFromArgv } from "./output-dir.js";
+import {
+  hasUnresolvableRelativeBaseDirFlag,
+  parseBaseDirFromArgv,
+} from "./output-dir.js";
 import {
   getLiveServerSnapshot,
-  liveRootFromArgv,
+  resolveLiveServerRoot,
   resolveEffectiveComfyUIBase,
   resolveLocalWorkspaceBase,
 } from "./workspace-env.js";
@@ -61,6 +64,14 @@ export type PanelBaseSource =
   | "live-base-directory"
   /** The running server's own install root, from its launch argv (#769). */
   | "live-argv-root"
+  /**
+   * The running server's install root re-anchored on the interpreter the OS
+   * reports for the process on our port (#1133). This is the ComfyUI **Desktop**
+   * / Windows **portable** shape: argv is a RELATIVE `ComfyUI\main.py` with no
+   * reported cwd, so `live-argv-root` cannot resolve — but the process listening
+   * on our port can be observed directly. See `resolveLiveServerRoot`.
+   */
+  | "live-observed-root"
   /** COMFYUI_PATH or the saved default workspace. */
   | "configured"
   /** Remote/cloud, or nothing resolvable. */
@@ -87,12 +98,41 @@ export interface PanelBaseResolution {
   /**
    * True when the server WAS reached but no live root could be derived from
    * what it reported: no `--base-directory`, and its argv yielded no absolute
-   * install root holding custom_nodes (argv absent, no positional main.py, or
-   * a RELATIVE main.py with no reported cwd — the common `python main.py` /
-   * portable-launcher shape). Distinct from liveProbeFailed: "start ComfyUI"
-   * is a dead remedy here because ComfyUI is already running (#890/#916).
+   * install root holding custom_nodes (argv absent, or no positional main.py).
+   *
+   * A RELATIVE main.py with no reported cwd — the ComfyUI Desktop / Windows
+   * portable shape — no longer lands here on its own (#1133): the process on our
+   * port is observed and the relative dir re-anchored on its interpreter. It
+   * reaches this flag only when that observation ALSO fails (the process could
+   * not be identified, or the anchored dir held no `main.py`).
+   *
+   * Distinct from liveProbeFailed: "start ComfyUI" is a dead remedy here because
+   * ComfyUI is already running (#890/#916).
    */
   liveRootUnderivable?: boolean;
+  /**
+   * True when the server reported a `--base-directory` that is PRESENT but
+   * UNRESOLVABLE (relative, with no absolute cwd), so NO candidate was tried.
+   *
+   * Carried separately because the remedy differs from every other underivable
+   * case: relaunching with an absolute `main.py` would NOT fix this one — the
+   * flag, not the script path, is what cannot be resolved. Reporting the generic
+   * remedy here would be the #916 defect pointed at a new branch.
+   */
+  baseDirUnresolvable?: boolean;
+  /**
+   * The live root that was skipped because its `custom_nodes` could NOT BE READ
+   * — a permission error, an IO error, a share that went away — as distinct from
+   * one that provably has none (#796).
+   *
+   * Both used to end here identically, and the difference decides what the
+   * fallback means: falling back to the CONFIGURED tree after disproving the
+   * live one is a conclusion, while doing it after failing to read the live one
+   * is a guess wearing the same clothes. On a Desktop split install the
+   * configured tree is exactly the one the server does not read, so a caller
+   * about to write needs to know which of the two it is standing on.
+   */
+  liveRootUnreadable?: string;
 }
 
 /**
@@ -105,23 +145,49 @@ export interface PanelBaseResolution {
  * configured base is a plausible READ but never authority for a destructive
  * write, nor for certifying which panel the browser is loading.
  *
- * Only the two live-derived sources qualify.
+ * Only the three live-derived sources qualify. `live-observed-root` belongs here
+ * for the same reason the other two do — it is anchored on the process the OS
+ * reports for our port, correlated against that server's OWN argv, and accepted
+ * only when the anchored directory really holds `main.py` and an interpreter
+ * belonging to that install. It is an OBSERVATION of the running server, not a
+ * guess about a configured path (#1133).
  */
 export function isLiveDerivedBase(
   resolution: PanelBaseResolution | undefined,
 ): boolean {
   return (
     resolution?.source === "live-base-directory" ||
-    resolution?.source === "live-argv-root"
+    resolution?.source === "live-argv-root" ||
+    resolution?.source === "live-observed-root"
   );
 }
 
-/** Does this candidate root actually hold a custom_nodes directory? */
-function hasCustomNodes(base: string): boolean {
+/**
+ * Does this candidate root hold a `custom_nodes` directory — THREE answers (#796).
+ *
+ * `statSync` throws for two entirely different reasons and this returned `false`
+ * for both. ENOENT/ENOTDIR is a real answer: nothing is there. EACCES, EPERM,
+ * EIO, EBUSY and a dead UNC share are NOT — they mean the question could not be
+ * asked. This file already knows that hazard; `safeExists` a few hundred lines
+ * down avoids UNC paths precisely because "a dead network share can block
+ * existsSync for seconds".
+ *
+ * Folding them mattered here because of what the caller does next: an unreadable
+ * LIVE root is skipped, the resolution falls back to the CONFIGURED path, and
+ * the panel installer then operates on a different tree — while the caller's own
+ * comment says the point is to accept only a base we can PROVE holds
+ * custom_nodes. A base we could not read is not disproof.
+ */
+type CustomNodesState = "present" | "absent" | "unknown";
+
+function customNodesState(base: string): CustomNodesState {
   try {
-    return statSync(join(base, "custom_nodes")).isDirectory();
-  } catch {
-    return false;
+    return statSync(join(base, "custom_nodes")).isDirectory() ? "present" : "absent";
+  } catch (err) {
+    // Only these two prove absence. Everything else — permissions, IO, a share
+    // that went away — is an unanswered question, not a negative answer.
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unknown";
   }
 }
 
@@ -137,35 +203,109 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
 
   const configured = resolveEffectiveComfyUIBase();
   const snapshot = await getLiveServerSnapshot();
-  if (snapshot.reachable) {
-    // `--base-directory` FIRST: when ComfyUI is launched with it, that flag —
-    // not the main.py location — is the root it derives custom_nodes/ from.
-    const candidates: Array<[string | undefined, PanelBaseSource]> = [
-      [parseBaseDirFromArgv(snapshot.argv, snapshot.cwd), "live-base-directory"],
-      [liveRootFromArgv(snapshot.argv, snapshot.cwd), "live-argv-root"],
-    ];
-    for (const [candidate, source] of candidates) {
-      // Only accept a live base we can PROVE holds custom_nodes. An argv root
-      // without one is not the tree the panel lives in, and pointing the
-      // installer at it would manufacture a false "not installed".
-      if (!candidate || !hasCustomNodes(candidate)) continue;
+  // A `--base-directory` that is PRESENT but UNRESOLVABLE (relative, and the
+  // server reported no absolute cwd) poisons EVERY derivation, so no candidate
+  // may be tried at all (codex gate, #1133). ComfyUI derives custom_nodes from
+  // `<server cwd>/<flag>`; without the cwd that path cannot be computed — but
+  // the install root and the OS-observed process root both still resolve, and
+  // both name a tree the flag has already overridden. Adopting either would
+  // hand a DESTRUCTIVE swap a confidently-wrong directory. Fail closed.
+  //
+  // This also closes the same hole on the pre-existing `live-argv-root` tier,
+  // where an ABSOLUTE main.py alongside an unresolvable relative
+  // `--base-directory` already resolved to the install root.
+  const baseDirPoisoned = hasUnresolvableRelativeBaseDirFlag(snapshot.argv, snapshot.cwd);
+  /** #796 — a live candidate whose custom_nodes could not be READ (permissions,
+   *  IO, a dead share), as opposed to one that provably lacks it. */
+  let liveRootUnreadable: string | undefined;
+  if (snapshot.reachable && !baseDirPoisoned) {
+    // Only accept a live base we can PROVE holds custom_nodes. A root without
+    // one is not the tree the panel lives in, and pointing the installer at it
+    // would manufacture a false "not installed".
+    const accept = (
+      candidate: string | undefined,
+      source: PanelBaseSource,
+    ): PanelBaseResolution | undefined => {
+      if (!candidate) return undefined;
+      const state = customNodesState(candidate);
+      if (state === "unknown") {
+        // #796 — STILL SKIPPED: "we could not read it" is not the proof this
+        // branch requires, and loosening a guard on an unread directory is the
+        // wrong direction. But it is not disproof either, so it is recorded
+        // instead of vanishing — the fallback below otherwise hands the caller a
+        // CONFIGURED tree while silently implying the live one was disqualified
+        // on the evidence.
+        liveRootUnreadable ??= candidate;
+        return undefined;
+      }
+      if (state === "absent") return undefined;
       return {
         base: candidate,
         source,
         overriddenConfiguredBase:
           configured && configured !== candidate ? configured : undefined,
       };
-    }
+    };
+
+    // `--base-directory` FIRST: when ComfyUI is launched with it, that flag —
+    // not the main.py location — is the root it derives custom_nodes/ from.
+    const fromFlag = accept(
+      parseBaseDirFromArgv(snapshot.argv, snapshot.cwd),
+      "live-base-directory",
+    );
+    if (fromFlag) return fromFlag;
+
+    // Only NOW pay for the install-root derivation. `resolveLiveServerRoot` is
+    // SYNCHRONOUS and its second tier shells out to the process table
+    // (netstat + WMI on Windows), which blocks the event loop for ~1.3s on a
+    // healthy machine and far longer on its timeout path — so it must never run
+    // when `--base-directory` was going to win anyway (codex gate, #1133).
+    //
+    // It goes through the ONE canonical resolver rather than re-parsing argv
+    // here, which is what silently dropped ComfyUI Desktop and the Windows
+    // portable bundle: they report a RELATIVE `ComfyUI\main.py` with no cwd, so
+    // `liveRootFromArgv` yields nothing and a Desktop install had NO
+    // live-derived candidate at all — every destructive panel operation refused
+    // on an uncorroborated configured path. The canonical resolver adds the tier
+    // that exists precisely for that shape, re-anchoring the relative main.py on
+    // the interpreter the OS reports for the process on our port.
+    //
+    // That does not widen what counts as corroboration: the anchor is accepted
+    // only when the resulting directory holds `main.py` AND the observed
+    // interpreter belongs to that install. Unresolved still yields no candidate,
+    // and the gate still refuses.
+    const live = resolveLiveServerRoot(snapshot.argv, snapshot.cwd, { remote: false });
+    const fromLive = accept(
+      live.root,
+      live.source === "observed-process" ? "live-observed-root" : "live-argv-root",
+    );
+    if (fromLive) return fromLive;
   }
 
   const liveProbeFailed = !snapshot.reachable;
   // Reached but nothing derivable: tell callers apart from "could not ask" —
   // the remedy for each is different (#916).
   const liveRootUnderivable = snapshot.reachable;
+  // …and apart again from "reached, but a flag we cannot resolve overrides
+  // everything we could derive", whose remedy is different a third time.
+  const baseDirUnresolvable = snapshot.reachable && baseDirPoisoned;
   if (configured) {
-    return { base: configured, source: "configured", liveProbeFailed, liveRootUnderivable };
+    return {
+      base: configured,
+      source: "configured",
+      liveProbeFailed,
+      liveRootUnderivable,
+      baseDirUnresolvable,
+      liveRootUnreadable,
+    };
   }
-  return { source: "none", liveProbeFailed, liveRootUnderivable };
+  return {
+    source: "none",
+    liveProbeFailed,
+    liveRootUnderivable,
+    baseDirUnresolvable,
+    liveRootUnreadable,
+  };
 }
 
 /*
@@ -186,6 +326,45 @@ const PANEL_BASE_TTL_MS = 60_000;
 let cached:
   | { at: number; target: string; generation: number; resolution: PanelBaseResolution }
   | undefined;
+
+/**
+ * How many times the cache has been deliberately CLEARED (#1222).
+ *
+ * The in-flight guard below compares `cached` by reference to catch "a newer
+ * write landed while we were probing". That comparison has one blind spot, and
+ * it is the one that bites: a probe which STARTS with an empty cache records
+ * `undefined`, a clear leaves it `undefined`, and the two compare equal — so the
+ * clear is invisible and the stale probe writes its pre-clear answer in
+ * afterwards.
+ *
+ * A clear is an EVENT, not a value, so counting it is what makes it observable.
+ * `undefined → undefined` is indistinguishable by reference and unmistakable by
+ * count.
+ */
+let clearEpoch = 0;
+
+/**
+ * Forget the resolved base, countably (#1222).
+ *
+ * The one way to clear it deliberately. A bare `cached = undefined` at a fourth
+ * call site would reintroduce the whole bug silently — the clear would happen and
+ * an in-flight probe would put its pre-clear answer straight back — so the count
+ * lives with the assignment rather than next to it.
+ *
+ * NOT used by the retarget bail inside `primePanelBase`. That one is discarding
+ * its OWN answer because the target moved, and the target/generation checks
+ * already stop anyone acting on it. Bumping there would additionally stop a
+ * CONCURRENT probe against the new target from caching a result that is
+ * perfectly good — which costs a re-probe rather than correctness, so it is a
+ * deliberate scope line and not a safety one. Stated that way because it is not
+ * pinned by a test: mutating it to bump changes no observable answer, only how
+ * often the next caller re-resolves, and a test asserting that would be pinning
+ * a performance detail as though it were a contract.
+ */
+function forgetResolvedBase(): void {
+  cached = undefined;
+  clearEpoch += 1;
+}
 
 /** Cache key: which ComfyUI this resolution describes. Never throws. */
 function targetKey(): string {
@@ -263,6 +442,9 @@ export async function primePanelBase(
   // primePanelBase()` a refusal fires in the background did exactly that to a
   // base seeded after it started (#879 test isolation surfaced it).
   const cacheAtStart = cached;
+  // #1222 — and the CLEAR COUNT, because the reference comparison above cannot
+  // see a clear that leaves the cache as empty as it found it.
+  const clearEpochAtStart = clearEpoch;
 
   let resolution: PanelBaseResolution;
   try {
@@ -307,6 +489,20 @@ export async function primePanelBase(
     return cachedResolution() ?? resolution;
   }
 
+  // #1222 — the cache was deliberately CLEARED while this probe was in flight.
+  // Same rule as above and the same reason: this answer predates the clear, so
+  // writing it would silently undo an explicit "forget what you knew". The
+  // reference check misses it whenever the cache was already empty when the
+  // probe started, which is the common case — a refusal fires the background
+  // prime precisely because nothing was primed yet.
+  //
+  // The ANSWER is still returned: this caller asked and this is what the probe
+  // found. Only the shared cache is left alone, so the next caller re-resolves
+  // rather than inheriting a resolution someone asked to be forgotten.
+  if (clearEpoch !== clearEpochAtStart) {
+    return resolution;
+  }
+
   cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };
   return resolution;
 }
@@ -331,10 +527,19 @@ export function lastPanelBaseResolution(): PanelBaseResolution | undefined {
   return cachedResolution();
 }
 
-/** Test hook — drop the cache so the next prime re-resolves. */
+/**
+ * Test hook — drop the cache so the next prime re-resolves.
+ *
+ * Bumps the clear epoch (#1222) so a probe already in flight cannot land its
+ * pre-clear answer afterwards. Without that, this hook cleared the cache and an
+ * unawaited background prime — the one a capability refusal fires — repopulated
+ * it seconds later, inside whichever test happened to be running. That produced
+ * three flakes whose only symptom was the wrong remedy WORDING, which reads
+ * exactly like a real regression.
+ */
 export function __resetPanelBaseCache(): void {
-  cached = undefined;
   diskObservation = undefined;
+  forgetResolvedBase();
 }
 
 /**
@@ -434,7 +639,12 @@ export function clearPanelDiskObservation(): void {
   // restarted with different launch flags — and therefore a different
   // custom_nodes — so keeping the previous root cached would let the very next
   // operation freeze the wrong tree.
-  cached = undefined;
+  //
+  // #1222 — through `forgetResolvedBase`, because an in-flight probe that
+  // started BEFORE this hello would otherwise write the pre-restart root back in
+  // a moment later, which is precisely the freezing this exists to prevent. That
+  // is a PRODUCTION path, not only a test one: the clear runs on every hello.
+  forgetResolvedBase();
 }
 
 /**

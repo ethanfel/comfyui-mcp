@@ -61,16 +61,34 @@ export function identityReason(
     return ambiguousTurn(tabId, "no single tab's identity could be read");
   }
   if (!origin) {
+    // The relay case USED to land here and was told, correctly at the time, that
+    // its problem was permanent. It no longer is: the relay path now supplies the
+    // origin it already knows from COMFYUI_URL, so a relay session adopts fences
+    // like any other. Naming a fixed cause as the "known case" would send a
+    // reader to change a backend that is no longer the reason (#1077).
     return (
       `this tab's connection carries no server-observed Origin, and the workflow identity is ` +
-      `bound to one — so the fence can never be adopted for it. This is structural, not ` +
-      `transient: refreshing the tab will not change it. Relay-backend connections ` +
-      `(COMFYUI_MCP_TUNNEL_BACKEND=relay) are the known case, because the relay protocol does ` +
-      `not forward the browser's handshake Origin.`
+      `bound to one — so the fence cannot be adopted for it. Refreshing the tab will not ` +
+      `change it. This means the connection reached the orchestrator by a path that neither ` +
+      `observed nor was told the panel's origin; if COMFYUI_URL is unset or unparseable for ` +
+      `this session, setting it to the URL the panel is served from is what supplies it.`
     );
   }
+  // #1255 — this used to end "a malformed uuid, or one bound to a different
+  // origin", which describes a comparison the code does not perform.
+  // workflowIdentityParts uses the origin as a PRESENCE gate: it requires one to
+  // exist, and never compares it against a previously bound value (nothing in
+  // the repo has ever read `identity.origin` -- both call sites take `.uuid`).
+  // Reaching here with an origin present therefore means the UUID failed its
+  // shape check, full stop.
+  //
+  // The old wording sent a reader hunting for an origin mismatch that cannot
+  // happen -- it cost a whole investigation and a closed-unmerged PR before the
+  // mechanism was checked rather than believed. A refusal must describe the
+  // check it actually ran.
   return (
-    `the workflow identity did not validate (uuid ${String(workflowUuid)} against origin ` +
-    `${origin}) — a malformed uuid, or one bound to a different origin.`
+    `the workflow identity did not validate: the uuid ${String(workflowUuid)} is not a ` +
+    `well-formed workflow uuid. (The origin ${origin} was present and accepted -- this gate ` +
+    `requires an origin to exist, it does not compare it against a previously bound one.)`
   );
 }

@@ -732,6 +732,11 @@ async function extractDepsAction(input: string | Record<string, unknown>): Promi
   }
 
   if (result.unresolved.length > 0) {
+    // #1136 — extract_deps has its OWN signal: it never calls fetchManagerList,
+    // so catalogue_unavailable is not its fact. Its `unresolved` comes from the
+    // MAPPINGS endpoint, whose failure was previously caught, logged at warn and
+    // discarded -- we held the exception and asserted absence anyway.
+    if (result.mappings_unavailable) lines.push(result.mappings_unavailable, "");
     lines.push(
       `### Unresolved node types (${result.unresolved.length})`,
       "These class_types are neither installed nor known to ComfyUI-Manager:",
@@ -783,6 +788,9 @@ async function installDepsAction(input: string | Record<string, unknown>): Promi
   }
 
   if (result.unresolved.length > 0) {
+    // #1136 — say it BEFORE the list. A reader who has already read
+    // "not found in ComfyUI-Manager" has drawn the conclusion.
+    if (result.catalogue_unavailable) lines.push(result.catalogue_unavailable, "");
     lines.push(
       `### Could not resolve (${result.unresolved.length})`,
       "Not found in ComfyUI-Manager — install manually:",

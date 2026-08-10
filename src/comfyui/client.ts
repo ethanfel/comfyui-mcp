@@ -28,6 +28,8 @@ import {
   readComfyJson,
   redactErrorMessage,
   rethrowWithJsonDiagnosis,
+  scrubLogLines,
+  scrubSecretShapedText,
 } from "./json-guard.js";
 import * as cloudClient from "./cloud-client.js";
 import type { ObjectInfo, SystemStats, QueueStatus } from "./types.js";
@@ -616,12 +618,38 @@ async function queueRemainingCount(): Promise<number | undefined> {
  * Falls back to the generic HTTP status only when the body is empty or is not
  * the expected validation JSON (#485).
  */
+/**
+ * One field of a STRUCTURED /prompt error, made safe to interpolate (#1191,
+ * codex review).
+ *
+ * The fix for #1191 redacted the raw-body FALLBACK and stopped there — but the
+ * structured branch runs FIRST and copied `error.message`, each node's
+ * `class_type`, and every `errors[].message` / `.details` verbatim into the
+ * result. A hostile or reflecting gateway can answer with JSON shaped exactly
+ * like a ComfyUI validation failure, so a credential echoed in any of those
+ * fields reached the agent while the "redacted" path never ran.
+ *
+ * scrubSecretShapedText returns null when it cannot substitute safely; that is a
+ * FAIL-CLOSED signal, so the field is withheld rather than passed through. The
+ * #485 diagnosis survives because a genuine ComfyUI validation message contains
+ * no credential and is returned unchanged.
+ */
+function safeField(v: unknown): string {
+  if (typeof v !== "string" || v === "") return "";
+  const scrubbed = scrubSecretShapedText(v);
+  return scrubbed === null ? "(withheld: contains a configured credential)" : scrubbed;
+}
+
 async function buildEnqueueError(res: Response): Promise<ComfyUIError> {
   // unknown-ok: "" only routes to the GENERIC status message, which reports the
   // HTTP status and claims nothing about node errors. An unread body and an empty
   // body get the same honest fallback rather than a fabricated validation result.
   const bodyText = await res.text().catch(() => "");
-  const generic = `ComfyUI /prompt returned ${res.status} ${res.statusText}`;
+  // #1191 — statusText is attacker-influenceable on a hostile proxy and lands in
+  // a message the agent reads, so it gets the same scrub the body does.
+  // describeStatus drops a standard reason phrase entirely (it adds nothing),
+  // clips a long one, and falls back to the bare status if it cannot scrub.
+  const generic = `ComfyUI /prompt returned ${describeStatus(res.status, res.statusText)}`;
 
   let parsed: unknown;
   try {
@@ -644,17 +672,20 @@ async function buildEnqueueError(res: Response): Promise<ComfyUIError> {
       const cls = info?.class_type ?? "node";
       const errs = Array.isArray(info?.errors) ? info.errors : [];
       if (errs.length === 0) {
-        lines.push(`- ${cls} (node ${nodeId}): validation failed`);
+        lines.push(`- ${safeField(cls)} (node ${safeField(nodeId)}): validation failed`);
         continue;
       }
       for (const e of errs) {
-        const detail = e?.details ? ` (${e.details})` : "";
-        lines.push(`- ${cls} (node ${nodeId}): ${e?.message ?? "validation failed"}${detail}`);
+        const detail = e?.details ? ` (${safeField(e.details)})` : "";
+        lines.push(
+          `- ${safeField(cls)} (node ${safeField(nodeId)}): ` +
+            `${safeField(e?.message) || "validation failed"}${detail}`,
+        );
       }
     }
 
     const headline = payload.error?.message
-      ? `ComfyUI rejected the workflow (${res.status}): ${payload.error.message}`
+      ? `ComfyUI rejected the workflow (${res.status}): ${safeField(payload.error.message)}`
       : `ComfyUI rejected the workflow (${res.status})`;
 
     if (lines.length > 0 || payload.error?.message) {
@@ -668,10 +699,18 @@ async function buildEnqueueError(res: Response): Promise<ComfyUIError> {
     }
   }
 
-  // Empty or unexpected body: fall back to the generic HTTP status, but keep
-  // any raw text so nothing is silently dropped.
+  // Empty or unexpected body: fall back to the generic HTTP status, but keep a
+  // REDACTED prefix of the text so nothing is silently dropped.
+  //
+  // #1191 — this used to interpolate 500 RAW bytes. A gateway that reflects the
+  // request can echo our own credential in the body it answers with, and this
+  // string goes straight into a tool result the agent reads and users paste into
+  // bug reports. /prompt is the worst endpoint to have that on: it is the call
+  // every render makes, so this is the error path most likely to be hit and
+  // shared. bodyPrefixOf redacts by SHAPE as well as by known value, and
+  // withholds the prefix entirely when it cannot substitute safely.
   return new ConnectionError(
-    bodyText ? `${generic}: ${bodyText.slice(0, 500)}` : generic,
+    bodyText ? `${generic}: ${bodyPrefixOf(bodyText)}` : generic,
   );
 }
 
@@ -760,7 +799,20 @@ export function getComfyUIPath(): string | undefined {
   return config.comfyuiPath;
 }
 
-export async function getLogs(): Promise<string[]> {
+/**
+ * Which lines the caller wants — applied to the RAW log, before redaction.
+ * See `selectAndScrubLogLines` for why this cannot be the caller's job (#1223).
+ */
+export interface GetLogsOptions {
+  /** Case-insensitive substring the line must contain. */
+  keyword?: string;
+  /** Keep only the last N matching lines. */
+  maxLines?: number;
+}
+
+export async function getLogs(opts?: GetLogsOptions): Promise<string[]> {
+  // Cloud mode has no /internal/logs equivalent; this always throws
+  // CLOUD_UNSUPPORTED, so there is nothing to select or scrub.
   if (isCloudMode()) return cloudClient.getLogs();
 
   // A managed/panel restart or Manager reboot leaves the cached client bound to
@@ -799,16 +851,45 @@ export async function getLogs(): Promise<string[]> {
 
   // ComfyUI returns logs as a JSON-encoded string with \n separators,
   // or as raw text depending on version. Handle both.
+  let lines: string[];
   try {
     const parsed = JSON.parse(text);
-    if (typeof parsed === "string") {
-      return parsed.split("\n").filter(Boolean);
-    }
+    lines = (typeof parsed === "string" ? parsed : text).split("\n").filter(Boolean);
   } catch {
     // Not JSON — treat as raw text
+    lines = text.split("\n").filter(Boolean);
   }
-  return text.split("\n").filter(Boolean);
+  return selectAndScrubLogLines(lines, opts);
 }
+
+/**
+ * Select the requested lines, THEN scrub them (#1223).
+ *
+ * The order is the whole point, and getting it backwards is a false ABSENCE:
+ * `get_system_stats action:"logs"` filtered by keyword AFTER this function had
+ * already redacted, so a keyword matching redacted text — `keyword:"ltxvideo"`,
+ * `keyword:"LTXLoopingSampler"` — reported "No log lines found" while the
+ * matching lines sat in the log. Reporting nothing found is much worse than
+ * reporting a redacted match: the caller stops looking.
+ *
+ * Selection lives HERE rather than in the caller so the raw text never leaves
+ * this function. Callers get scrubbed lines and cannot filter on anything else,
+ * which is what makes the ordering a property of the code rather than a rule
+ * every future call site has to remember.
+ */
+function selectAndScrubLogLines(lines: string[], opts?: GetLogsOptions): string[] {
+  let selected = lines;
+  if (opts?.keyword) {
+    const kw = opts.keyword.toLowerCase();
+    selected = selected.filter((line) => line.toLowerCase().includes(kw));
+  }
+  // Tail before scrubbing: strictly less work, and identical output either way.
+  if (typeof opts?.maxLines === "number" && selected.length > opts.maxLines) {
+    selected = selected.slice(-opts.maxLines);
+  }
+  return scrubLogLines(selected);
+}
+
 
 /**
  * ComfyUI frontend per-user settings, served by the frontend user manager:

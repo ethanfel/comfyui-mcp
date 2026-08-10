@@ -493,7 +493,21 @@ export async function startDownloadJob(
       rec.status === "downloading" &&
       nowForAdopt - (rec.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS &&
       rec.trayId === trayId &&
-      (rec.id === id || (rec.req_key !== undefined && rec.req_key === reqKey)),
+      (rec.id === id || (rec.req_key !== undefined && rec.req_key === reqKey)) &&
+      // A FRESH HEARTBEAT IS NOT A LIVE WRITER. The heartbeat is written every
+      // 15s and only goes stale after 60, so a process that died a moment ago
+      // leaves a record that still looks current for up to a minute. Adopting it
+      // hands the caller a job nobody is running: the tool reports "in flight"
+      // and the poll never settles, which is worse than starting a second
+      // writer — the outcome adoption exists to avoid — because nothing
+      // downloads at all.
+      //
+      // PROVEN gone only (ESRCH). `undefined` means the probe could not tell —
+      // no pid on a pre-#858 record, or the probe itself failed — and refusing
+      // to adopt on that would treat "could not determine" as "dead", which is
+      // this codebase's own recurring defect (#796) pointed the other way: it
+      // would start a SECOND writer for a download that is genuinely running.
+      writerProcessGone(rec) !== true,
   );
   if (foreign) {
     logger.info(`Adopting a cross-session in-flight download (no second writer): ${foreign.id}`, {
@@ -1057,7 +1071,19 @@ export function listDownloadJobCandidates(id: string): DownloadJob[] {
       byKey.set(k, job);
     }
   }
-  return [...byKey.values()].sort((a, b) => b.started_at - a.started_at);
+  // #1208 — a DETERMINISTIC tiebreak. started_at is a millisecond timestamp, so
+  // two jobs begun in the same millisecond compared equal and the order fell back
+  // to Map insertion order: stable locally, evidently not on a loaded CI runner.
+  // "lists newest first" failed on all THREE platforms at once and went green on
+  // an unchanged re-run — and a flake that fails everywhere simultaneously reads
+  // like a regression, which is what it costs to rule out.
+  //
+  // trayId is the right tiebreak: it is unique per physical download (two URLs
+  // sharing an id differ there), so equal timestamps order identically on every
+  // run and in every process.
+  return [...byKey.values()].sort(
+    (a, b) => b.started_at - a.started_at || compareTrayIds(a.trayId, b.trayId),
+  );
 }
 
 /**
@@ -1109,6 +1135,94 @@ export function getDownloadJob(id: string, trayId?: string): DownloadJob | undef
   if (live) return live; // this session's terminal (cancelled/error), no DONE to prefer
   const terminal = matches.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0];
   return terminal ? jobFromPersisted(terminal) : undefined;
+}
+
+/**
+ * Why a by-id lookup came back empty — when the answer is NOT "it is gone" (#1183).
+ *
+ * A reporter polled a live 26.5GB local download for ~30 minutes (20% → 95%) and
+ * then got, for ONE poll:
+ *
+ *   No download matching id `cb43b8c206bec9b1`. It has either finished long ago
+ *   … or never started
+ *
+ * The file existed nowhere on disk and nothing had been cancelled. Re-issuing the
+ * same URL immediately re-adopted the SAME id at 97% — the job was alive in
+ * process the entire time.
+ *
+ * getDownloadJob DECLINES in several places rather than guessing, and those
+ * declines are correct: two concurrent physical transfers sharing an id must not
+ * be resolved by picking one. What is not correct is rendering a decline as an
+ * ABSENCE. "I will not choose between two" and "there is nothing here" are
+ * different facts, and only the second justifies telling a user their download
+ * vanished — which is what invites a redundant multi-gigabyte re-download.
+ *
+ * So: when the lookup misses, ask the cheaper question it never asked — is there
+ * a LIVE record for this id at all? Returns undefined when there genuinely is
+ * not, so a real "not found" keeps its existing wording.
+ */
+export function describeUnresolvedDownload(id: string): string | undefined {
+  const now = Date.now();
+  const liveInMemory = jobs.get(id)?.job;
+  const inFlight = listPersistedDownloadJobs().filter(
+    (r) => r.id === id && r.status === "downloading",
+  );
+  const livePersisted = inFlight.filter(
+    (r) => now - (r.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
+  );
+  // A STALE in-flight record counts here, hedged — and getting that wrong is
+  // what would have left the REPORTED case uncovered.
+  //
+  // This function first used the same freshness window the lookup uses, which
+  // means it went silent in exactly the situation most likely to have produced a
+  // one-poll miss during a 26GB transfer: a heartbeat delayed past 60s while the
+  // writer was busy. The codebase already states the right rule one file over
+  // (#761): "a missed heartbeat is only a liveness hint, not proof the transfer
+  // stopped" — which is why an in-flight record is retained for 6h rather than
+  // reaped at 60s. Declining to mention such a record would repeat the very fold
+  // this fix exists to remove, one level down.
+  const stalePersisted = inFlight.filter(
+    (r) => now - (r.updated ?? 0) >= PERSISTED_INFLIGHT_STALE_MS,
+  );
+  const inMemoryLive = liveInMemory?.status === "downloading";
+  if (!inMemoryLive && livePersisted.length === 0 && stalePersisted.length === 0) {
+    return undefined;
+  }
+
+  // Only a stale record to go on: say what is known and what is not, rather than
+  // asserting either "running" or "gone".
+  if (!inMemoryLive && livePersisted.length === 0) {
+    const newest = stalePersisted.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0];
+    const ageS = Math.round((now - (newest?.updated ?? now)) / 1000);
+    return (
+      `A download with id \`${id}\` has an IN-FLIGHT record that stopped reporting ` +
+      `${ageS}s ago — this lookup declined to answer for it, which is NOT the same as it ` +
+      `being gone. A missed heartbeat is a liveness HINT, not proof the transfer stopped: ` +
+      `the bytes may still be streaming while persistence was interrupted (a reconnect, or ` +
+      `a busy writer). Check the panel download tray, or re-run with no selector to list ` +
+      `every tracked download, BEFORE re-downloading — a second transfer would duplicate ` +
+      `a multi-gigabyte file.`
+    );
+  }
+
+  const trays = [
+    ...new Set([
+      ...(inMemoryLive && liveInMemory ? [liveInMemory.trayId] : []),
+      ...livePersisted.map((r) => r.trayId).filter((t): t is string => typeof t === "string"),
+    ]),
+  ];
+  const several = trays.length > 1;
+  return (
+    `A download with id \`${id}\` IS still running — this lookup declined to answer for it, ` +
+    `which is NOT the same as it being gone. ` +
+    (several
+      ? `TWO OR MORE live transfers share that id (tray ids: ${trays.join(", ")}), so answering ` +
+        `by id alone would have picked one arbitrarily. Re-run with \`tray_id\` to select the one ` +
+        `you mean, or omit the selector to list them all.`
+      : `Its record could not be matched by id alone in this session. Re-run with no selector to ` +
+        `list every tracked download, or pass \`tray_id\`${trays[0] ? ` (\`${trays[0]}\`)` : ""}.`) +
+    ` Do NOT re-download: the transfer is in flight and a second one would duplicate it.`
+  );
 }
 
 /** Adopt an in-flight download by URL or destination after a reconnect (#529) —
@@ -1164,6 +1278,27 @@ export function findDownloadJob(query: { url?: string; destKey?: string }): Down
   return persisted ? jobFromPersisted(persisted) : undefined;
 }
 
+/**
+ * The ordering tiebreak for two jobs that share a millisecond (#1208).
+ *
+ * RAW comparison, not localeCompare (codex review). localeCompare is
+ * locale-aware by definition and its collation depends on the runtime's ICU
+ * build, so `tray-B` vs `tray-a` can order differently on Windows and Linux —
+ * which would have traded a timing flake for a portability flake, in a function
+ * whose whole job here is to be identical on every machine.
+ *
+ * A missing trayId sorts LAST rather than colliding on the string "undefined":
+ * two absent ids still compare equal (nothing can separate them), but an absent
+ * one never displaces a present one, so the order stays stable as far as the
+ * data allows.
+ */
+export function compareTrayIds(a: string | undefined, b: string | undefined): number {
+  if (a === b) return 0;
+  if (a === undefined) return 1;
+  if (b === undefined) return -1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function listDownloadJobs(): DownloadJob[] {
   // One Entry is indexed under multiple keys — dedup by identity so a job appears once
   // regardless of how many keys point at it. Identity is (id, trayId), NOT id alone:
@@ -1197,7 +1332,19 @@ export function listDownloadJobs(): DownloadJob[] {
       byKey.set(k, job);
     }
   }
-  return [...byKey.values()].sort((a, b) => b.started_at - a.started_at);
+  // #1208 — a DETERMINISTIC tiebreak. started_at is a millisecond timestamp, so
+  // two jobs begun in the same millisecond compared equal and the order fell back
+  // to Map insertion order: stable locally, evidently not on a loaded CI runner.
+  // "lists newest first" failed on all THREE platforms at once and went green on
+  // an unchanged re-run — and a flake that fails everywhere simultaneously reads
+  // like a regression, which is what it costs to rule out.
+  //
+  // trayId is the right tiebreak: it is unique per physical download (two URLs
+  // sharing an id differ there), so equal timestamps order identically on every
+  // run and in every process.
+  return [...byKey.values()].sort(
+    (a, b) => b.started_at - a.started_at || compareTrayIds(a.trayId, b.trayId),
+  );
 }
 
 /**

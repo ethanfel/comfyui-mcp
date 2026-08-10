@@ -18,6 +18,13 @@ const hoisted = vi.hoisted(() => ({
   // Whether an argv-derived live root is present on THIS filesystem. A
   // Docker/forwarded loopback server's container path is not host-local → false.
   liveRootExists: true,
+  /** #1263 — the interpreter the live-process probe "finds", instead of whatever
+   *  is really running on the developer's machine. undefined = nothing found. */
+  livePython: undefined as string | undefined,
+  /** The stub itself, created here so the spec can assert BY IDENTITY that this
+   *  is the function in force, and count the calls the code under test makes to
+   *  it (codex). Its behaviour is installed in `beforeEach`. */
+  liveInterpreter: vi.fn() as ReturnType<typeof vi.fn>,
 }));
 
 // The live-root routing branch only streams local when the root exists locally.
@@ -40,6 +47,29 @@ vi.mock("../../services/workspace-env.js", async () => {
   return { ...actual, resolveEffectiveComfyUIBase: () => hoisted.base };
 });
 
+// #1263 — THE PROCESS TABLE IS NOT A FIXTURE. `resolveLiveServerRoot` falls back
+// to `observeLivePython()`, which calls `resolveLiveInterpreter` — and that
+// shells out to netstat/WMI to find whatever python is really serving the port
+// on THIS machine. So on a developer box with ComfyUI running, a relative
+// `main.py` argv anchors onto the live interpreter, a root resolves, the mocked
+// `existsSync` says it exists, and the #420 case streams local instead of routing
+// to the Manager. On CI nothing is listening, the probe finds nothing, and the
+// same test passes.
+//
+// That is why this file passed every CI run while failing locally: the assertion
+// depended on whether the machine running it happened to have a ComfyUI up.
+// Stubbed to "found nothing" by default, which is the state these cases describe;
+// `hoisted.livePython` opts a case into the other answer.
+vi.mock("../../services/live-interpreter.js", async () => {
+  const actual = await vi.importActual<typeof import("../../services/live-interpreter.js")>(
+    "../../services/live-interpreter.js",
+  );
+  // The stub is created in `vi.hoisted` and handed over here, so the spec can
+  // assert BY IDENTITY that this is the function in force, and count the calls
+  // the code under test makes to it (codex).
+  return { ...actual, resolveLiveInterpreter: hoisted.liveInterpreter };
+});
+
 // getSystemStats stands in for the connected server's /system_stats. getClient is
 // pulled in transitively by model-resolver; stub it so the import doesn't fail.
 vi.mock("../../comfyui/client.js", () => ({
@@ -54,6 +84,7 @@ vi.mock("../../comfyui/client.js", () => ({
   }),
 }));
 
+import { resolveLiveInterpreter } from "../../services/live-interpreter.js";
 import { shouldDispatchDownloadToManager } from "../../services/model-resolver.js";
 
 beforeEach(() => {
@@ -62,6 +93,74 @@ beforeEach(() => {
   hoisted.stats = undefined;
   hoisted.statsThrows = false;
   hoisted.liveRootExists = true;
+  hoisted.livePython = undefined;
+  // The stub is a spy now (so its calls can be counted), so its behaviour has to
+  // be (re)installed here rather than living in the mock factory.
+  hoisted.liveInterpreter.mockReset();
+  hoisted.liveInterpreter.mockImplementation(() =>
+    hoisted.livePython ? { python: hoisted.livePython, pid: 4242 } : undefined,
+  );
+});
+
+// #1263 — THE STUB MUST BE PROVEN, NOT ASSUMED.
+//
+// Every case below depends on `resolveLiveInterpreter` returning what this file
+// says it returns. If the mock ever stops intercepting — a vitest change, a path
+// resolution difference, an import that reaches the module by another specifier —
+// the stub goes INERT and these tests silently read the real process table again.
+// The symptom is not an error: it is the #420 case receiving `false` on a machine
+// with ComfyUI running, and passing on CI where nothing is listening. That is the
+// original bug, and it recurred on 0.50.87 for a reporter whose vitest, OS and
+// checkout all match a rig where it passes.
+//
+// The #1290 source gate asserts that a spec MENTIONS live-interpreter. It cannot
+// see whether the mock takes effect. This can, and it fails with its own name on
+// it rather than as a confusing routing assertion.
+describe("the live-process stub is actually in force (#1263)", () => {
+  it("the imported resolveLiveInterpreter IS this file's stub, by identity", () => {
+    // Identity, not behaviour (codex): a different implementation returning the
+    // same two values would satisfy an output check.
+    expect(
+      resolveLiveInterpreter,
+      "vi.mock is not intercepting ../../services/live-interpreter.js — this file is " +
+        "reading the REAL process table, so its assertions now depend on whether this " +
+        "machine happens to have ComfyUI running (#1263).",
+    ).toBe(hoisted.liveInterpreter);
+  });
+
+  it("and the CODE UNDER TEST reaches that same stub — not another copy", async () => {
+    // The check that matters (codex): proving THIS file's import is mocked says
+    // nothing about which module `shouldDispatchDownloadToManager` resolves. If
+    // the SUT reached an unmocked copy — a different specifier, a duplicated
+    // module instance — the identity check above would still pass while every
+    // routing assertion silently consulted the real process table.
+    //
+    // The #420 shape is the one that must consult it: no local base, and a
+    // RELATIVE main.py that can only be anchored via the live interpreter.
+    hoisted.base = undefined;
+    hoisted.stats = { system: { argv: ["main.py", "--listen"] } };
+    await shouldDispatchDownloadToManager();
+
+    expect(
+      hoisted.liveInterpreter.mock.calls.length,
+      "the routing code never called the stubbed probe, so it is resolving a DIFFERENT " +
+        "copy of live-interpreter than this file mocked — the stub is inert for the " +
+        "assertions that depend on it (#1263).",
+    ).toBeGreaterThan(0);
+  });
+
+  it("the stub follows its fixture, so it is not merely returning undefined by luck", () => {
+    // A real probe on a machine with no ComfyUI also returns undefined, so the
+    // default proves nothing on its own.
+    try {
+      hoisted.livePython = "C:/probe/python.exe";
+      expect(resolveLiveInterpreter()).toEqual({ python: "C:/probe/python.exe", pid: 4242 });
+    } finally {
+      // Restored here rather than left to beforeEach, so a failure above cannot
+      // leave the fixture mutated for anything that runs before it (codex).
+      hoisted.livePython = undefined;
+    }
+  });
 });
 
 describe("shouldDispatchDownloadToManager (#420 reconnect routing)", () => {
@@ -146,5 +245,30 @@ describe("shouldDispatchDownloadToManager (#420 reconnect routing)", () => {
       system: { argv: ["python", "main.py", "--base-directory", "data"], cwd: "/srv/live" },
     };
     expect(await shouldDispatchDownloadToManager()).toBe(false);
+  });
+  // #1263 — the OTHER side of the live-process probe, which was previously
+  // decided by whatever happened to be running on the developer's machine and so
+  // was never actually asserted. Now that the probe is a fixture, both answers
+  // are reachable on purpose.
+  it("no local base, but the LIVE interpreter anchors a real root → streams local", async () => {
+    hoisted.base = undefined;
+    // A relative main.py with no reported cwd: unresolvable from argv alone, so
+    // the decision falls to the live-process probe.
+    hoisted.stats = { system: { argv: ["main.py", "--listen"] } };
+    hoisted.livePython = "/opt/comfy/.venv/bin/python";
+    hoisted.liveRootExists = true;
+
+    expect(await shouldDispatchDownloadToManager()).toBe(false);
+  });
+
+  it("...and routes to the Manager when that anchored root is NOT on this filesystem", async () => {
+    // A container/forwarded server: the probe reports a python, but its root is a
+    // path that does not exist here, so there is nothing local to stream into.
+    hoisted.base = undefined;
+    hoisted.stats = { system: { argv: ["main.py", "--listen"] } };
+    hoisted.livePython = "/opt/comfy/.venv/bin/python";
+    hoisted.liveRootExists = false;
+
+    expect(await shouldDispatchDownloadToManager()).toBe(true);
   });
 });

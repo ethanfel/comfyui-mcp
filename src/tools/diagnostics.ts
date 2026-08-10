@@ -105,7 +105,49 @@ function selectRunToDiagnose(
   return selectNewestHistoryEntry(history);
 }
 
-function formatHistoryEntry(
+/** #1229 — per-value cap for a non-media history output. Generous enough for a
+ *  diagnostic string, small enough that a runaway value cannot dominate the
+ *  reply; anything longer is clipped WITH a note saying so. */
+const PER_OUTPUT_VALUE_CHARS = 800;
+
+/**
+ * Render one non-media history output value (#1229).
+ *
+ * Separator is " | " between keys and ", " inside an array. Multi-line values
+ * are indented as continuations so one value cannot shatter the bullet list --
+ * the motivating use case is reading validation errors through a scratch
+ * PreviewAny, which are multi-line by nature.
+ */
+function renderOutputValue(value: unknown): string {
+  let flat: string;
+  try {
+    flat = Array.isArray(value)
+      ? value.map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join(", ")
+      : typeof value === "string"
+        ? value
+        : JSON.stringify(value);
+  } catch {
+    // Unreachable today (the entry always comes from JSON.parse, which cannot
+    // produce a cycle or a BigInt) -- but losing the WHOLE entry, including the
+    // status and timing already computed, to an opaque TypeError would be worse
+    // than the bug this fixes.
+    return "(unserializable)";
+  }
+  if (flat === undefined || flat === "") return "(empty)";
+  // Slice by CODE POINT: a UTF-16 slice can split a surrogate pair and emit a
+  // lone half, which is not well-formed text.
+  const chars = Array.from(flat);
+  const clipped =
+    chars.length > PER_OUTPUT_VALUE_CHARS
+      ? chars.slice(0, PER_OUTPUT_VALUE_CHARS).join("") +
+        `... [truncated, ${chars.length} chars total]`
+      : flat;
+  return clipped.includes("\n")
+    ? "\n" + clipped.split("\n").map((l) => `    ${l}`).join("\n")
+    : clipped;
+}
+
+export function formatHistoryEntry(
   promptId: string,
   entry: HistoryEntry,
 ): string {
@@ -185,6 +227,7 @@ function formatHistoryEntry(
       // (jcd315/comfyui-mcp-muse, commit e13342ec).
       const mediaKeys = ["images", "videos", "video", "gifs"] as const;
       const expanded: string[] = [];
+      const consumed = new Set<string>();
       for (const key of mediaKeys) {
         const items = output[key];
         if (!Array.isArray(items)) continue;
@@ -202,13 +245,50 @@ function formatHistoryEntry(
             return `${path} (type=${type})`;
           })
           .join(", ");
-        if (fileList) expanded.push(`${key} → **${fileList}**`);
+        if (fileList) {
+          expanded.push(`${key} → **${fileList}**`);
+          consumed.add(key);
+        }
       }
-      if (expanded.length > 0) {
-        lines.push(`- Node ${nodeId}: ${expanded.join("; ")}`);
+      // #1229 - render every key the media expansion did NOT consume, in BOTH
+      // branches.
+      //
+      // Scoping this to the no-media `else` left the reported defect live one
+      // branch over, on STOCK nodes: SaveAnimatedWEBP emits {images, animated}
+      // and a captioner emits {images, text}, so `expanded.length > 0` won a
+      // short-circuit and the payload was dropped exactly as before. Fixing the
+      // fallback alone fixed only the case I happened to test.
+      const leftovers = Object.entries(output)
+        .filter(([key]) => !consumed.has(key))
+        .map(([key, value]) => {
+          const v = renderOutputValue(value);
+          // No space before a multi-line block: `key: ` meeting the value's
+          // leading newline leaves a trailing space on the key line.
+          return v.startsWith("\n") ? `${key}:${v}` : `${key}: ${v}`;
+        });
+      const rendered = [...expanded, ...leftovers];
+      // One key per LINE once there is more than one, or any value is
+      // multi-line. Round 2 caught the two round-1 fixes colliding: rendering
+      // leftovers alongside media (HIGH 1) plus indented continuations for
+      // multi-line values meant `join(" | ")` appended the next key to the last
+      // indented line, so `animated: true` read as the tail of a PreviewAny
+      // error. No data lost, but mis-attributed -- and it fires on exactly the
+      // {images, text, animated} shape HIGH 1 made renderable.
+      //
+      // This also retires the inline separator rather than relocating its
+      // collision: `" | "` merely moved the clash from semicolon-bearing text
+      // onto pipe-bearing text, and a markdown table row is a very plausible
+      // PreviewAny payload.
+      if (rendered.length === 0) {
+        // Three states used to share "(no output data)": a missing output, a
+        // non-object output, and an object with no keys. Distinct causes, and
+        // folding them is the defect class this issue belongs to.
+        lines.push(`- Node ${nodeId}: (empty output object)`);
+      } else if (rendered.length === 1 && !rendered[0].includes("\n")) {
+        lines.push(`- Node ${nodeId}: ${rendered[0]}`);
       } else {
-        const outputTypes = Object.keys(output);
-        lines.push(`- Node ${nodeId}: ${outputTypes.join(", ")}`);
+        lines.push(`- Node ${nodeId}:`);
+        for (const part of rendered) lines.push(`  - ${part}`);
       }
     }
   }
@@ -232,19 +312,14 @@ export async function getLogsAction(args: {
   max_lines?: number;
   keyword?: string;
 }): Promise<CallToolResult> {
-  let lines = await getLogs();
-
-  // Filter by keyword if provided
-  if (args.keyword) {
-    const kw = args.keyword.toLowerCase();
-    lines = lines.filter((line) => line.toLowerCase().includes(kw));
-  }
-
-  // Tail to max_lines
+  // #1223 — the keyword filter and the tail are handed to getLogs so they run on
+  // the RAW log, BEFORE redaction. Filtering here meant matching against text the
+  // scrub had already rewritten, so `keyword:"ltxvideo"` answered "No log lines
+  // found" for a log that contained it — an absence claim about a line that was
+  // right there. Selection and redaction have to happen in that order, and the
+  // only way to guarantee it is to not have the raw lines here at all.
   const maxLines = args.max_lines ?? 100;
-  if (lines.length > maxLines) {
-    lines = lines.slice(-maxLines);
-  }
+  const lines = await getLogs({ keyword: args.keyword, maxLines });
 
   // Strip ANSI escape codes for readability
   const clean = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));

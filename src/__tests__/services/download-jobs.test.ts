@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
   resolvers: [] as Array<{ resolve: (p: string) => void; reject: (e: Error) => void; url: string }>,
@@ -108,6 +108,7 @@ import {
   startDownloadJob,
   getDownloadJob,
   findDownloadJob,
+  compareTrayIds,
   listDownloadJobs,
   listDownloadJobCandidates,
   cancelDownloadJob,
@@ -115,7 +116,8 @@ import {
   downloadIdFor,
   describePlacement,
 } from "../../services/download-jobs.js";
-import { setProgressDir, PERSIST_OWNER } from "../../services/download-progress.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { setProgressDir, PERSIST_OWNER, __resetStableRecordsDir } from "../../services/download-progress.js";
 import * as progressModule from "../../services/download-progress.js";
 import { downloadModel, resolveDownloadTarget } from "../../services/model-resolver.js";
 import { mkdtemp, mkdir, symlink, writeFile, readFile, rm as fsRm } from "node:fs/promises";
@@ -126,6 +128,19 @@ import { join as pathJoin } from "node:path";
 /** Simulate ANOTHER MCP session's persisted in-flight record on disk: a distinct
  *  owner-scoped control-job- file (owner ≠ this process's PERSIST_OWNER). Used to
  *  exercise cross-session sibling detection without a second process. */
+
+/** A pid nothing answers to, so `writerProcessGone` can return PROVEN gone. */
+function deadPidForTests(): number {
+  for (let pid = 999_000; pid < 999_200; pid++) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return pid;
+    }
+  }
+  throw new Error("could not find a pid that is provably gone");
+}
+
 async function writeForeignJobRecord(
   dir: string,
   rec: {
@@ -172,6 +187,9 @@ const URL_A = "https://huggingface.co/org/repo/resolve/main/big.safetensors";
 const URL_B = "https://huggingface.co/org/repo/resolve/main/other.safetensors";
 
 describe("download job registry", () => {
+  let storeDir = "";
+  const savedDataDir = process.env.COMFYUI_MCP_DATA_DIR;
+
   beforeEach(() => {
     hoisted.resolvers.length = 0;
     hoisted.calls = 0;
@@ -184,6 +202,25 @@ describe("download job registry", () => {
     hoisted.lastOnTrayId = undefined;
     hoisted.lastOnLanded = undefined;
     resetDownloadJobs();
+    // #1148 — THE PERSISTED STORE IS NOW ON BY DEFAULT, so it needs isolating
+    // like every other on-disk state this suite touches. Without this, records
+    // written by one case are still on disk for the next and show up in
+    // `listDownloadJobs()`, which merges in-memory with persisted rows: cases
+    // asserting an exact job count started seeing the previous case's downloads.
+    //
+    // That accumulation is CORRECT in production — `action:"status"` with no
+    // selector is meant to list every tracked download, and records self-reap
+    // after 6h. It is only a test that needs each case to start empty.
+    storeDir = mkdtempSync(pathJoin(tmpdir(), "djobs-store-"));
+    process.env.COMFYUI_MCP_DATA_DIR = storeDir;
+    __resetStableRecordsDir();
+  });
+
+  afterEach(() => {
+    if (savedDataDir === undefined) delete process.env.COMFYUI_MCP_DATA_DIR;
+    else process.env.COMFYUI_MCP_DATA_DIR = savedDataDir;
+    __resetStableRecordsDir();
+    if (storeDir) rmSync(storeDir, { recursive: true, force: true });
   });
 
   it("reports a download as in flight rather than finished or failed", async () => {
@@ -416,12 +453,33 @@ describe("download job registry", () => {
     expect(listDownloadJobs()).toHaveLength(1);
   });
 
+  // #1208 — this raced the clock. It started two jobs 2 ms apart and asserted an
+  // order derived from `b.started_at - a.started_at`, a MILLISECOND timestamp
+  // with no tiebreak, so when both landed in the same millisecond the result fell
+  // back to Map insertion order. It failed on all three platforms at once during
+  // a release build and went green on an unchanged re-run.
+  //
+  // Now it controls what it asserts: the timestamps are set explicitly, so the
+  // ordering is a property of the comparator rather than of how busy the machine
+  // was.
   it("lists newest first", async () => {
-    await startDownloadJob(URL_A, "checkpoints");
-    await new Promise((r) => setTimeout(r, 2));
-    await startDownloadJob(URL_B, "loras");
+    const a = await startDownloadJob(URL_A, "checkpoints");
+    const b = await startDownloadJob(URL_B, "loras");
+    a.job.started_at = 1_000;
+    b.job.started_at = 2_000;
     expect(listDownloadJobs()[0].url).toBe(URL_B);
   });
+
+  // NOT unit-tested here, deliberately, and worth saying why rather than
+  // shipping a test that passes for the wrong reason: the comparator's trayId
+  // tiebreak only shows itself when two jobs share a millisecond, and that
+  // cannot be forced through the public API — `listDownloadJobs()` returns FRESH
+  // objects, so assigning `started_at` on the returned array mutates throwaway
+  // copies. An earlier attempt did exactly that and was vacuous.
+  //
+  // The tiebreak is defensive and cheap; what this file DOES pin is the ordering
+  // itself, above, now that the test no longer races a 2 ms gap to establish it.
+
 
   // #467 P1-A: the job layer dedups BEFORE the header-aware cache layer, so it must
   // fold auth into its keys — otherwise two concurrent same-URL+same-dest calls with
@@ -1774,6 +1832,107 @@ describe("download job registry", () => {
       }
     });
 
+    // #1148 — A FRESH HEARTBEAT IS NOT A LIVE WRITER.
+    //
+    // Adoption required a heartbeat newer than 60s and never asked whether that
+    // writer still exists. The heartbeat is written every 15s, so a process that
+    // died a moment ago leaves a record that looks current for up to a minute —
+    // and adopting it hands the caller a job nobody is running: "in flight",
+    // polled forever, nothing downloading. That is worse than the duplicate
+    // writer adoption exists to prevent.
+    it("does NOT adopt a fresh record whose writer is PROVEN gone — it starts its own", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const a = await startDownloadJob(URL_A, "checkpoints");
+        const id = a.job.id;
+        expect(hoisted.calls).toBe(1);
+        await fsRm(pathJoin(dir, `control-job-${id}-${PERSIST_OWNER}.json`), { force: true });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId: a.job.trayId,
+          progressId: `prog-${URL_A}`,
+          url: URL_A,
+          owner: `${PERSIST_OWNER}-other`,
+          dest_key: a.job.destKey,
+          // A pid nothing answers to: PROVEN gone (ESRCH), while the record's
+          // `updated` stamp is fresh.
+          pid: deadPidForTests(),
+        });
+        resetDownloadJobs();
+
+        const b = await startDownloadJob(URL_A, "checkpoints");
+
+        // A SECOND writer is exactly right here: the first one is dead.
+        expect(hoisted.calls, "it must start its own writer").toBe(2);
+        expect(b.job.status).toBe("downloading");
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("still adopts when the writer is ALIVE — the dedup must keep working", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const a = await startDownloadJob(URL_A, "checkpoints");
+        const id = a.job.id;
+        await fsRm(pathJoin(dir, `control-job-${id}-${PERSIST_OWNER}.json`), { force: true });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId: a.job.trayId,
+          progressId: `prog-${URL_A}`,
+          url: URL_A,
+          owner: `${PERSIST_OWNER}-other`,
+          dest_key: a.job.destKey,
+          // This process is alive by definition — the honest stand-in for a live
+          // foreign writer.
+          pid: process.pid,
+        });
+        resetDownloadJobs();
+
+        const b = await startDownloadJob(URL_A, "checkpoints");
+
+        expect(b.job.id).toBe(id);
+        expect(hoisted.calls, "no second writer for a live download").toBe(1);
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("adopts a record with NO pid — unknown liveness is not death", async () => {
+      // Pre-#858 records carry no pid. Declining on that would start a SECOND
+      // writer for a download that may well be running: the same fold pointed
+      // the other way.
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const a = await startDownloadJob(URL_A, "checkpoints");
+        const id = a.job.id;
+        await fsRm(pathJoin(dir, `control-job-${id}-${PERSIST_OWNER}.json`), { force: true });
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId: a.job.trayId,
+          progressId: `prog-${URL_A}`,
+          url: URL_A,
+          owner: `${PERSIST_OWNER}-other`,
+          dest_key: a.job.destKey,
+          // pid deliberately omitted.
+        });
+        resetDownloadJobs();
+
+        const b = await startDownloadJob(URL_A, "checkpoints");
+
+        expect(b.job.id).toBe(id);
+        expect(hoisted.calls, "unknown must not start a duplicate").toBe(1);
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
     it("this session's IN-MEMORY cancelled does NOT mask another session's validated DONE (same id)", async () => {
       const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
       setProgressDir(dir);
@@ -1845,6 +2004,12 @@ describe("download job registry", () => {
     it("stops a completed job's heartbeat when persistence goes inactive (no forever-retrying interval)", async () => {
       const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
       setProgressDir(dir);
+      // A path whose parent is a FILE, used below to make the fallback store
+      // genuinely unavailable — which is what "persistence goes inactive" means
+      // now that a default records dir exists.
+      const blockedParent = pathJoin(dir, "i-am-a-file");
+      await writeFile(blockedParent, "not a directory");
+      const savedDataForHb = process.env.COMFYUI_MCP_DATA_DIR;
       vi.useFakeTimers();
       const clearSpy = vi.spyOn(globalThis, "clearInterval");
       try {
@@ -1854,7 +2019,12 @@ describe("download job registry", () => {
         // Persistence goes INACTIVE, then the download completes. The settled finally's
         // terminal persist no-ops (no dir → not durable), so it does NOT clear the
         // heartbeat there — the heartbeat itself must stop on its next tick.
+        // #1148 — clearing the progress dir alone no longer makes persistence
+        // inactive: it falls back to the stable records dir. Neutralise that too,
+        // so this still tests what it says it does.
         setProgressDir("");
+        process.env.COMFYUI_MCP_DATA_DIR = pathJoin(blockedParent, "nested");
+        __resetStableRecordsDir();
         hoisted.resolvers[0].resolve("/M/checkpoints/big.safetensors");
         await entry.settled;
         clearSpy.mockClear();
@@ -1865,15 +2035,25 @@ describe("download job registry", () => {
       } finally {
         vi.useRealTimers();
         setProgressDir("");
+        if (savedDataForHb === undefined) delete process.env.COMFYUI_MCP_DATA_DIR;
+        else process.env.COMFYUI_MCP_DATA_DIR = savedDataForHb;
+        __resetStableRecordsDir();
         await fsRm(dir, { recursive: true, force: true });
       }
     });
 
-    it("installs a heartbeat only when the persisted store is active (no leak on non-panel downloads)", async () => {
-      // No progress dir → persistence inactive → NO heartbeat interval (would otherwise
-      // leak, retrying a no-op forever since persist never reports durable).
+    it("installs a heartbeat whenever there is somewhere to persist — including without a panel", async () => {
+      // #1148 — THE PREMISE CHANGED, and the guarantee did not. This used to read
+      // "no progress dir -> no heartbeat", because a plain non-panel download had
+      // nowhere to persist and an interval there would retry a no-op forever.
+      // There is now a stable records dir by default, so a plain download DOES
+      // persist — which is the entire point: a record that was never written
+      // cannot survive a restart.
       const noPanel = await startDownloadJob(URL_A, "checkpoints");
-      expect((noPanel as { heartbeat?: unknown }).heartbeat).toBeUndefined();
+      expect(
+        (noPanel as { heartbeat?: unknown }).heartbeat,
+        "a plain download must persist, or nothing survives a restart",
+      ).toBeDefined();
 
       // With a progress dir → a heartbeat is installed (and cleared by resetDownloadJobs).
       const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
@@ -1884,6 +2064,29 @@ describe("download job registry", () => {
       } finally {
         setProgressDir("");
         await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("installs NO heartbeat when there is genuinely nowhere to persist", async () => {
+      // The guarantee the old test was really protecting: an interval with no
+      // store retries a no-op forever, because persist never reports durable.
+      // "Nowhere to persist" is now rare rather than the default — the records
+      // dir has to be unusable — so provoke it directly: a data dir whose PARENT
+      // is a file, so the mkdir fails with ENOTDIR.
+      const blockerDir = await mkdtemp(pathJoin(tmpdir(), "djobs-blocked-"));
+      const blocker = pathJoin(blockerDir, "i-am-a-file");
+      await writeFile(blocker, "not a directory");
+      const savedData = process.env.COMFYUI_MCP_DATA_DIR;
+      process.env.COMFYUI_MCP_DATA_DIR = pathJoin(blocker, "nested");
+      __resetStableRecordsDir();
+      try {
+        const nowhere = await startDownloadJob(URL_A, "checkpoints");
+        expect((nowhere as { heartbeat?: unknown }).heartbeat).toBeUndefined();
+      } finally {
+        if (savedData === undefined) delete process.env.COMFYUI_MCP_DATA_DIR;
+        else process.env.COMFYUI_MCP_DATA_DIR = savedData;
+        __resetStableRecordsDir();
+        await fsRm(blockerDir, { recursive: true, force: true });
       }
     });
 
@@ -2086,5 +2289,41 @@ describe("download job registry", () => {
       expect(r.confirmed).toBe(false);
       expect(r.warning).toMatch(/NOT verified as landed/);
     });
+  });
+});
+
+// #1208 (codex review) — the tiebreak must be DETERMINISTIC ACROSS MACHINES.
+//
+// The first version used `String(a.trayId).localeCompare(String(b.trayId))`.
+// localeCompare is locale-aware by definition and its collation depends on the
+// runtime's ICU build, so `tray-B` vs `tray-a` orders one way here and can order
+// the other way elsewhere:
+//
+//     "tray-B".localeCompare("tray-a")  →  1
+//     "tray-B" < "tray-a"               →  false  (raw: -1 the other direction)
+//
+// That would have traded a timing flake for a portability flake, in the one
+// function whose job is to be identical on every machine.
+describe("compareTrayIds (#1208)", () => {
+  it("orders by RAW string comparison, not locale collation", () => {
+    // The exact pair where the two disagree.
+    expect(compareTrayIds("tray-B", "tray-a")).toBeLessThan(0);
+    expect("tray-B".localeCompare("tray-a")).toBeGreaterThan(0);
+  });
+
+  it("is antisymmetric and reflexive — a sort comparator must be", () => {
+    expect(compareTrayIds("a", "b")).toBeLessThan(0);
+    expect(compareTrayIds("b", "a")).toBeGreaterThan(0);
+    expect(compareTrayIds("a", "a")).toBe(0);
+  });
+
+  it("sorts a MISSING trayId last without colliding on 'undefined'", () => {
+    // String(undefined) === "undefined" would have made every id-less job equal
+    // to every other AND sortable against real ids by that literal.
+    expect(compareTrayIds(undefined, "a")).toBeGreaterThan(0);
+    expect(compareTrayIds("a", undefined)).toBeLessThan(0);
+    expect(compareTrayIds(undefined, undefined)).toBe(0);
+    // …and it must not sort as the literal string.
+    expect(compareTrayIds(undefined, "zzzz")).toBeGreaterThan(0);
   });
 });

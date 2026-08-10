@@ -1931,6 +1931,18 @@ export async function panelStatus(
           : ` — no COMFYUI_PATH or saved workspace was needed (#769).`)
       );
     }
+    if (baseResolution.source === "live-observed-root") {
+      return (
+        ` Resolved from the RUNNING ComfyUI process itself (${baseResolution.base}): it ` +
+        `reported a relative main.py with no working directory (the Comfy Desktop / ` +
+        `Windows portable shape), so its install root was re-anchored on the ` +
+        `interpreter the OS reports for the process serving this port (#1133).` +
+        (baseResolution.overriddenConfiguredBase
+          ? ` This is NOT the configured workspace ` +
+            `(${baseResolution.overriddenConfiguredBase}).`
+          : ``)
+      );
+    }
     return "";
   })();
 
@@ -2005,7 +2017,20 @@ export async function panelStatus(
         `serves from, so "not installed" is UNCORROBORATED. On a split install ` +
         `(Comfy Desktop's --base-directory, #766) the panel lives elsewhere and ` +
         `installing here would land in a custom_nodes nothing loads. ` +
-        (baseResolution?.liveRootUnderivable
+        // #796 — THREE causes, three remedies. The unreadable case used to take
+        // one of the other two branches, and both give advice that cannot work:
+        // the argv was fine (so relaunching with an absolute main.py changes
+        // nothing) and ComfyUI is reachable (so "start/reach ComfyUI" is already
+        // true). Naming a remedy that cannot apply is worse than naming none.
+        (baseResolution?.liveRootUnreadable
+          ? `ComfyUI IS running and DID identify an install root — ` +
+            `${baseResolution.liveRootUnreadable} — but its custom_nodes could not be ` +
+            `READ from here (a permission error, an IO error, or a network path that ` +
+            `is not available to this process), so it could not be confirmed as the ` +
+            `serving tree. That is not evidence it lacks one. Make that directory ` +
+            `readable by whoever runs this MCP — or run install_comfyui ` +
+            `(action:"panel") from a process that can read it — before installing.`
+          : baseResolution?.liveRootUnderivable
           ? `ComfyUI IS running, but its reported launch arguments did not identify ` +
             `an install root holding custom_nodes (a relative main.py with no ` +
             `reported working directory), so reaching it again will not change this — ` +
@@ -2549,7 +2574,23 @@ function assertSwapTreeCorroborated(
   }
   throw new PanelInstallError(
     `Panel update did NOT apply (${managerReason}), and ${what} is REFUSED: the ` +
-      (resolution?.liveRootUnderivable
+      (resolution?.baseDirUnresolvable
+        ? // The server named a --base-directory we cannot resolve: it is
+          // RELATIVE and no working directory was reported. Every root we could
+          // otherwise derive (the install root, the observed process root) is a
+          // tree that flag has already overridden, so none of them may license a
+          // swap. Note the remedy is NOT the absolute-main.py one below — the
+          // script path is not what failed to resolve here.
+          `running ComfyUI answered with a --base-directory we cannot resolve (it is a ` +
+          `RELATIVE path and the server reported no working directory), and that flag — ` +
+          `not the main.py location — is where ComfyUI derives custom_nodes from. So ` +
+          `${comfyuiPath} cannot be confirmed as the tree it serves, and neither can any ` +
+          `root derived from its launch arguments: the flag overrides them. Updating here ` +
+          `could move a copy nobody serves while the browser keeps loading the real one — ` +
+          `reported as a verified success. Relaunch ComfyUI with an ABSOLUTE ` +
+          `--base-directory (or update the pack by hand under the directory that flag ` +
+          `resolves to), then retry. ${describePanelUpdateRecovery()}`
+        : resolution?.liveRootUnderivable
         ? // The server ANSWERED but its launch arguments yielded no install
           // root holding custom_nodes (#890/#916 — the common `python main.py`
           // / portable-launcher shape reports a relative argv and no cwd). The

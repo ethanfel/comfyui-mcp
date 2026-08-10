@@ -47,6 +47,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import { conversationOfScopeAddress, isScopeAddress, shortTabId } from "../services/session-scope.js";
+import type { ScopeRepinOutcome } from "./turn-origins.js";
 
 /** #884 — journal TICKETS (run completions #468, ask answers #486) must be
  *  keyed by the REAL tab a run/card was routed to: the panel reports back under
@@ -897,7 +898,10 @@ function isLoopbackHostName(host: string): boolean {
 
 /** The scheme://host:port origin of a URL (default ports made explicit), or null if
  *  unparseable. Loopback hosts canonicalize to their FAMILY loopback (v4 → 127.0.0.1,
- *  v6 → ::1) — so localhost/127.0.0.1/0.0.0.0 compare equal, and ::1/:: compare equal,
+ *  v6 → ::1) — so 127.0.0.1/0.0.0.0 compare equal, and ::1/:: compare equal. NOTE:
+ *  `localhost` is deliberately NOT folded (loopbackFamily returns null for it), so it
+ *  compares UNEQUAL to a concrete literal — callers that would harm a user by treating
+ *  that as proof of difference must degrade it to "unknown" themselves (#1233),
  *  but a v4 host and a v6 host DIFFER (they may be different instances). Ports differ. */
 function httpOriginOf(rawUrl: string): string | null {
   try {
@@ -1187,6 +1191,146 @@ async function probeDeclineRecovery(
  *     Origin carries NO path, a boot target mounted under a basePath fails path-aware
  *     identity and is (soundly) fail-closed to dispatched-unconfirmed.
  */
+/**
+ * #851 — what to tell the caller about `restart_comfyui` when the panel's confirmation
+ * card timed out.
+ *
+ * The old text recommended it unconditionally. It targets COMFYUI_URL, not the ComfyUI
+ * the panel runs inside, so a reporter who followed that advice aimed a restart at a
+ * different server than the one they had been working on — and got "No ComfyUI process
+ * found on port 8188" while the panel was working fine on the live canvas.
+ *
+ * `panelBase` comes from captureRebootHealthBase(), which is a PROOF rather than a
+ * comparison: null in remote/cloud mode, and whenever the tab's origin cannot be shown
+ * to front the local boot instance. "Unproven" is deliberately NOT folded into
+ * "different" — that would fire the warning on ordinary remote installs where the two
+ * ARE the same server, trading a wrong recommendation for a wrong alarm.
+ *
+ * Pure, so the three-way decision is testable without a live panel.
+ */
+/**
+ * panel#654 — did the browser tab come back after the restart, and DO WE KNOW?
+ *
+ * `panel_tab_reconnected` was a bare boolean, and `false` meant two unrelated
+ * things:
+ *
+ *   - the tab was watched for a newer hello and did not come back;
+ *   - **nothing was ever watched**, so there is no observation to report.
+ *
+ * The second is the common one and it is silent. `awaitPostRestartReachable`
+ * opens with `if (before == null) return false` — immediate, nothing awaited —
+ * and `before` is `bridge.tabConnectionIdentity(tabId)`, which is `undefined`
+ * whenever the socket is not OPEN **at capture time** (captured BEFORE the
+ * restart dispatch, so a socket still settling after a Manager install lands
+ * exactly there), or the tab session id is absent, or resolveTarget throws.
+ * The reporter's output — `server_ready:true` with `panel_tab_reconnected:false`
+ * — is reproducible with the panel never having failed at all, which is why
+ * every panel-side measurement in that thread showed healthy recovery: the
+ * panel was reconnecting fine and the orchestrator never looked.
+ *
+ * A reader who sees `false` concludes the panel is dead and hard-refreshes the
+ * browser. That is the manual step this issue is about, and on this path it may
+ * have been unnecessary every time.
+ *
+ * THE GATE IS NOT WEAKENED. `ready` and `graph_tools_ready` are still computed
+ * from the boolean, so an undetermined reconnect still withholds graph tools —
+ * failing closed on capability is right, and a weaker proof would be worse. What
+ * changes is that the REPLY stops asserting an observation that was never made.
+ * `"unknown"` follows the shape this file already uses for exactly this
+ * distinction (`stale: true | "unknown"`), rather than inventing a second field
+ * that a reader could miss while still acting on the misleading boolean.
+ *
+ * `serverReady:false` is undetermined too, and for the same reason: the tab is
+ * only watched once the server is back, so nothing was observed about it.
+ */
+export type TabReconnectReport = true | false | "unknown";
+
+export function classifyTabReconnect({
+  serverReady,
+  baselineCaptured,
+  tabBack,
+}: {
+  serverReady: boolean;
+  baselineCaptured: boolean;
+  tabBack: boolean;
+}): TabReconnectReport {
+  if (tabBack === true) return true; // a newer hello from the same tab was seen
+  if (!serverReady) return "unknown"; // never watched — the server never came back
+  return baselineCaptured ? false : "unknown";
+}
+
+export function restartTimeoutFallbackAdvice({
+  headlessBase,
+  panelBase,
+  observedOrigin = null,
+}: {
+  headlessBase: string;
+  panelBase: string | null;
+  /**
+   * #1233 — the tab's SERVER-OBSERVED handshake Origin, read directly rather than
+   * through captureRebootHealthBase's proof.
+   *
+   * That proof answers "is this provably the boot instance", so it collapses a
+   * CONFIRMED MISMATCH into the same `null` as an absent or unprovable origin — and the
+   * confirmed mismatch is exactly the case panel#851 was filed about (a tab fronting a
+   * second local ComfyUI on another port). The evidence was computed and then discarded.
+   * Passing it separately lets a confirmed mismatch reach the strong warning without
+   * loosening the proof, which is correctly strict for its own purpose.
+   */
+  observedOrigin?: string | null;
+}): string {
+  if (panelBase != null && sameHttpBase(headlessBase, panelBase)) {
+    return "or use restart_comfyui to restart the server directly without a panel card.";
+  }
+  // Proven different: either the proof resolved a base that differs, or the observed
+  // origin — which the browser sets and page JS cannot forge — differs outright.
+  // ORIGIN-only compare for the raw Origin, deliberately. `tabServerOrigin` is pathless
+  // (scheme+host+port — the browser sends no path on a WS upgrade), while `headlessBase`
+  // may carry a basePath mount such as :8188/comfy. A path-AWARE compare therefore reads
+  // a correctly-mounted install as a mismatch and fires the strong warning at a server
+  // that IS the right one — the cry-wolf failure this branch exists to avoid, which is
+  // how it was found. A pathless Origin can prove a different host:port; it cannot prove
+  // a different path, so it is only ever used for the claim it can actually support.
+  // (captureRebootHealthBase fails closed on the same ambiguity for the same reason.)
+  // #1233 (codex) — a DNS-ambiguous `localhost` on EITHER side is NOT proof of a
+  // different server. loopbackFamily() deliberately excludes it (a coordinator P0: it
+  // can resolve to either family, or to something else entirely), so `localhost:8188`
+  // vs `127.0.0.1:8188` canonicalizes unequal and would fire the strong warning at what
+  // is very likely the same instance. Absence of proof is not proof of difference, so
+  // an ambiguous host degrades to UNPROVEN — the same direction captureRebootHealthBase
+  // takes for the same input.
+  const dnsAmbiguous = (u: string | null) => {
+    if (!u) return false;
+    try {
+      return new URL(u).hostname.toLowerCase().replace(/^\[|\]$/g, "") === "localhost";
+    } catch {
+      return false;
+    }
+  };
+  const originMismatch =
+    observedOrigin != null &&
+    !dnsAmbiguous(observedOrigin) &&
+    !dnsAmbiguous(headlessBase) &&
+    !sameHttpOrigin(headlessBase, observedOrigin)
+      ? observedOrigin
+      : null;
+  const proven = panelBase ?? originMismatch;
+  if (proven != null) {
+    return (
+      `Do NOT reach for restart_comfyui here without checking: it targets ${headlessBase}, ` +
+      `while this panel is running inside ${proven}. Restarting the first would hit a ` +
+      "different server than the one you have been working on. That may find nothing there " +
+      "at all — or it may SUCCEED and take down a ComfyUI you did not mean to touch, which " +
+      "on a shared instance is the worse outcome."
+    );
+  }
+  return (
+    `or use restart_comfyui, which restarts ${headlessBase} directly without a panel ` +
+    "card — check that this is the same ComfyUI you have been working on, since I " +
+    "could not confirm which one this panel is running inside."
+  );
+}
+
 function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
   if (isCloudMode() || isRemoteMode()) return null;
   const bootBase = getBootLocalComfyUIBaseUrl(); // server-authorized, hello-immutable
@@ -1586,6 +1730,202 @@ function withTruncationHints(res: ToolResult, rules: TruncationRule[]): ToolResu
  * the bound this tool advertises did not apply. The flag is stripped again before the
  * result is returned — it exists only to drive the rider.
  */
+/**
+ * A 0-node outline is a CLAIM, and one made mid-restore is not established (#1184).
+ *
+ * Right after a ComfyUI restart and a tab switch, graph_outline returned
+ * `node_count: 0` for a tab holding a 7-node starter graph — the frontend was
+ * still restoring, and the canvas transiently had nothing on it. The agent
+ * trusted the empty read, reported the canvas empty, and BUILT A NEW 9-NODE
+ * PIPELINE alongside the invisible one. A later panel_query_graph showed 16
+ * nodes: ids 1–7 had been there the whole time, which the frontend knew, because
+ * the new adds started at id 8.
+ *
+ * That is the worst shape of this defect class, because the action taken on the
+ * false read DESTROYS WORK: a duplicate pipeline cannot be un-built, and the user
+ * is left with two overlapping graphs and no way to tell which nodes are theirs.
+ *
+ * It is also unusually cheap to get right. Unlike most "could not determine"
+ * cases, an empty outline is trivially RE-VERIFIABLE: read it again, and the
+ * restore has either finished or it has not.
+ *
+ * So an empty first read is re-read once after a short settle:
+ *   - second read non-empty  → the first was a race; report the real graph.
+ *   - second read still empty → "empty" is now OBSERVED TWICE, not assumed, and
+ *     is reported plainly with no hedge (a blank canvas is a normal state and
+ *     must not be narrated as suspicious).
+ *
+ * The whole cost lands on the genuinely-empty case — one extra cheap read — which
+ * is the right place for it: a blank canvas is common but harmless to re-check,
+ * while a false empty is rare and expensive.
+ *
+ * Never throws: a failed re-read leaves the original reply exactly as it was.
+ */
+async function confirmEmptyOutline(
+  ctx: PanelToolCtx,
+  res: ToolResult,
+  reread: () => Promise<ToolResult>,
+): Promise<ToolResult> {
+  try {
+    if (res.isError) return res;
+    const first = parseToolResultJson(res);
+    if (!first || first.node_count !== 0) return res;
+
+    // Which workflow this empty answer is ABOUT (codex review). The re-read is a
+    // second round trip, and the user can switch tabs during it — so a non-empty
+    // second outline might describe a DIFFERENT workflow entirely. Substituting
+    // it would report workflow B's graph as though it confirmed a read of A,
+    // which is a worse failure than the empty read this exists to fix.
+    const identityBefore = currentWorkflowFence(ctx);
+
+    // A BOUNDED POLL, not a single retry (codex review). A restore after a
+    // ComfyUI restart has no guaranteed duration, and one 400ms attempt is an
+    // arbitrary cliff: if the restore is still going at that instant, the fix
+    // silently fails to cover the very report it is for. Poll briefly instead,
+    // stopping the moment nodes appear.
+    for (const waitMs of EMPTY_OUTLINE_RECHECK_STEPS_MS) {
+      await sleep(waitMs);
+      const second = await reread();
+      // Redundant with the parsed-null guard below TODAY — an error result carries
+      // no parseable JSON — and kept anyway: it states the intent directly, and
+      // would still hold if an error result ever carried a structured body.
+      if (second.isError) continue;
+      const parsed = parseToolResultJson(second);
+      if (!parsed || parsed.node_count === 0) continue;
+
+      // Nodes appeared — but only adopt them if the canvas is still the SAME
+      // workflow. A changed identity means the second read answers a different
+      // question, so the original (honest, empty) answer stands.
+      const identityAfter = currentWorkflowFence(ctx);
+      if (
+        identityBefore.known &&
+        identityAfter.known &&
+        identityBefore.uuid !== identityAfter.uuid
+      ) {
+        return res;
+      }
+      return second;
+    }
+    return res;
+  } catch {
+    return res;
+  }
+}
+
+/**
+ * The back-off schedule for re-reading an empty outline (#1184).
+ *
+ * A bounded poll rather than one attempt: a restore after a ComfyUI restart has
+ * no guaranteed duration, so a single fixed wait is an arbitrary cliff that would
+ * silently miss a slower restore (codex review). Stops the moment nodes appear.
+ *
+ * Bounded deliberately at ~1.2s total. A genuinely blank canvas is a COMMON
+ * state and pays this whole cost, so it has to stay small enough not to be felt;
+ * a longer poll would buy rarer restores at the expense of every empty read.
+ */
+const EMPTY_OUTLINE_RECHECK_STEPS_MS = [250, 400, 550] as const;
+
+/**
+ * Enforce `max_chars` when the PANEL could not (#1203).
+ *
+ * A panel older than the budget protocol ignores `max_chars` and returns the
+ * whole outline. The orchestrator already noticed — that is what
+ * `markBudgetIgnored` is for — and then forwarded the unbounded reply anyway,
+ * with a note explaining that the bound the caller had explicitly set did not
+ * apply. A 137-node outline arrived that way, which is the exact context flood
+ * `max_chars` exists to prevent, and the disclosure came AFTER the cost was
+ * already paid. A warning is not a bound.
+ *
+ * WHY REFUSE RATHER THAN TRUNCATE. This tool's contract is that coverage is
+ * never traded away: over budget the outline sheds RESOLUTION — widget values,
+ * then titles, then a per-group summary — so whatever comes back still describes
+ * the whole graph, and if even the floor will not fit it returns NO outline
+ * rather than a partial one that reads as complete. Cutting the rendered text at
+ * a character count would break exactly that guarantee: the result would look
+ * like a finished outline that simply ends, and a caller acting on it would
+ * believe the graph stops where the string does — the #1184 failure again, with
+ * the truncation invisible instead of announced.
+ *
+ * Shedding resolution is the panel's job and needs the graph, not its rendering.
+ * The orchestrator has only the rendered text, so the honest move is the one the
+ * panel itself makes at its floor: return no outline, and say precisely what
+ * happened, how big the outline actually was, and which of the three levers
+ * (raise the bound, update the panel, scope the read) will work.
+ *
+ * The counts and `viewing` survive — they are the part of the reply that is
+ * small, true, and independent of the budget.
+ */
+function enforceOutlineBudget(res: ToolResult, requested: unknown): ToolResult {
+  if (typeof requested !== "number") return res;
+  const payload = parseToolResultJson(res);
+  if (!payload) return res;
+  // A panel that supports the budget echoes it back and has already applied its
+  // own ladder. Nothing to enforce, and second-guessing it would be wrong.
+  if (typeof payload.max_chars === "number") return res;
+  const outline = payload.outline;
+  if (typeof outline !== "string") return res;
+  // Within the bound already. The panel ignored the parameter, but the reply
+  // honours it, and refusing a reply that FITS would be a bound in name only.
+  if (outline.length <= requested) return res;
+
+  const idx = res.content.findIndex((c) => c.type === "text");
+  if (idx < 0) return res;
+
+  const nodes = typeof payload.node_count === "number" ? payload.node_count : null;
+  const groups = typeof payload.group_count === "number" ? payload.group_count : null;
+  const shape =
+    nodes != null
+      ? `The graph has ${nodes} node(s)${groups != null ? ` and ${groups} group(s)` : ""}.`
+      : "";
+  // The refusal goes IN the outline field, not an empty string (codex review).
+  // Two reasons. It is what the panel itself does at its own floor, so a caller
+  // that handles one refusal handles both. And an empty outline next to
+  // `node_count: 137` is exactly the contradiction #1184 was about — a consumer
+  // that reads `outline` and finds nothing has been told the canvas is empty by
+  // a reply whose own counts say otherwise. Bounded and fixed-length, so it
+  // cannot itself overrun a budget whose floor is OUTLINE_MAX_CHARS_FLOOR.
+  payload.outline =
+    `NO OUTLINE — this panel build ignores \`max_chars\`, and its full reply (${outline.length} chars) exceeds the bound of ${requested} you set. ` +
+    `It is withheld rather than cut, because a truncated outline would read as a complete one. ` +
+    `${shape} See \`max_chars_hint\` for what to do.`.trim();
+  payload.detail_level = "refused";
+  payload.degraded = true;
+  payload.budget_applied_by = "orchestrator";
+  payload.unbounded_chars = outline.length;
+  payload.degraded_reason =
+    `This panel build ignores \`max_chars\`, so it returned the FULL outline (${outline.length} chars) against a bound of ${requested}. ` +
+    `It is withheld rather than cut: a truncated outline would read as a complete one. ${shape}`.trim();
+
+  return {
+    ...res,
+    content: res.content.map((c, i) =>
+      i === idx && c.type === "text" ? { ...c, text: JSON.stringify(payload, null, 2) } : c,
+    ),
+  };
+}
+
+/** The three levers when the orchestrator had to withhold an outline (#1203),
+ *  in the order worth trying. Shared so the two riders cannot drift. */
+function outlineBudgetRemedies(unbounded: number | null): string {
+  // Every "raise it" must name the ceiling, or a caller already at the maximum
+  // is sent on a retry that cannot change anything (the repo-wide remedy check,
+  // which caught this text before it shipped).
+  // The ceiling has to sit next to the parameter name, not at the end of the
+  // sentence: the remedy check reads "raise `X` … up to N" as one phrase, and it
+  // is right to — a caller skimming for whether the retry is possible should not
+  // have to finish the clause.
+  const raise =
+    unbounded == null
+      ? `Raise \`max_chars\` up to ${OUTLINE_MAX_CHARS_CEILING}`
+      : unbounded <= OUTLINE_MAX_CHARS_CEILING
+        ? `Raise \`max_chars\` up to ${OUTLINE_MAX_CHARS_CEILING} — this outline needs at least ${unbounded} to be accepted whole`
+        : `Raising \`max_chars\` will NOT help — the full outline is past its ceiling of ${OUTLINE_MAX_CHARS_CEILING}`;
+  return (
+    `${raise}; update the ComfyUI Agent Panel, which can shed per-node detail and still cover every node inside a smaller bound; ` +
+    `or scope the read with panel_query_graph {ids:[…], fields:'detail'}.`
+  );
+}
+
 function markBudgetIgnored(res: ToolResult, requested: unknown): ToolResult {
   if (typeof requested !== "number") return res;
   const payload = parseToolResultJson(res);
@@ -2409,6 +2749,143 @@ function activeMatchesOpenRefreshTarget(active: unknown, path: string): boolean 
   return !!targetIdentity && canonicalSavedRecordIdentity(active) === targetIdentity;
 }
 
+/**
+ * #887 — THREE readings of the post-open active record, because
+ * `activeMatchesOpenRefreshTarget` returning false is not one answer.
+ *
+ * That predicate is a UUID-adoption gate, and for adoption both "a different
+ * workflow is active" and "I cannot tell what is active" correctly mean *do not
+ * adopt*. Reusing it to WARN would be a different claim on the same evidence:
+ * it returns false whenever `canonicalSavedRecordIdentity(active)` is null, which
+ * includes an ordinary UNSAVED tab (`tmp:` routing keys are deliberately rejected
+ * as saved identities). An open whose caller then has "Unsaved Workflow" active —
+ * the single most common state there is — would raise a wrong-canvas alarm on
+ * every call.
+ *
+ * So `different` is only returned when the panel POSITIVELY identified what is
+ * active and it is not the target. An active record we cannot read at all stays
+ * `indeterminate`, and the caller says nothing: unproven degrades to unknown,
+ * never to the negative. That rule is why the previous attempt at this issue was
+ * withdrawn, and it is the rule this module already states for every other
+ * proof-of-sameness oracle.
+ *
+ * An unsaved tab IS a positive identification: a `tmp:` routing key cannot be the
+ * saved workflow the caller named, so that case is genuinely `different` — but it
+ * reaches that verdict by being READ, not by failing to canonicalize.
+ */
+export type OpenActiveReading = "same" | "different" | "indeterminate";
+
+/** #887 — what the post-open corroborating read OBSERVED, when it contradicts the open. */
+export type OpenDriftNotice = { drifted: true; activeLabel: string };
+
+/**
+ * Would this active record plausibly BE the requested workflow? Used only to
+ * SUPPRESS a drift warning, never to prove sameness, so it is deliberately
+ * generous: every normalization that could make two spellings the same file is
+ * applied, and ties break toward silence. A miss here costs a warning we could
+ * have given; a false positive here FAILS a healthy open, which is far worse.
+ *
+ * `activeMatchesTarget` alone is not enough — it is raw string equality, so
+ * `./workflows/a.json`, `workflows\a.json` and `Workflows/A.json` all read as
+ * different files from `workflows/a.json`. This file already warns against
+ * exactly that conflation for the recovery path. Case folding is safe HERE
+ * (and only here) because the generous direction is the silent one.
+ */
+function plausiblySameSavedWorkflow(active: unknown, path: string): boolean {
+  if (activeMatchesTarget(active, path)) return true;
+  if (!active || typeof active !== "object") return false;
+  const want = canonicalSavedWorkflowPath(path);
+  if (!want) return false;
+  const fold = (s: string) => s.toLowerCase();
+  const wantFolded = fold(want);
+  const wantNoExt = stripJsonExt(wantFolded);
+  const a = active as { path?: unknown; filename?: unknown; key?: unknown };
+  for (const raw of [a.path, a.filename, a.key]) {
+    const got = canonicalSavedWorkflowPath(raw);
+    if (!got) continue;
+    const gotFolded = fold(got);
+    if (gotFolded === wantFolded) return true;
+    if (wantNoExt !== null && stripJsonExt(gotFolded) === wantNoExt) return true;
+  }
+  return false;
+}
+
+export function readOpenActiveAgainstTarget(
+  active: unknown,
+  path: string,
+  activeConfirmed?: unknown,
+): OpenActiveReading {
+  // #433/#3014 — `active_confirmed:false` is the panel telling us this value is
+  // untrustworthy. It is already refused as adoption evidence; it cannot be
+  // better evidence for failing an open than it is for stamping one.
+  if (activeConfirmed === false) return "indeterminate";
+  if (activeMatchesOpenRefreshTarget(active, path)) return "same";
+  if (!canonicalRequestedSavedIdentity(path)) return "indeterminate"; // our own side is unreadable
+  if (!active || typeof active !== "object") return "indeterminate";
+  // The STRICT gate above failing is not enough to warn. It requires a canonical
+  // saved identity on both sides, and it refuses a record whose routing_key is
+  // absent, replayed, or malformed (#716 P1) — even when that record's PATH is the
+  // very workflow we opened. Declining to adopt a uuid on that evidence is right;
+  // telling the caller a different canvas is mounted would be a false alarm on the
+  // same workflow.
+  if (plausiblySameSavedWorkflow(active, path)) return "indeterminate";
+  const a = active as { path?: unknown; filename?: unknown; key?: unknown };
+  const identified =
+    (typeof a.path === "string" && a.path !== "") ||
+    (typeof a.filename === "string" && a.filename !== "") ||
+    (typeof a.key === "string" && a.key !== "");
+  return identified ? "different" : "indeterminate";
+}
+
+/**
+ * #887 — observe what is active after an open, WITHOUT adopting anything.
+ *
+ * Split out of `refreshOpenWorkflowUuid` because the two questions have different
+ * preconditions. Adoption is gated on the open reply corroborating the requested
+ * identity — a reply that cannot prove which workflow it opened must never
+ * authorize a fence refresh. Pure observation needs none of that: "what does the
+ * panel say is active right now" is answerable regardless of what the open replied,
+ * and on the path that matters most the open reply is an ERROR carrying no JSON at
+ * all. Requiring corroboration there is what kept the reporter's own case
+ * unexamined.
+ */
+async function observeActiveAfterOpen(
+  ctx: PanelToolCtx,
+  requestedPath: string,
+): Promise<OpenDriftNotice | null> {
+  let list: Record<string, unknown> | null = null;
+  try {
+    const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+    if (!res?.isError) list = parseToolResultJson(res);
+  } catch {
+    return null; // could not ask — nothing was observed, so nothing is claimed
+  }
+  if (!list) return null;
+  if (readOpenActiveAgainstTarget(list.active, requestedPath, list.active_confirmed) !== "different") {
+    return null;
+  }
+  return { drifted: true, activeLabel: describeActiveRecord(list.active) };
+}
+
+/**
+ * Human-readable name for whatever the panel says is active, for the #887 warning.
+ *
+ * PATH FIRST, deliberately. The case this guard exists for is a same-basename
+ * workflow in another directory, and naming it by its bare `filename` produces a
+ * sentence that refutes itself — "workflows/a/foo.json was opened, but foo.json is
+ * active now" reads as the same file. The directory IS the distinguishing
+ * information. `title` precedes the bare filename for the unsaved case, where the
+ * panel puts the human label there and leaves path/filename null.
+ */
+export function describeActiveRecord(active: unknown): string {
+  if (!active || typeof active !== "object") return "another workflow";
+  const a = active as { path?: unknown; filename?: unknown; key?: unknown; title?: unknown };
+  for (const v of [a.path, a.title, a.filename, a.key]) {
+    if (typeof v === "string" && v !== "") return v;
+  }
+  return "another workflow";
+}
+
 /** Normalizes only syntax the panel's saved-path/routing identity normalizes. */
 function canonicalSavedWorkflowPath(value: unknown): string | null {
   if (typeof value !== "string" || !value) return null;
@@ -2615,6 +3092,13 @@ export type WorkflowFenceRebind =
       before: FenceRead;
       kind: "no_uuid" | "uncorroborated";
       why: string;
+      /** #1292 — how hard we already tried, so the remedy can stop telling a
+       *  caller to do the thing this function just did. Present only on the
+       *  `uncorroborated` path, which is the one that rechecks. `settles` is
+       *  whether waiting could EVER have helped: false means the reply's SHAPE
+       *  is wrong (an older build sends no open-workflow list), and telling that
+       *  caller to try again in a moment is advice that can never come true. */
+      rechecks?: { attempts: number; waitedMs: number; settles: boolean };
     }
   /** A live identity was read, but the bridge declined to adopt it (the tab stopped
    *  being reachable, or the uuid failed the orchestrator's shape/origin check).
@@ -2656,23 +3140,52 @@ export type WorkflowFenceRebind =
  */
 function corroborateActiveForFence(
   parsed: Record<string, unknown>,
-): { ok: true; active: Record<string, unknown> } | { ok: false; why: string } {
+):
+  | { ok: true; active: Record<string, unknown> }
+  /** `settles` — could a LATER read of the same panel answer differently? #1292
+   *  rechecks, and rechecking a fact that cannot change only makes the same
+   *  error slower. A SNAPSHOT fact (what is open, which entry is flagged, whether
+   *  the panel has finished confirming) settles; a SHAPE fact (this build does
+   *  not send a `workflows` array; these records share no comparable identity
+   *  field) does not, no matter how long anyone waits. */
+  | { ok: false; why: string; settles: boolean } {
   const active = parsed.active;
   if (!active || typeof active !== "object") {
-    return { ok: false, why: "the reply carried no active-workflow record" };
+    // SETTLES: mid-restore the frontend genuinely has no active workflow yet —
+    // that is #1184's finding in this reply's terms, and it is the window here.
+    return { ok: false, why: "the reply carried no active-workflow record", settles: true };
   }
   // #514: the panel says so itself when its active record is not confirmed. An
   // explicit `false` is the panel telling us the value is untrustworthy — never
   // adopt through that. (Absent = an older panel that cannot say; the list
   // corroboration below then has to carry the whole weight.)
   if (parsed.active_confirmed === false) {
-    return { ok: false, why: "the panel reported its active workflow as UNCONFIRMED" };
+    // SETTLES: this is the reported window itself — the panel says "not yet",
+    // and a moment later it says otherwise (#1292).
+    return {
+      ok: false,
+      why: "the panel reported its active workflow as UNCONFIRMED",
+      settles: true,
+    };
   }
   const list = parsed.workflows;
-  if (!Array.isArray(list) || list.length === 0) {
+  // TWO DIFFERENT FACTS, and #1292 made the difference cost real time. An ABSENT
+  // `workflows` field is a property of the installed build — it will not appear
+  // by waiting — while an EMPTY list is a snapshot of what is open right now,
+  // which a mid-restore panel reports before its tabs come back. Folding them
+  // would make every recovery on an older panel 2.9s slower for nothing.
+  if (!Array.isArray(list)) {
     return {
       ok: false,
       why: "the reply carried no open-workflow list to corroborate the active record against",
+      settles: false,
+    };
+  }
+  if (list.length === 0) {
+    return {
+      ok: false,
+      why: "the reply's open-workflow list was empty, so nothing corroborates the active record",
+      settles: true,
     };
   }
   // Only an AFFIRMATIVE per-record flag can nominate the corroborating entry;
@@ -2682,7 +3195,12 @@ function corroborateActiveForFence(
       !!w && typeof w === "object" && (w as { active?: unknown }).active === true,
   );
   if (flaggedActive.length === 0) {
-    return { ok: false, why: "no entry in the open-workflow list is marked active" };
+    // SETTLES: a snapshot taken before the panel re-flagged its active tab.
+    return {
+      ok: false,
+      why: "no entry in the open-workflow list is marked active",
+      settles: true,
+    };
   }
   if (flaggedActive.length > 1) {
     // A mixed/partial snapshot. Exactly the shape that would let another canvas's
@@ -2690,6 +3208,8 @@ function corroborateActiveForFence(
     return {
       ok: false,
       why: `${flaggedActive.length} entries in the open-workflow list are marked active (a mixed reply)`,
+      // SETTLES: "mixed" IS the half-reconciled state, by definition.
+      settles: true,
     };
   }
   // Same tri-state primitive the pin path uses. `false` = they name DIFFERENT
@@ -2700,12 +3220,17 @@ function corroborateActiveForFence(
     return {
       ok: false,
       why: "the active record and the entry marked active in the open-workflow list name DIFFERENT workflows (a stale or mixed reply)",
+      // SETTLES: a stale half of the snapshot catches up.
+      settles: true,
     };
   }
   if (verdict !== true) {
     return {
       ok: false,
       why: "the active record and the open-workflow list share no comparable identity field, so nothing corroborates it",
+      // DOES NOT SETTLE: a field the records do not carry will not appear by
+      // waiting — that is the reply's SHAPE, not its timing.
+      settles: false,
     };
   }
   return { ok: true, active: active as Record<string, unknown> };
@@ -2779,6 +3304,37 @@ WHY THIS READ WAS NEEDED AT ALL: this session's panel is ${v.version}, and a ` +
   }
 }
 
+/**
+ * #1292 — THE RECONCILIATION WINDOW IS OURS TO ABSORB, NOT THE CALLER'S TO WAIT OUT.
+ *
+ * Right after `panel_restart_comfyui` and the tab's reconnect, the panel is
+ * briefly mid-reconciliation: it answers `workflow_list`, but its active record
+ * is marked UNCONFIRMED (or the list is momentarily mixed). Corroboration
+ * correctly refuses — and the caller got a hard failure for a state that fixes
+ * itself, with the remedy "call this again in a moment". The reporter did, and
+ * the identical call returned `already_current`.
+ *
+ * A recovery operation that tells you to retry it is one that has not finished
+ * recovering. So this path rechecks with a FRESH read, three times over ~2.9s.
+ *
+ * WHY THESE AND NOT A LONGER BUDGET: this runs only when the rebind has already
+ * failed, so the cost is paid on a path that was going to fail anyway — but it is
+ * still latency added to a tool call, and the window this covers is a local
+ * process reconnecting. The reporter's five seconds is an upper bound with a
+ * human in it, not a measurement of the settle.
+ *
+ * WHY ONLY `uncorroborated`: the sibling failure `no_uuid` means the installed
+ * panel exposes no workflow identity at all. Rechecking a build that will never
+ * answer differently just makes the same error slower — the distinction the
+ * status already draws, now with teeth.
+ *
+ * The corroboration rule itself does NOT move. It still fails closed on every
+ * attempt; a recheck buys a fresh snapshot to judge, never a lower bar. What
+ * would be unsafe is arbitrating a mixed reply, and that is exactly what is not
+ * happening here.
+ */
+const FENCE_CORROBORATION_RECHECK_STEPS_MS = [400, 900, 1600] as const;
+
 async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebind> {
   const tabAtStart = ctx.tabId;
   let before = currentWorkflowFence(ctx);
@@ -2791,32 +3347,76 @@ async function rebindWorkflowFence(ctx: PanelToolCtx): Promise<WorkflowFenceRebi
   const syncFenceToCurrentTab = (): void => {
     if (ctx.tabId !== tabAtStart) before = currentWorkflowFence(ctx);
   };
-  let parsed: Record<string, unknown> | null = null;
-  try {
-    const res = await ctx.call({ cmd: "workflow_list" }, 6000);
-    syncFenceToCurrentTab();
-    if (res?.isError) {
-      return await unreadableOrHealed(ctx, before, toolResultText(res));
+  // One read + corroboration. Returns null when the READ failed in a way that is
+  // its own status (`unreadable`/`healed_by_panel`) — those are not the transient
+  // window this rechecks, and the settle inside unreadableOrHealed already covers
+  // the case where the refusal itself repaired the fence.
+  const readAndCorroborate = async (): Promise<
+    | { done: WorkflowFenceRebind }
+    | { corroborated: ReturnType<typeof corroborateActiveForFence> }
+  > => {
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      const res = await ctx.call({ cmd: "workflow_list" }, 6000);
+      syncFenceToCurrentTab();
+      if (res?.isError) {
+        return { done: await unreadableOrHealed(ctx, before, toolResultText(res)) };
+      }
+      parsed = parseToolResultJson(res);
+    } catch (err) {
+      syncFenceToCurrentTab();
+      return {
+        done: await unreadableOrHealed(
+          ctx,
+          before,
+          err instanceof Error ? err.message : String(err ?? "unknown error"),
+        ),
+      };
     }
-    parsed = parseToolResultJson(res);
-  } catch (err) {
-    syncFenceToCurrentTab();
-    return await unreadableOrHealed(
-      ctx,
-      before,
-      err instanceof Error ? err.message : String(err ?? "unknown error"),
-    );
+    if (!parsed) {
+      return {
+        done: await unreadableOrHealed(
+          ctx,
+          before,
+          "the panel's workflow_list reply was not readable as JSON",
+        ),
+      };
+    }
+    // CORROBORATE before adopting. The uuid must come from a record the panel's own
+    // open-workflow list agrees is the live canvas — otherwise a stale or mixed
+    // reply's uuid (valid in shape, belonging to ANOTHER canvas) would overwrite
+    // this tab's stamp and be reported as a successful rebind.
+    return { corroborated: corroborateActiveForFence(parsed) };
+  };
+
+  const first = await readAndCorroborate();
+  if ("done" in first) return first.done;
+  let corroborated = first.corroborated;
+  let attempts = 1;
+  let waitedMs = 0;
+  // #1292 — recheck the RECONCILIATION WINDOW with a fresh read, never a lower bar.
+  // Only a failure that CAN settle is worth re-reading (codex review, P2): a reply
+  // whose SHAPE is wrong — an older build that sends no `workflows` array, records
+  // sharing no comparable identity field — will say exactly the same thing 2.9s
+  // later, so retrying it just makes the identical error slower. That is the same
+  // reasoning that keeps `no_uuid` out of this loop, applied one level down.
+  for (const waitMs of FENCE_CORROBORATION_RECHECK_STEPS_MS) {
+    if (corroborated.ok || !corroborated.settles) break;
+    await sleep(waitMs);
+    waitedMs += waitMs;
+    attempts++;
+    const next = await readAndCorroborate();
+    if ("done" in next) return next.done;
+    corroborated = next.corroborated;
   }
-  if (!parsed) {
-    return await unreadableOrHealed(ctx, before, "the panel's workflow_list reply was not readable as JSON");
-  }
-  // CORROBORATE before adopting. The uuid must come from a record the panel's own
-  // open-workflow list agrees is the live canvas — otherwise a stale or mixed
-  // reply's uuid (valid in shape, belonging to ANOTHER canvas) would overwrite
-  // this tab's stamp and be reported as a successful rebind.
-  const corroborated = corroborateActiveForFence(parsed);
   if (!corroborated.ok) {
-    return { status: "no_identity", before, kind: "uncorroborated", why: corroborated.why };
+    return {
+      status: "no_identity",
+      before,
+      kind: "uncorroborated",
+      why: corroborated.why,
+      rechecks: { attempts, waitedMs, settles: corroborated.settles },
+    };
   }
   const active = corroborated.active;
   const uuid = responseWorkflowUuid(active);
@@ -3170,9 +3770,28 @@ function describeFenceRebind(
             `plain reload can serve the same cached bundle again; only a hard refresh replaces ` +
             `it. If a hard refresh does not help, the installed pack itself predates the ` +
             `per-workflow identity and must be UPDATED — no rebind can add it.`
-          : `\n\nWHAT TO DO: call this again in a moment. A stale or mixed workflow list is ` +
-            `usually transient — it settles once the panel finishes reconciling its tabs. If ` +
-            `it persists across a few attempts: ${RELOAD_TAB_REMEDY}`;
+          : // #1292 — DO NOT PRESCRIBE WHAT WE JUST DID. This path now rechecks
+            // with fresh reads before failing, so "call this again in a moment"
+            // would be advice the tool already took on the caller's behalf — and
+            // taking it a fourth time is the least likely thing left to work.
+            // When the rechecks ran, say so and move on to the remedy that has
+            // not been tried.
+            (r.rechecks && !r.rechecks.settles
+              ? // Waiting cannot fix a reply whose SHAPE is wrong, so do not
+                // prescribe waiting. This said "call this again in a moment" to
+                // a caller whose panel will answer identically forever.
+                `\n\nWHY RETRYING WILL NOT HELP: this is the shape of the panel's reply, not a ` +
+                `moment in its reconciliation — a later read answers the same way. ` +
+                `${RELOAD_TAB_REMEDY} If it survives a hard refresh, the installed pack is too ` +
+                `old to corroborate its own active workflow and must be UPDATED.`
+              : r.rechecks && r.rechecks.attempts > 1
+              ? `\n\nALREADY TRIED: the panel was re-read ${r.rechecks.attempts} times over ` +
+                `~${(r.rechecks.waitedMs / 1000).toFixed(1)}s and never corroborated. That window ` +
+                `covers the usual post-restart reconciliation, so this is probably NOT the ` +
+                `transient case.\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY}`
+              : `\n\nWHAT TO DO: call this again in a moment. A stale or mixed workflow list is ` +
+                `usually transient — it settles once the panel finishes reconciling its tabs. ` +
+                `If it persists across a few attempts: ${RELOAD_TAB_REMEDY}`);
       if (!r.before.known) {
         return {
           binding: "unverified",
@@ -3236,7 +3855,7 @@ async function refreshOpenWorkflowUuid(
   ctx: PanelToolCtx,
   requestedPath: string,
   openResult: ToolResult,
-): Promise<void> {
+): Promise<OpenDriftNotice | null> {
   const parsedOpen = parseToolResultJson(openResult);
   const opened = parsedOpen?.opened;
   const openedPath =
@@ -3268,7 +3887,7 @@ async function refreshOpenWorkflowUuid(
     if (requestedUnsaved && requestedUnsaved === parsedOpen?.routing_key) {
       refreshWorkflowUuid(ctx, parsedOpen);
     }
-    return;
+    return null;
   }
 
   // THREE outcomes for this corroborating read, not two — and conflating the last
@@ -3304,9 +3923,22 @@ async function refreshOpenWorkflowUuid(
     // value, which is fresher than the reply — or it names a DIFFERENT active
     // workflow, in which case another tab won the slot and adopting our target's
     // uuid would fence this session to a canvas that is not mounted. Adopt nothing.
-    if (!activeMatchesOpenRefreshTarget(list!.active, requestedPath)) return;
+    //
+    // #887 — declining to adopt was right and was never enough. This is the ONLY
+    // genuinely later observation in the whole open path: it sits behind a real
+    // `await ctx.call(...)` round trip to the panel, so unlike anything inside the
+    // panel's own synchronous post-load window it can actually see the active
+    // pointer having settled somewhere else. It saw the contradiction, kept the
+    // session safe, and told the CALLER nothing — the tool result still reported a
+    // plain success naming the path the agent asked for. The agent then had every
+    // reason to Save-As onto what it believed was that canvas.
+    const reading = readOpenActiveAgainstTarget(list!.active, requestedPath, list!.active_confirmed);
+    if (reading === "different") {
+      return { drifted: true, activeLabel: describeActiveRecord(list!.active) };
+    }
+    if (reading === "indeterminate") return null;
     refreshWorkflowUuid(ctx, list!.active) || refreshWorkflowUuid(ctx, parsedOpen);
-    return;
+    return null;
   }
 
   // COULD NOT ASK — the wedged case. Fall back to the reply's proven uuid rather
@@ -3316,7 +3948,12 @@ async function refreshOpenWorkflowUuid(
   // actually mounted, whereas doing nothing here guarantees every subsequent
   // command is refused. A reply that carries no uuid (the panel could not prove
   // it) still refreshes nothing, so fail-closed is preserved.
+  //
+  // #887 — and NO drift notice from here, deliberately. This branch is reached
+  // precisely because the corroborating read could not be made, so nothing was
+  // observed about what is active. Warning here would be inventing the finding.
   refreshWorkflowUuid(ctx, parsedOpen);
+  return null;
 }
 
 /** Exact resolved-path check for an open receipt. A filename/basename is not a
@@ -3456,7 +4093,61 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
     // #716 — re-read the active record after this exact successful open before
     // refreshing the next command's stamp. This prevents a late reply from an
     // earlier open from overwriting the fence after another tab became active.
-    if (!res.isError) await refreshOpenWorkflowUuid(ctx, path, res);
+    if (res.isError) {
+      // #887 — THE REPORTER'S OWN PATH. The panel throws for every open verdict
+      // short of PROVEN, so the case in the ticket ("Tool errors saying the
+      // requested workflow is active") arrives here, not below. Gating the
+      // corroborating read on success left exactly the reported scenario
+      // unexamined: the panel's message asserts the target IS active, and nothing
+      // in this process ever checked whether it still was.
+      //
+      // OBSERVE ONLY — never adopt. The open did not prove itself, and the panel
+      // deliberately withholds `workflow_uuid` in that case to keep the fence
+      // fail-closed. Reading what is active cannot change that; it only adds a
+      // fact to a message that is already an error.
+      //
+      // AND ONLY FOR THE CLASS WHERE THE LOAD ACTUALLY RAN. A genuine acked
+      // failure — a missing file, a real executor error — means nothing was
+      // opened, so another workflow being active is the expected state, not
+      // drift; warning there would be noise, and this repo already pins that a
+      // genuine error must not trigger a workflow_list round trip at all. Every
+      // rebind-unproven message the panel emits opens with `workflow_open RAN`
+      // (its own contract wording for "the load executed, the proof did not"),
+      // which is exactly the class that can assert a false active workflow.
+      if (!/workflow_open RAN/i.test(toolResultText(res))) return res;
+      const drift = await observeActiveAfterOpen(ctx, path);
+      if (!drift) return res;
+      return fail(
+        `${toolResultText(res)}\n\nAND — checked after that failure — ${drift.activeLabel} is the ` +
+          `ACTIVE workflow now, not ${path}. Whatever that message says about ${path} being active, ` +
+          `it is not: the canvas you would read or write is ${drift.activeLabel}. Do NOT save, ` +
+          `save-as, or edit expecting ${path}. Call panel_list_workflows to see the current state.`,
+      );
+    }
+    {
+      const drift = await refreshOpenWorkflowUuid(ctx, path, res);
+      // #887 — the read above is the ONLY observation in this whole path taken
+      // after a real round trip, so it is the only thing that can catch the active
+      // pointer having settled elsewhere. It already declined to adopt the uuid;
+      // reporting a plain success alongside that silence is what let an agent
+      // Save-As onto the wrong canvas.
+      //
+      // This FAILS the open rather than annotating it. The caller asked for a
+      // workflow to be made active and it is not active — a success naming the
+      // requested path is false on the one point the caller acts on, and the next
+      // act is typically a write. The session's fence is untouched (nothing was
+      // adopted), so the tab that IS active keeps its own protection.
+      if (drift) {
+        return fail(
+          `workflow_open: ${path} was opened, but ${drift.activeLabel} is the ACTIVE workflow now — ` +
+            `the panel confirmed this on a re-read after the open completed. This session's ` +
+            `workflow identity was NOT re-pointed at ${path}, so the canvas you would read or ` +
+            `write is ${drift.activeLabel}, not ${path}. Do NOT save, save-as, or edit expecting ` +
+            `${path}. Call panel_list_workflows to see the current state, then re-open ${path} ` +
+            `if you still need it — another tab became active during or after the open.`,
+        );
+      }
+    }
     return res;
   }
 
@@ -4658,7 +5349,7 @@ export interface PanelToolCtx {
      *  panel_reload's unconditional call was silently repinning healthy turns
      *  onto whichever tab was last active). Real-tab ctxs ignore this flag. */
     scopeRecoveryConsent?: boolean;
-  }) => { previous: string; current: string; rebound: boolean };
+  }) => { previous: string; current: string; rebound: boolean; repinRefusal?: string };
   /**
    * Best-effort in-place self-heal for the handful of tools that call the bridge
    * DIRECTLY (not via `ctx.call`) — e.g. panel_request_adult_consent's ask_user
@@ -5148,7 +5839,7 @@ export function makePanelToolCtx(
   // active tab can't be picked.
   const rebindToActiveTab = (opts?: {
     scopeRecoveryConsent?: boolean;
-  }): { previous: string; current: string; rebound: boolean } => {
+  }): { previous: string; current: string; rebound: boolean; repinRefusal?: string } => {
     const previous = ctx.tabId;
     // #884 P0 — a SCOPE-bound ctx must never be REPLACED by a real tab id (that
     // would permanently narrow the shared conversation's routing to one tab).
@@ -5175,8 +5866,22 @@ export function makePanelToolCtx(
       if (!opts?.scopeRecoveryConsent || !pinProvenDead) {
         return { previous, current: previous, rebound: false };
       }
-      const repinned = bridge.repinScopeToActive?.(previous);
-      return { previous, current: previous, rebound: Boolean(repinned) };
+      // #1077 Finding 2 — carry the REASON out when nothing was repinned. This
+      // collapsed to `Boolean(repinned)`, so four different refusals arrived at
+      // the caller as one bare `false` and the user was told only that the
+      // adoption was refused. One of those refusals repeats forever (an active
+      // tab on another backend's conversation while this one has several), and
+      // nothing in the reply hinted that naming a workflow is the way out.
+      const outcome = bridge.repinScopeToActive?.(previous);
+      const repinned = typeof outcome === "string" ? outcome : undefined;
+      const repinRefusal =
+        outcome && typeof outcome === "object" ? outcome.reason : undefined;
+      return {
+        previous,
+        current: previous,
+        rebound: Boolean(repinned),
+        ...(repinRefusal ? { repinRefusal } : {}),
+      };
     }
     // A healthy binding is left untouched (never disturb a live session). Recovery only
     // fires for an orphaned/stale tab id.
@@ -5848,16 +6553,30 @@ function recoveredAskResult(entry: AskEntry): ToolResult {
  * the question at hand, which is the misattribution this whole path exists to
  * prevent. Reporting them beats swallowing them — the user did answer something.
  */
-function askTimeoutResult(
+export function askTimeoutResult(
   tabId: string,
   fingerprint: string,
   recovery: AskRecovery,
+  /**
+   * #1243 — did a reachability check actually run before the wait? When it did, the
+   * "maybe nothing rendered the card" alternative has ALREADY been ruled out, and
+   * offering it anyway sends the agent to re-invoke from "an interactive tab" it was
+   * demonstrably already on. `ctx.ensureReachable` is optional-chained at the call
+   * site, so this is threaded rather than assumed — an absent check means the
+   * alternative is still live and is still named.
+   */
+  surfaceConfirmed: boolean,
 ): ToolResult {
-  let text =
-    "The question card was not answered in time (or no interactive panel surface " +
-    "rendered it — e.g. an exec/headless run), so nothing was selected. If you " +
-    "still need the decision, ask the user directly in plain chat text, or " +
-    "re-invoke panel_ask from an interactive ComfyUI tab.";
+  const waited = `${Math.round(ASK_TOTAL_BUDGET_CAP_MS / 1000)}s`;
+  let text = surfaceConfirmed
+    ? `The question card was delivered to the panel and went unanswered for ${waited}, ` +
+      "so nothing was selected — this is a timeout, not a delivery failure. The user " +
+      "may simply not have been at the screen. If you still need the decision, ask them " +
+      "directly in plain chat text, or re-invoke panel_ask when they are present."
+    : `The question card was not answered within ${waited} — either it went unanswered, ` +
+      "or no interactive panel surface rendered it (e.g. an exec/headless run), and this " +
+      "call could not establish which. If you still need the decision, ask the user " +
+      "directly in plain chat text, or re-invoke panel_ask from an interactive ComfyUI tab.";
   // What is surfaced, and why each:
   //  • an answer that reached NO tool call — nobody has it, so it must be told;
   //  • an answer to THIS EXACT question that DID reach a tool call but could not
@@ -6032,7 +6751,13 @@ async function askUserWithGrace(
       // a conversation replaced mid-ask would let the live turn's ack settle a
       // warning that conversation never saw — the debt path reaching a live turn
       // through a helper, which is how it slipped the gate before.
-      const body = askTimeoutResult(tabId, fingerprint, outcome.recovery);
+      // #1243 — derive this rather than hardcoding `true`. The reachability call above
+      // is optional-chained (`ctx.ensureReachable?.()`), so on a ctx that does not
+      // provide it NO check ran and the no-surface alternative is still live. Passing a
+      // literal would have made the false branch unreachable in production — dead code
+      // justified by a hypothetical, and a test exercising a path nothing takes.
+      const surfaceConfirmed = typeof ctx.ensureReachable === "function";
+      const body = askTimeoutResult(tabId, fingerprint, outcome.recovery, surfaceConfirmed);
       return AskAnswers.askBelongsToLiveConversation(askId)
         ? withDroppedAnswerWarning(tabId, body)
         : body;
@@ -6349,10 +7074,24 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
   return {
     ...d,
     schema: { ...d.schema, ...RETRY_OF_ARG },
-    handler: (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
+    handler: async (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
       const retryOf =
         typeof args.retry_of === "string" && args.retry_of !== "" ? args.retry_of : undefined;
       if (!retryOf) return d.handler(args, ctx);
+      // #694 — the retried attempt may have ALREADY LANDED. The bridge keeps a
+      // late completion when a mutation replies after its reply timeout, and
+      // this is the one moment we know the caller cares about that exact rid:
+      // they just named it. Drained here (once) and reported alongside the
+      // retry's own outcome.
+      //
+      // Deliberately NOT a short-circuit. Skipping the dispatch would be wrong
+      // whenever the token is stale or pasted onto different args -- the bridge
+      // stores the rid, not a fingerprint of what it carried, so "the write for
+      // this rid landed" does not prove "the write you are asking for now is
+      // that same write". Suppressing a real mutation on that inference is the
+      // #683 mistake with the arrow reversed, and #687 reverted it for cause.
+      // Double-apply is already the #521 panel ledger's job; this only makes the
+      // outcome VISIBLE, which is the half of #694 nothing else does.
       const wrapped = Object.create(ctx) as PanelToolCtx;
       wrapped.call = (
         cmd: Record<string, unknown>,
@@ -6379,7 +7118,47 @@ function withRetryToken(d: PanelToolDef): PanelToolDef {
           timeoutMs,
           onDispatchedRid,
         );
-      return d.handler(args, wrapped);
+      const out = await d.handler(args, wrapped);
+      // Drained AFTER the handler, deliberately, for two measured reasons.
+      //
+      // (1) The drain is destructive. Draining first meant a handler that threw
+      //     consumed the notice permanently: the retry failed, no new token was
+      //     minted, and a later successful retry reported nothing.
+      // (2) It widens the window. A late reply that lands WHILE the retry is in
+      //     flight is now caught; draining first stranded it in the map until
+      //     TTL, which is the common case when an agent retries promptly.
+      //
+      // Matched on COMMAND, not rid alone. A token names an attempt, and the
+      // sentence below claims "the attempt you are retrying" completed -- which
+      // is only true if the retained completion is for the command this tool
+      // actually dispatches. Without the check, pasting a stale token onto a
+      // different tool prints a confident notice about an unrelated write.
+      // …and not at all if the retry FAILED. `ctx.call` converts almost every
+      // dispatch failure into an isError result rather than throwing, so gating
+      // on a thrown exception alone still drained on a failed retry -- the same
+      // permanent loss, one layer over. The caller gets no new token from a
+      // failed retry, so a consumed notice here is unrecoverable.
+      if (out.isError) return out;
+      const expectedCmd = RETRY_TOKEN_CMD_BY_TOOL[d.name];
+      const landed = ctx.bridge?.takeLateMutation?.(retryOf);
+      if (!landed || (expectedCmd !== undefined && landed.cmd !== expectedCmd)) return out;
+      const secs = (landed.lateByMs / 1000).toFixed(1);
+      return {
+        ...out,
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `NOTE — the attempt you are retrying DID complete. "${landed.cmd}" on tab ` +
+              `${landed.tabId} was acknowledged by the panel ${secs}s after its reply ` +
+              `timeout, so the earlier outcome-unknown warning has been resolved: it ` +
+              `applied. Read the retry's own result below to see the final state (a ` +
+              `panel that recognised the retry token will have answered it with the ` +
+              `original outcome rather than applying anything a second time).`,
+          },
+          ...out.content,
+        ],
+      };
     },
   };
 }
@@ -6493,7 +7272,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // The synthetic `__budget_ignored` flag below is derived from the reply, not
           // sent by the panel: a build that supports the budget echoes `max_chars` back.
           markBudgetIgnored(
-            await ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+            // #1203 — and ENFORCE it here when the panel could not, before the
+            // unbounded outline reaches the caller who asked for a bound.
+            enforceOutlineBudget(
+              // #1184 — an empty outline is re-verified before it is believed.
+              await confirmEmptyOutline(
+                ctx,
+                await ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+                () => ctx.call({ cmd: "graph_outline", max_chars: args.max_chars }),
+              ),
+              args.max_chars,
+            ),
             args.max_chars,
           ),
           [
@@ -6505,9 +7294,30 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               // unbounded reply as "this fitted".
               flag: "__budget_ignored",
               key: "max_chars_hint",
-              text: (p) =>
-                `This panel build does not support \`max_chars\` on the outline, so the budget you set (${typeof args.max_chars === "number" ? args.max_chars : OUTLINE_MAX_CHARS_DEFAULT}) was NOT applied and the outline below is the full, unbounded one (${typeof p.node_count === "number" ? p.node_count : "all"} node(s)). ` +
-                `Update the ComfyUI Agent Panel to bound it, or scope the read with panel_query_graph in the meantime.`,
+              text: (p) => {
+                const asked =
+                  typeof args.max_chars === "number" ? args.max_chars : OUTLINE_MAX_CHARS_DEFAULT;
+                const nodes = typeof p.node_count === "number" ? p.node_count : "all";
+                // #1203 — three different situations used to share one sentence
+                // that described only the worst of them. Saying "the outline
+                // below is the full, unbounded one" when it was withheld, or
+                // when it fitted anyway, is its own false report.
+                if (p.budget_applied_by === "orchestrator") {
+                  const unbounded =
+                    typeof p.unbounded_chars === "number" ? p.unbounded_chars : null;
+                  return (
+                    `This panel build does not support \`max_chars\`, so it returned the FULL outline for all ${nodes} node(s)` +
+                    `${unbounded != null ? ` (${unbounded} chars)` : ""} against your bound of ${asked}. ` +
+                    `NO outline is included: it is withheld rather than cut, because a truncated outline would read as a complete one. ` +
+                    outlineBudgetRemedies(unbounded)
+                  );
+                }
+                return (
+                  `This panel build does not support \`max_chars\`, so the budget you set (${asked}) was not applied by the panel — ` +
+                  `the outline below is its full, unbounded reply for all ${nodes} node(s), which happens to fit within your bound. ` +
+                  `Update the ComfyUI Agent Panel to have the budget applied properly; on a larger graph an unbounded reply will not fit.`
+                );
+              },
             },
             {
               // On an older panel this is never set either, so the rider is inert there.
@@ -6528,6 +7338,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 // it "still covers ALL nodes" would describe content the reader cannot
                 // see, which is the same lie as a silent cut.
                 if (p.detail_level === "refused") {
+                  // #1203 — an ORCHESTRATOR refusal is a different situation and
+                  // needs different advice. The panel refuses because even its
+                  // smallest whole-graph form did not fit, so the question is
+                  // whether raising the bound can ever help. Here the panel never
+                  // applied the bound at all: the full outline's size is known
+                  // exactly, updating the panel unlocks the shed ladder, and the
+                  // generic text's "this build does not report how large the
+                  // smallest form would be" would send the reader chasing a
+                  // capability the reply is already explaining is absent.
+                  if (p.budget_applied_by === "orchestrator") {
+                    const unbounded =
+                      typeof p.unbounded_chars === "number" ? p.unbounded_chars : null;
+                    return (
+                      `NO outline was returned: this panel build ignores \`max_chars\`, so its reply${unbounded != null ? ` (${unbounded} chars)` : ""} exceeded \`max_chars\`=${inForce} and a PARTIAL outline is deliberately withheld because it would read as complete. ` +
+                      `The graph has ${nodes} node(s) and ${groups} group(s). ` +
+                      outlineBudgetRemedies(unbounded)
+                    );
+                  }
                   // And if the floor exceeds the CEILING, raising is a guaranteed second
                   // refusal — a dead retry inside the message explaining the first.
                   //
@@ -8384,7 +9212,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_ask",
-      "Ask the user to choose between options — renders an interactive question card in the panel chat and BLOCKS until they pick, returning their choice as text. Use this (NOT the AskUserQuestion tool, which never renders here) whenever you need the user to decide between options. Each option may carry a short description. The card always includes an 'Other…' free-text field, so the returned string may be a listed label or whatever the user typed (comma-joined for multi_select). Ask only when the answer genuinely changes what you do.",
+      "Ask the user to choose between options — renders an interactive question card in the panel chat and BLOCKS until they pick, returning their choice as text. It does NOT block forever: if nobody answers within ~285s the call returns an error saying so, and you must then ask in plain chat text or re-invoke when the user is present. Budget for that — a question asked while the user is away costs the better part of five minutes before you learn anything. Use this (NOT the AskUserQuestion tool, which never renders here) whenever you need the user to decide between options. Each option may carry a short description. The card always includes an 'Other…' free-text field, so the returned string may be a listed label or whatever the user typed (comma-joined for multi_select). Ask only when the answer genuinely changes what you do.",
       {
         question: z.string().describe("The question to ask, e.g. 'Which sampler should I use?'"),
         options: z
@@ -8535,7 +9363,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // THE explicit scope-recovery consent (#884 gate 3) — the only
             // caller that may escape a DEAD scope pin (a healthy pin still
             // stays put; see rebindToActiveTab's double gate).
-            ctx.rebindToActiveTab({ scopeRecoveryConsent: true });
+            const rebind = ctx.rebindToActiveTab({ scopeRecoveryConsent: true });
+            // #1077 Finding 2 — a scope repin that declined now says WHY, and
+            // this is where the user reads it. The refusal used to be a bare
+            // boolean, so a session stuck in the one state that repeats forever
+            // (the active tab belongs to another backend's conversation while
+            // this one has several eligible tabs) saw no difference from a
+            // healthy pin being correctly left alone.
+            if (rebind?.repinRefusal) {
+              rebindNote += ` The session pin was NOT moved: ${rebind.repinRefusal}.`;
+            }
           } catch (err) {
             // #474: with 2+ live tabs the rebind is AMBIGUOUS — fail so the user picks.
             // But with ZERO tabs connected (the "Connected: none" window right after a
@@ -8609,6 +9446,43 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // indeterminate values leave the old command stamp intact (fail closed).
         if (mode === "pinned" && pinnedWorkflowUuid) {
           refreshWorkflowUuid(ctx, { workflow_uuid: pinnedWorkflowUuid });
+        }
+        // #888 — make the SCOPE PIN follow the named workflow.
+        //
+        // Pinning wrote the workflow-target store above and, until now, nothing
+        // else. But after a mixed-origin turn the thing refusing every subsequent
+        // scope-addressed command is a DIFFERENT piece of state — the turn-origin
+        // pin, left ambiguous (`null`) by the #884 fence. So this tool reported
+        // success truthfully while the actual blocker went untouched, and the next
+        // `panel_graph_outline` returned the identical ambiguity error.
+        //
+        // The advice to do this is already in the code: the repin handler's own
+        // refusal says "Name the workflow instead — panel_set_workflow_target with
+        // a path, or panel_open_workflow — and the pin follows it." It did not
+        // follow, because only `mode:"current"` ever reached that handler.
+        //
+        // Routed through the SAME handler, so the P0 safety gate is shared rather
+        // than re-implemented: a pin that still reaches a live tab of this
+        // conversation is never displaced, however explicit the request. This can
+        // only ever recover a pin that is dead or ambiguous.
+        //
+        // Best-effort by construction: the pin store write above has already
+        // succeeded and is what the caller asked for. A repin that cannot happen
+        // must not retract it, so the outcome is reported, never thrown.
+        let scopeRepin: ScopeRepinOutcome | undefined;
+        if (mode === "pinned" && pinPath && isScopeAddress(ctx.tabId)) {
+          // The PATH, never a tab id derived from it. `wf:<path>` is the saved
+          // workflow HANDLE; a real tab id is a bridge ROUTE, `wf:<route>:<path>`
+          // (panel #640). The first cut of this fix compared the handle against
+          // routes, so it never matched and refused every time — inert, while a
+          // source-text "wiring" assertion passed, because grepping for a call
+          // cannot tell reachable code from dead code. The handler now does the
+          // matching against the routes the bridge actually holds.
+          try {
+            scopeRepin = ctx.bridge.repinScopeToWorkflow?.(ctx.tabId, pinPath);
+          } catch {
+            scopeRepin = undefined; // never worse than the pre-#888 silence
+          }
         }
         ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
         // #770/#803/#716 — ROUTING is only half of "follow the tab that's live now".
@@ -8745,12 +9619,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               `mode:"current"${rebindNote ? `.${rebindNote}` : "."}\n\nNOT APPLIED:${fence.note}`,
           );
         }
+        // #888 — SAY what the scope repin did. A silent success is as unhelpful
+        // here as the silent refusal #1077 fixed: the whole complaint is that
+        // pinning reported success while routing stayed ambiguous, so "the routing
+        // ambiguity is cleared" is the one fact that makes this reply actionable.
+        // A refusal carries its own reason out for the same reason.
+        const scopeRepinNote =
+          typeof scopeRepin === "string"
+            ? ` This session's turn routing was AMBIGUOUS (a reconnect delivered messages from several workflows at once) and is now pinned to this workflow, so graph tools will resolve deterministically.`
+            : scopeRepin && typeof scopeRepin === "object" && scopeRepin.reason
+              ? ` NOTE — the workflow target was set, but this session's turn routing was NOT re-pinned: ${scopeRepin.reason}.`
+              : "";
         return ok({
           ...target,
           ...(deferredBind ? { deferred: true } : {}),
           ...(fence ? { graph_binding: fence.binding } : {}),
           ...(fenceRebind ? { graph_binding_status: fenceRebind.status } : {}),
-          note: hint + rebindNote + (fence?.note ?? ""),
+          ...(typeof scopeRepin === "string" ? { turn_routing: "repinned" } : {}),
+          note: hint + rebindNote + (fence?.note ?? "") + scopeRepinNote,
         });
       },
     ),
@@ -9274,12 +10160,30 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           confirmBudget,
         );
         if (decision === "timeout") {
+          // #851 — the fallback used to be recommended unconditionally, and
+          // `restart_comfyui` targets COMFYUI_URL, NOT the ComfyUI the panel is
+          // running inside. A reporter followed this advice against a panel driving a
+          // different server and got `No ComfyUI process found on port 8188` while the
+          // panel was working fine on the live canvas — a restart aimed at the wrong
+          // machine, recommended by a call that never checked which machine that was.
+          //
+          // The information was already here and simply not consulted on this branch:
+          // captureRebootHealthBase() is the origin the PANEL answers on, and the
+          // adjacent decline branch already reads it. Only recommend the headless tool
+          // when it provably points at the same server; otherwise name both and say
+          // plainly that this call did not verify the other one.
+          const fallback = restartTimeoutFallbackAdvice({
+            headlessBase: getComfyUIBaseUrl(),
+            panelBase: captureRebootHealthBase(ctx),
+            // #1233 — the raw observed origin, so a CONFIRMED mismatch is not lost inside
+            // the proof's null. Server-observed on the WS upgrade; page JS cannot forge it.
+            observedOrigin: ctx.bridge?.tabServerOrigin?.(ctx.tabId) ?? null,
+          });
           return ok(
             `No confirmation received within ${Math.round(confirmBudget / 1000)}s, so I did NOT ` +
               "restart ComfyUI. The panel tab may be backgrounded or still reconnecting after a " +
               "previous restart, so the confirmation card wasn't answered. Tell me to restart it " +
-              "and I'll re-ask, or use restart_comfyui to restart the server directly without a " +
-              "panel card.",
+              `and I'll re-ask. ${fallback}`,
           );
         }
         if (decision !== "yes") {
@@ -9939,12 +10843,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   : true
               : false;
             const graphToolsReady = tabBack && (ctx.tabCanMutateGraph ? ctx.tabCanMutateGraph() : true);
+            // #654 — `ready`/`graph_tools_ready` still come from the BOOLEAN, so an
+            // undetermined reconnect withholds graph tools exactly as before. Only
+            // the reported observation changes.
+            const tabReconnect = classifyTabReconnect({
+              serverReady: recovery.ready,
+              baselineCaptured: preRestartPanelIdentity != null,
+              tabBack,
+            });
             return ok({
               rebooting: true,
               ready: graphToolsReady,
               graph_tools_ready: graphToolsReady,
               server_ready: recovery.ready,
-              panel_tab_reconnected: tabBack,
+              panel_tab_reconnected: tabReconnect,
               confirmed_cycle: observed, // true = we directly observed the down→up cycle
               recovered_ms: recovery.waited_ms,
               probes: recovery.attempts,
@@ -9955,8 +10867,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   ? "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; the headless managed restart " +
                     `came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s, but ` +
                     (!tabBack
-                      ? "the panel tab has NOT reconnected yet (ready:false). Wait a moment then retry, or " +
-                        'rebind with panel_set_workflow_target({mode:"current"}) before issuing graph tools.'
+                      ? tabReconnect === "unknown"
+                        ? "whether the panel tab reconnected could NOT be determined — no pre-restart " +
+                          "baseline was captured for it, so nothing was watched. WHY is not established " +
+                          "here, and it is one of: the tab's socket was not open at the instant the " +
+                          "restart was dispatched; the panel advertised no tab session id (an older " +
+                          "build, or its browser-tab lease was refused because a duplicate tab holds " +
+                          "it); or the tab did not resolve at all. The tab may well be back. Graph " +
+                          "tools are withheld (ready:false) because that is unproven, NOT because the " +
+                          'tab is known to be gone: call panel_list_workflows or panel_set_workflow_target({mode:"current"}) ' +
+                          "to find out, and only refresh the browser if those also fail. If this " +
+                          "repeats on every restart, the panel is probably too old to advertise a tab " +
+                          "session id — update it."
+                        : "the panel tab has NOT reconnected yet (ready:false). Wait a moment then retry, or " +
+                          'rebind with panel_set_workflow_target({mode:"current"}) before issuing graph tools.'
                       : "the panel tab reconnected but cannot safely run graph mutations (ready:false), usually " +
                         "because it is still running a stale panel bundle. Hard-refresh the ComfyUI browser tab " +
                         "(Ctrl+Shift+R) before issuing graph tools; if that does not restore it, update the panel " +
@@ -10080,6 +11004,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // Old/lightweight contexts have no capability accessor, so preserve their historical
         // contract rather than claiming a production tab passed a check it never ran.
         const graphToolsReady = tabBack && (ctx.tabCanMutateGraph ? ctx.tabCanMutateGraph() : true);
+        // #654 — same split as the legacy path above. The gate is unchanged:
+        // `ready`/`graph_tools_ready` still key off the boolean, so an undetermined
+        // reconnect still withholds graph tools. Only the reported observation changes.
+        const tabReconnect = classifyTabReconnect({
+          serverReady: true, // this branch only runs on a confirmed healthy cycle
+          baselineCaptured: preRestartPanelIdentity != null,
+          tabBack,
+        });
         // #848: WHAT THIS RESTART DID NOT DO. "It came back healthy" answers a
         // different question from "did it come back with the launch arguments I just
         // configured?", and a user who had edited ComfyUI Desktop's saved launch args
@@ -10118,7 +11050,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           probes: recovery.attempts,
           saw_down: recovery.sawDown,
           via: recovery.via,
-          panel_tab_reconnected: tabBack,
+          panel_tab_reconnected: tabReconnect,
           note:
             (tabBack && !graphToolsReady
               ? `ComfyUI restart accepted and it is healthy again in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
@@ -10131,9 +11063,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             (dropped ? "; connection dropped as expected while it went down" : "") +
             (tabBack
               ? "; the panel tab reconnected — graph tools are ready."
-              : "; ComfyUI is back but the panel tab has NOT reconnected yet (ready:false) — " +
-                'wait a moment then retry, or rebind with panel_set_workflow_target({mode:"current"}) ' +
-                "before issuing graph tools.") +
+              : tabReconnect === "unknown"
+                ? "; ComfyUI is back, but whether the panel tab reconnected could NOT be determined — no " +
+                  "pre-restart baseline was captured for it, so nothing was watched. WHY is not " +
+                  "established here, and it is one of: its socket was not open at the instant the " +
+                  "restart was dispatched; the panel advertised no tab session id (an older build, or " +
+                  "a refused browser-tab lease); or the tab did not resolve at all. The tab may well " +
+                  "be back. Graph tools are withheld (ready:false) because that is UNPROVEN, not " +
+                  "because the tab is known to be gone: call panel_list_workflows or " +
+                  'panel_set_workflow_target({mode:"current"}) to find out, and refresh the browser only ' +
+                  "if those also fail. If this repeats on every restart, the panel is probably too old " +
+                  "to advertise a tab session id — update it."
+                : "; ComfyUI is back but the panel tab has NOT reconnected yet (ready:false) — " +
+                  'wait a moment then retry, or rebind with panel_set_workflow_target({mode:"current"}) ' +
+                  "before issuing graph tools.") +
             ".") + argvNote,
         });
       },

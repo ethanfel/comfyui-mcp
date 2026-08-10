@@ -11,6 +11,7 @@
 
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 /** Per-PROCESS owner nonce (#515/#529). Distinguishes THIS session's persisted job
@@ -73,8 +74,78 @@ let lateBoundDir = "";
 export function setProgressDir(dir: string): void {
   lateBoundDir = dir;
 }
+/**
+ * A STABLE per-user directory for persisted job records, used when nothing else
+ * set one (#1148).
+ *
+ * Without it, a plain stdio MCP server — no panel, no orchestrator, no
+ * COMFYUI_MCP_PROGRESS_DIR — had NO channel dir, so `persistedRecordsEnabled()`
+ * was false and not one job record was ever written. Every cross-restart
+ * mechanism built for #1148 was inert in that configuration, while
+ * `download_model action:"status"` went on promising that an interrupted
+ * download stays resolvable by id. A reporter lost a 5 GB transfer to exactly
+ * that gap and was told "No download matching id".
+ *
+ * DELIBERATELY NOT UNDER tmpdir. The orchestrator nonces its progress dir per
+ * start and REAPS earlier ones there — the very deletion #1148's carry-over
+ * exists to survive. A records dir a later orchestrator start could sweep would
+ * reintroduce the bug from the other side.
+ *
+ * SAFE ONLY BECAUSE ADOPTION IS LIVENESS-CHECKED (#1275). Enabling the store
+ * also enables cross-session adoption, and before that fix a record left behind
+ * by a crashed process was adoptable for up to a minute — a new download would
+ * take over a job nobody was running. Turning this on without that guard traded
+ * one silent failure for a worse one.
+ *
+ * Created lazily and memoized: `channelDir()` runs on every persist, and a
+ * failure to create it degrades to "no persistence" — the previous behaviour —
+ * rather than throwing inside a download.
+ */
+let defaultRecordsDir: string | undefined;
+let defaultRecordsDirTried = false;
+
+function stableRecordsDir(): string {
+  if (defaultRecordsDirTried) return defaultRecordsDir ?? "";
+  defaultRecordsDirTried = true;
+  try {
+    const dir = join(
+      process.env.COMFYUI_MCP_DATA_DIR?.trim() || join(homedir(), ".comfyui-mcp"),
+      "download-records",
+    );
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    defaultRecordsDir = dir;
+  } catch {
+    defaultRecordsDir = undefined;
+  }
+  return defaultRecordsDir ?? "";
+}
+
+/** Test seam: forget the memoized default so a case can point it somewhere else. */
+export function __resetStableRecordsDir(): void {
+  defaultRecordsDir = undefined;
+  defaultRecordsDirTried = false;
+}
+
 function channelDir(): string {
   return PROGRESS_DIR || lateBoundDir;
+}
+
+/**
+ * Where the persisted JOB RECORDS live — the channel dir when there is one, else
+ * the stable per-user default (#1148).
+ *
+ * Deliberately SEPARATE from `channelDir()`, which also drives the control
+ * channel (the MCP child's target-change requests, read by an orchestrator).
+ * Falling back for that one too would switch on a channel with nobody at the
+ * other end: a plain stdio server has no orchestrator to read it, and a test
+ * asserting the control channel is inactive without a progress dir caught
+ * exactly that over-reach.
+ *
+ * Only the RECORD store needs somewhere to write regardless of transport,
+ * because only it has to survive a restart.
+ */
+function recordsDir(): string {
+  return channelDir() || stableRecordsDir();
 }
 const lastWriteAt = new Map<string, number>();
 
@@ -91,10 +162,18 @@ const lastWriteAt = new Map<string, number>();
  * on disk and no error event: 40 minutes gone, invisibly, while the documented
  * contract told their agent to keep waiting rather than re-issue.
  *
- * The transfer really is dead — it streamed inside a process that no longer
- * exists — so this does NOT resurrect it, and pretending otherwise would be the
- * worse bug. What it fixes is the SILENCE: a record that says the download was
- * interrupted, which `status` can find by the id the caller was handed.
+ * What this does NOT do is decide whether the transfer is dead — the original
+ * framing, and WRONG for the case that matters. A download DISPATCHED to
+ * ComfyUI-Manager is a server-side fetch: the ComfyUI HOST is doing the work and
+ * a restart here does not touch it, so it is very likely still running, and
+ * telling that caller to re-issue writes a second copy to the same destination —
+ * a corrupt model (#1197). This function reads neither the `pid` nor the `owner`
+ * it persists, and `writerProcessGone()` exists to answer exactly the question it
+ * skips, so it is in no position to assert death for EITHER route.
+ *
+ * What it fixes is the SILENCE: a record saying we stopped WATCHING, which
+ * `status` can find by the id the caller was handed — worded per route, which is
+ * why `via_manager` has to survive the copy.
  *
  * Only `downloading` records migrate. A terminal record's outcome was already
  * delivered, and re-landing it would replay a settled event. Fields are copied
@@ -120,24 +199,81 @@ export function migrateInFlightJobs(fromDir: string, toDir: string): number {
         typeof raw[k] === "string" ? (raw[k] as string) : undefined;
       const num = (k: string): number | undefined =>
         typeof raw[k] === "number" ? (raw[k] as number) : undefined;
-      const rec = {
+      // WHO was transferring decides what this record may say, so the flag has to
+      // survive the migration (#1197). A Manager dispatch is a server-side fetch:
+      // the ComfyUI HOST is doing the work and a restart here does not touch it.
+      // Dropping `via_manager` is what made the old text dangerous — it rendered
+      // as a plain local interruption, so a live 12 GB host transfer was reported
+      // stopped and the caller was told to re-issue, which writes a SECOND copy to
+      // the same destination and corrupts the model (node-management.ts:971-979).
+      const viaManager = raw.via_manager === true;
+      // TYPED, not inferred: an annotated object literal gets excess-property
+      // checking, so a key that is NOT on PersistedDownloadJob is a COMPILE
+      // error. The five dead keys that lived here for months (`name`, `dest`,
+      // `target`, `total`, `received` — from the tray-row interface) are caught
+      // this way. `persistDownloadJob` cannot help: it spreads a variable, which
+      // defeats the check.
+      //
+      // The type gate and the round-trip test's key-set assertion are
+      // COMPLEMENTARY, and an earlier version of this comment wrongly said the
+      // type was "the only thing that catches this class":
+      //   - the TYPE catches a key that is not on the interface at all;
+      //   - the TEST catches a key that IS on the interface but that the writer
+      //     never emits (e.g. `notes`), which the type cannot see.
+      // What is true, and worth stating precisely, is that no assertion on the
+      // PERSISTED record can see a dead key: it is always `undefined` and
+      // JSON.stringify drops it before it reaches disk. An assertion on the
+      // literal itself would see it.
+      const rec: PersistedDownloadJob = {
         id: raw.id,
         status: "error" as const,
-        name: str("name"),
-        url: str("url"),
-        dest: str("dest"),
-        target: str("target"),
+        url: str("url") ?? "",
         dest_key: str("dest_key"),
         req_key: str("req_key"),
-        total: num("total"),
-        received: num("received"),
+        // Carried so the record stays USABLE, not just readable: without trayId a
+        // caller passing the tray_id they were handed gets "not found" on a record
+        // that exists, the row renders `(tray undefined)`, and an absent
+        // started_at prints `NaN s ago` in the candidate listing.
+        // `trayId`, NOT `tray_id` — this record's one camelCase key (line ~631),
+        // and the ONLY one url lookup matches on. Getting it wrong yields a
+        // silent `undefined` that a fixture using the same wrong key would not
+        // catch, which is precisely how a test passes for the wrong reason.
+
+        // Required by the interface. A source record missing one is already
+        // unusable for lookup; an empty string keeps the record VALID and
+        // findable by id rather than emitting a malformed one.
+        trayId: str("trayId") ?? "",
+        filename: str("filename"),
+        target_subfolder: str("target_subfolder") ?? "",
+        started_at: num("started_at") ?? Date.now(),
+        pid: num("pid"),
+        via_manager: viaManager,
+        // Real keys that were also being dropped. `resume` is what a re-issue
+        // needs to continue a partial rather than restart it, and `progressId`
+        // links the record back to its tray row.
+        progressId: str("progressId"),
+        resume: raw.resume,
         updated: Date.now(),
         interrupted_by_restart: true,
-        error:
-          `This download was INTERRUPTED: the orchestrator process it was streaming ` +
-          `inside exited (a restart or a session drop), so the transfer stopped. It is ` +
-          `NOT running and will not resume on its own — nothing is waiting to finish. ` +
-          `Any partial file may also have been discarded. Re-issue the download.`,
+        // NEITHER branch asserts the transfer died. This function reads neither
+        // the `pid` nor the `owner` it persists, and `writerProcessGone()` exists
+        // to answer exactly that question — the cancel path refuses to close a
+        // stale record until that probe returns ESRCH (#761/#858). What is
+        // observed is only that we stopped watching.
+        error: viaManager
+          ? `This download is no longer being WATCHED, and it was DISPATCHED to ` +
+            `ComfyUI-Manager — the fetch runs on the ComfyUI host, which the restart ` +
+            `here did not touch, so it is very likely STILL RUNNING. Do NOT re-issue ` +
+            `it: a second dispatch writes another copy to the same destination and ` +
+            `CORRUPTS the model. The file is not listed until it COMPLETES (which can ` +
+            `be hours for a multi-GB model), so an empty list_local_models proves ` +
+            `nothing and a timer is not a test — check the ComfyUI host's own logs or ` +
+            `disk if you need to know where it is.`
+          : `This download is no longer being WATCHED: the orchestrator process that ` +
+            `was streaming it exited, so nothing here is writing those bytes and no ` +
+            `further progress will be reported. Any partial file may have been ` +
+            `discarded. Re-issue the download — it picks up a resumable .partial where ` +
+            `one survives, and otherwise restarts from zero.`,
       };
       writeFileSync(
         join(toDir, `${JOB_PREFIX}${sanitizeIdPart(raw.id)}-${PERSIST_OWNER}.json`),
@@ -163,7 +299,7 @@ export function progressEnabled(): boolean {
  *  when there is actually somewhere to persist/adopt (avoids a leaked no-op interval on
  *  plain non-panel downloads). */
 export function persistedRecordsEnabled(): boolean {
-  return !!channelDir();
+  return !!recordsDir();
 }
 
 function fileFor(id: string, target?: string, attempt?: number): string {
@@ -672,7 +808,7 @@ function sanitizeIdPart(id: string): string {
 /** THIS session's record file for a job id — owner-scoped, so a second session running
  *  the same id writes a DIFFERENT file rather than clobbering ours. */
 function jobFileFor(id: string): string {
-  return join(channelDir(), `${JOB_PREFIX}${sanitizeIdPart(id)}-${PERSIST_OWNER}.json`);
+  return join(recordsDir(), `${JOB_PREFIX}${sanitizeIdPart(id)}-${PERSIST_OWNER}.json`);
 }
 
 let persistSeq = 0;
@@ -695,7 +831,7 @@ let persistSeq = 0;
  *  "downloading" record (bounded by long record retention, but this recovers it sooner). Returns
  *  false when there is no channel dir (nothing to persist) or the replace didn't happen. */
 export function persistDownloadJob(job: Omit<PersistedDownloadJob, "updated">): boolean {
-  const dir = channelDir();
+  const dir = recordsDir();
   if (!dir) return false;
   try {
     mkdirSync(dir, { recursive: true });
@@ -743,7 +879,7 @@ export function persistDownloadJob(job: Omit<PersistedDownloadJob, "updated">): 
 
 /** Remove a persisted job record (e.g. once it's fully retired). Best-effort. */
 export function removePersistedDownloadJob(id: string): void {
-  const dir = channelDir();
+  const dir = recordsDir();
   if (!dir) return;
   try {
     rmSync(jobFileFor(id), { force: true });
@@ -763,7 +899,7 @@ export function removePersistedDownloadJob(id: string): void {
  *  a persistent failure is reported to the caller so it can DISCLOSE the leftover
  *  instead of claiming a clean close it did not observe (codex gate, round 2). */
 export function removePersistedDownloadJobFor(id: string, owner: string): boolean {
-  const dir = channelDir();
+  const dir = recordsDir();
   if (!dir || !owner) return false;
   const path = join(dir, `${JOB_PREFIX}${sanitizeIdPart(id)}-${sanitizeIdPart(owner)}.json`);
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -842,7 +978,7 @@ export function readPersistedDownloadJob(id: string): PersistedDownloadJob | nul
 /** Every persisted job record (freshest not guaranteed; caller sorts). Used to
  *  list in-flight downloads after a reconnect and to look one up by URL/destination. */
 export function listPersistedDownloadJobs(): PersistedDownloadJob[] {
-  const dir = channelDir();
+  const dir = recordsDir();
   if (!dir) return [];
   const out: PersistedDownloadJob[] = [];
   let files: string[] = [];

@@ -4,7 +4,381 @@ All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) and the format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.50.66
+
+### Fixed
+
+- The restart-confirmation timeout no longer points you at a server it never checked. When
+  `panel_restart_comfyui`'s confirmation card times out it suggests the headless
+  `restart_comfyui` as a fallback — but that targets `COMFYUI_URL`, which is not
+  necessarily the ComfyUI the panel is running inside. It now says which server it would
+  restart, and refuses to recommend it outright when it can prove that is a different one.
+  A confirmed origin mismatch (a tab fronting a second local ComfyUI) reaches that strong
+  warning instead of being lost inside a proof that only answers "is it the same"; an
+  origin that merely cannot be proven stays a mild, target-naming note. The warning also
+  now names the worse outcome — restarting a live wrong target can succeed and take down a
+  ComfyUI you did not mean to touch, not merely find nothing there (#1233, panel#851)
+
 ## Unreleased
+
+## [0.50.91] - 2026-08-10
+
+### MCP
+
+#### Changed
+- prove the live-process stub is in force, instead of assuming it (#1314)
+
+
+## [0.50.90] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- resolve the panel base through the OS-observed process on Desktop (#1193)
+
+
+## [0.50.89] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- this repo's own release subject is a release subject (#1310)
+
+
+## [0.50.88] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- say it once — the interactive remedy repeated its own lead (#1307)
+- give an interactive card a disconnect remedy that applies to it (#1305)
+
+
+## [0.50.87] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a proven-irrelevant stale copy no longer vetoes the download (#1298)
+- say why a CivitAI download failed, instead of a bare status (#1303)
+
+#### Changed
+- 0.50.86 (#1304)
+- 0.50.85 (#1302)
+
+
+## [0.50.86] - 2026-08-09
+
+> Covers changes since 0.50.85.
+
+### MCP
+
+#### Fixed
+
+- **A failed model download now says WHY (#1300).** `download_model` reported
+  `Download failed: 404 ` and nothing else, so a missing CivitAI token and a genuinely
+  wrong URL were the same sentence — one reporter needed four attempts to download a
+  single file. The server's own explanation is now carried back (bounded and scrubbed),
+  and for CivitAI the message names the actual cause: no token configured, a token that
+  is invalid or unentitled, or a metadata-query URL that needs the `?fileId=` form.
+
+## [0.50.85] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop reporting a forgotten run as one you never queued (#1301)
+
+#### Changed
+- 0.50.84 (#1297)
+
+
+## [0.50.84] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- absorb the post-restart reconciliation window in mode:"current" (#1292) (#1295)
+
+
+## [0.50.83] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- say 'could not determine' instead of asserting the tab did not reconnect (panel#654) (#1289)
+
+#### Changed
+- fail when a test reaches the live-process probe unstubbed (#1291)
+- 0.50.82 (#1288)
+
+
+## [0.50.82] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a tab id is a bridge ROUTE, not a workflow path (#1287)
+
+
+## [0.50.81] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- an explicit workflow pin must clear an AMBIGUOUS turn pin (panel#888) (#1279)
+
+#### Changed
+- 0.50.80 (#1283)
+
+
+## [0.50.80] - 2026-08-09
+
+### MCP
+
+#### Changed
+- 'unreachable' is a specific claim, not a synonym for 'it failed' (#1281)
+- 0.50.79 (#1280)
+
+
+## [0.50.79] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- persist job records without a panel, so a restart can be survived (#1278)
+- do not adopt an in-flight record whose writer is PROVEN gone (#1275)
+
+#### Changed
+- 0.50.78 — an open that lands on another workflow stops reporting success (panel#887) (#1276)
+
+
+## [0.50.78] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- tell the caller when the post-open read contradicts the open (panel#887) (#1272)
+
+#### Changed
+- 0.50.77 (#1273)
+
+
+## [0.50.77] - 2026-08-09
+
+### MCP
+
+#### Changed
+- a failure message must not name a cause nobody observed (#1271)
+- 0.50.76 (#1270)
+
+
+## [0.50.76] - 2026-08-09
+
+### MCP
+
+#### Changed
+- 'no saved sessions' must not also mean 'could not read them' (#1269)
+- 0.50.75 (#1268)
+
+
+## [0.50.75] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- download-manager-routing depends on state a neighbour primes (#1266)
+- the identity refusal must describe the check it actually ran (#1255)
+
+#### Changed
+- a probe that FAILED must not answer 'no' (#1267)
+- 0.50.74 (#1265)
+
+
+## [0.50.74] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a relaunch that exits 1 must say what the child printed (#1262)
+
+#### Changed
+- 0.50.73 (#1260)
+
+
+## [0.50.73] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- 'latest' is not a git ref — do not check it out (#1258)
+
+#### Changed
+- 0.50.72 (#1256)
+
+
+## [0.50.72] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- investigate #1077 Finding 2 — permanent refusal without a relay backend (#1252)
+
+#### Changed
+- reset the panel-base cache in the five files that never did (#1253)
+- 0.50.71 (#1251)
+
+
+## [0.50.71] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the timeout must not offer a cause it already ruled out (#1247)
+- get_history shows output VALUES, not just their keys (#1229)
+
+#### Changed
+- stop panelRecoveryContext wording depending on which test ran first (#1250)
+- 0.50.70 (#1249)
+- 0.50.69 (#1248)
+
+
+## [0.50.70] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.50.69] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- 127.0.0.1 and localhost are the same host, not a target drift (#1246)
+
+#### Changed
+- 0.50.68 (#1245)
+
+
+## [0.50.68] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- the stale-heartbeat note must not tell a Manager dispatch to re-issue (#1242)
+
+#### Changed
+- 0.50.67 (#1241)
+
+
+## [0.50.67] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a relay session can adopt a workflow fence — it knows its own origin (#1240)
+
+
+## [0.50.66] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a CONFIRMED origin mismatch must not be lost inside the proof (#1235)
+
+#### Changed
+- delete civitai-lookup.ts, which nothing has ever imported (#1236)
+- 0.50.65 (#1232)
+
+
+## [0.50.65] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- enforce panel_graph_outline's max_chars when the live panel ignores it (#1228)
+- make an unreachable host say unreachable, not 'nothing found' (#1136)
+
+#### Changed
+- 0.50.63 (#1227)
+
+
+## [0.50.64] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.50.63] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- stop redacting file paths and module names, and filter the log BEFORE scrubbing (#1225)
+
+#### Changed
+- 0.50.62 (#1224)
+
+
+## [0.50.62] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a 0-node outline right after a restore is not an observation (#1221)
+
+
+## [0.50.61] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- de-flake two timing-dependent tests (#1216)
+
+
+## [0.50.60] - 2026-08-09
+
+_No user-facing changes._
+
+
+## [0.50.59] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- status must not report a LIVE download as missing (#1213)
+- type three test-only violations so `src/__tests__` can rejoin typechecking (#1204)
+
+
+## [0.50.58] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- scrub /internal/logs before it reaches a tool result (#1209)
+
+
+## [0.50.57] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- download status must not promise survival across an orchestrator restart (#1194)
+
+
+## [0.50.56] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- redact the response body in the enqueue error builders (#1202)
+
+
+## [0.50.55] - 2026-08-09
+
+### MCP
+
+#### Fixed
+- a live ComfyUI-Manager download must not be reported INTERRUPTED (#1200)
+
 
 ## [0.50.54] - 2026-08-09
 

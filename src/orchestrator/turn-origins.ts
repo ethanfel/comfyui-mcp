@@ -28,6 +28,7 @@
 // is unchanged, so the stamp would pass).
 
 import { randomUUID } from "node:crypto";
+import { shortTabId } from "../services/session-scope.js";
 
 export interface TurnOriginDeps {
   /** The backend a panel tab is CURRENTLY on (live tabBackends lookup). */
@@ -409,7 +410,7 @@ export class TurnOriginTracker {
    * only at the switch event (codex gate-4 delta, P0). Event-driven
    * invalidation ({@link tabChangedBackend}) fires when a switch is
    * OBSERVABLE, but a pin can land on a foreign-backend tab with no event at
-   * all: wf:<hash> ids are deterministic and recur, so after the pinned
+   * all: wf:<tabRouteId>:<path> ids are deterministic and recur, so after the pinned
    * surface migrates away (deleting its backend record) and disconnects
    * (pruning its alias), a NEW socket can hello under the pin's exact id on
    * another backend — `prev` is gone, no switch is seen, and the stale pin
@@ -516,6 +517,70 @@ export interface ScopeRepinBridge {
  *    otherwise the backend's SOLE interactive tab; 2+ candidates without a
  *    clear active one refuse rather than guess.
  */
+/**
+ * What an explicit `mode:"current"` repin did — or, when it did nothing, WHY
+ * (#1077 Finding 2).
+ *
+ * A bare `undefined` was indistinguishable across four different refusals, and
+ * the caller collapsed it to `rebound: false`. A session wedged on any of them
+ * saw only "the adoption was REFUSED" and had no way to tell a healthy pin it
+ * should leave alone from an ambiguity it could resolve by naming a workflow.
+ */
+export type ScopeRepinOutcome = string | { repinned: false; reason: string } | undefined;
+
+
+/**
+ * #888 — does this BRIDGE ROUTE address a tab showing `path`?
+ *
+ * The panel's bridge-route module (#640) defines two strings that look alike and
+ * are not interchangeable:
+ *
+ *   saved-workflow HANDLE : `wf:<path>`                 — names a WORKFLOW
+ *   bridge ROUTE (tab_id) : `wf:<tabRouteId>:<path>`    — names a TAB
+ *
+ * The handle is path-only *precisely because* two browser tabs can show the same
+ * file, so it cannot address one of them. `bridge.tabs()` returns ROUTES.
+ *
+ * The first attempt at #888 compared a derived handle against those routes; it
+ * never matched, so the recovery refused every time and the fix was inert — while
+ * a source-text "wiring" assertion passed, because grepping for a call cannot tell
+ * reachable code from dead code. `ui-bridge.ts`'s own comment still describes
+ * tabId as "commonly derived from a saved workflow path", which predates #640 and
+ * is what licensed the wrong derivation.
+ *
+ * Matching is on the PATH SUFFIX of the route, normalized the way every other
+ * saved-path comparison here normalizes (separators, `./`, case), and it also
+ * accepts a legacy handle-shaped id so an older panel is not silently excluded.
+ * Generous on purpose: a miss refuses the recovery, and refusing is the failure
+ * this issue is about — but a match is only ever ACTED on when exactly one tab
+ * matches, so generosity cannot silently redirect to the wrong tab.
+ */
+export function tabRouteCarriesPath(tabId: string, path: string): boolean {
+  if (typeof tabId !== "string" || !tabId.startsWith("wf:")) return false;
+  // Escape-free by construction: split/join instead of a backslash class. An
+  // earlier cut of this line was written through a shell heredoc and arrived with
+  // its escapes mangled — the file stayed valid-looking text and the regex was
+  // silently wrong, which is a documented trap in this repo.
+  const norm = (v: string) =>
+    v
+      .split("\\")
+      .join("/")
+      .replace(/^(?:\.\/)+/, "")
+      .replace(/\/{2,}/g, "/")
+      .replace(/\.json$/i, "")
+      .toLowerCase();
+  const want = norm(path);
+  if (!want) return false;
+  const rest = tabId.slice(3);
+  const sep = rest.indexOf(":");
+  // `wf:<route>:<path>` (current) and `wf:<path>` (legacy/no-route panels).
+  const candidates = sep >= 0 ? [rest.slice(sep + 1), rest] : [rest];
+  return candidates.some((c) => {
+    const got = norm(c);
+    return got === want || got.endsWith(`/${want}`) || want.endsWith(`/${got}`);
+  });
+}
+
 export function makeScopeRepinHandler(opts: {
   bridge: ScopeRepinBridge;
   tracker: TurnOriginTracker;
@@ -523,8 +588,8 @@ export function makeScopeRepinHandler(opts: {
   backendForTab: (tabId: string) => string;
   backendOfKey: (key: string) => string;
   info: (msg: string) => void;
-}): (scopeId: string) => string | undefined {
-  return (scopeId) => {
+}): (scopeId: string, preferredWorkflowPath?: string) => ScopeRepinOutcome {
+  return (scopeId, preferredWorkflowPath) => {
     const key = opts.scopeAgentKeyOf(scopeId);
     // RECOVERY ONLY: a pin that still reaches a live tab OF THIS conversation
     // is healthy — never displace it (null = ambiguous/ownership-refused and
@@ -534,21 +599,95 @@ export function makeScopeRepinHandler(opts: {
     // against the resolution-time refusal (codex gate-4 delta).
     const existing = opts.tracker.resolvedPinOf(key);
     if (typeof existing === "string" && opts.bridge.canReach(existing)) {
-      return undefined;
+      return {
+        repinned: false,
+        reason:
+          `the existing pin (${shortTabId(existing)}) still reaches a live tab of this ` +
+          `conversation, so it is healthy and was left alone — this recovery only displaces a ` +
+          `pin that is dead or ambiguous`,
+      };
     }
     const backend = opts.backendOfKey(key);
     const eligible = opts.bridge
       .tabs()
       .map((t) => t.tab_id)
       .filter((t) => opts.bridge.isHeadless?.(t) !== true && opts.backendForTab(t) === backend);
+    // #888 — a NAMED workflow decides which tab, where "current" cannot.
+    //
+    // The refusal below already tells the agent to do exactly this ("Name the
+    // workflow instead — panel_set_workflow_target with a path ... and the pin
+    // follows it"), and until now nothing made the pin follow: `mode:"pinned"`
+    // wrote the workflow-target store and never reached this handler at all, so
+    // a successful pin left the ambiguous turn pin in place and every following
+    // scope-addressed command hit the same ambiguity refusal.
+    //
+    // Eligibility is the SAME as for the active tab — this conversation's
+    // backend, not headless — so naming a workflow cannot reach a tab that
+    // "current" would have been refused for. The healthy-pin gate above still
+    // runs first and is untouched: a live pin is never displaced, however
+    // explicit the request.
+    //
+    // A named tab that is NOT eligible REFUSES rather than falling back to the
+    // active tab. Silently re-aiming an explicit request at a different
+    // workflow is the precise hazard this fence exists for (#884 gate 3, P0).
+    const matches = preferredWorkflowPath ? eligible.filter((t) => tabRouteCarriesPath(t, preferredWorkflowPath)) : [];
+    const named = matches.length === 1 ? matches[0] : undefined;
+    if (preferredWorkflowPath && !named) {
+      return {
+        repinned: false,
+        reason:
+          matches.length > 1
+            ? `${matches.length} connected tabs are showing that workflow (${matches
+                .map(shortTabId)
+                .join(", ")}), so naming it does not identify ONE of them — the pin was not moved. ` +
+              `Close the duplicate tab, or issue a message from the tab you mean`
+            : `no connected tab of this conversation's backend (${backend}) is showing that ` +
+              `workflow — it may be open in another browser tab, on another backend's ` +
+              `conversation, or not open at all. The pin was NOT moved, and was not silently ` +
+              `redirected to a different workflow either. Check panel_list_workflows`,
+      };
+    }
     const active = opts.bridge.resolveActiveScopeTab();
     const tab =
-      active && eligible.includes(active)
+      named ??
+      (active && eligible.includes(active)
         ? active
         : eligible.length === 1
           ? eligible[0]
-          : undefined;
-    if (!tab) return undefined;
+          : undefined);
+    // #1077 Finding 2 — SAY WHY. Every refusal above and below returned a bare
+    // `undefined`, which the caller collapsed to `rebound: false`, so a session
+    // stuck here was told only that the adoption was refused. The reporter could
+    // not tell which branch fired and had no orchestrator log to read; they
+    // refreshed, closed and reopened the tab, and finally traced it to source.
+    //
+    // The state worth naming is the last one: `active` exists but belongs to a
+    // DIFFERENT backend's conversation while this one has two or more tabs.
+    //
+    // NOT permanent, and saying so would overstate it — the active tab moves on
+    // the next user_message, so a message sent from one of this conversation's
+    // own tabs clears it. What IS true is that RETRYING THE TOOL never clears
+    // it: the inputs are identical every time, which is what the reporter
+    // experienced before refreshing and reopening the tab. Nothing in the old
+    // reply hinted at either way out.
+    if (!tab) {
+      if (eligible.length === 0) {
+        return {
+          repinned: false,
+          reason:
+            `no connected tab belongs to this conversation's backend (${backend}) — ` +
+            `every eligible tab is either headless or bound to another backend`,
+        };
+      }
+      return {
+        repinned: false,
+        reason:
+          `this conversation has ${eligible.length} eligible tabs and the active one ` +
+          `(${active ? shortTabId(active) : "none"}) is not among them, so "current" does not ` +
+          `identify which to bind. Name the workflow instead — panel_set_workflow_target with a ` +
+          `path, or panel_open_workflow — and the pin follows it`,
+      };
+    }
     opts.tracker.repinTo(key, tab);
     opts.info(
       `[panel-orchestrator] ${key} re-pinned onto ${tab.slice(0, 8)} by explicit target request (#884 recovery)`,

@@ -7,11 +7,17 @@
 //
 // That is unactionable in general and WRONG in one specific case. Identity is
 // bound to the connection's server-observed Origin, and a relay-backend
-// connection has none: `attachRelayConnection(sock)` calls `handleConnection(sock)`
+// connection had none: `attachRelayConnection(sock)` called `handleConnection(sock)`
 // with no origin argument, and the relay protocol does not forward the browser's
-// handshake Origin. So `workflowIdentityParts()` can never validate, the fence can
-// NEVER be adopted, and no amount of refreshing changes it. The reporter refreshed
-// repeatedly and closed and reopened the tab before tracing it to source.
+// handshake Origin. So `workflowIdentityParts()` could never validate, the fence
+// could NEVER be adopted, and no amount of refreshing changed it. The reporter
+// refreshed repeatedly and closed and reopened the tab before tracing it to source.
+//
+// THE RELAY HALF IS NOW FIXED and the wording moved with it: the Origin identifies
+// where the panel page is SERVED FROM, which is the ComfyUI the session already
+// points at, so `setupRelayBridge` supplies it from COMFYUI_URL and no relay
+// protocol change was needed. What remains here is the diagnosis for a connection
+// that genuinely has no origin from any source.
 //
 // They also had no orchestrator log to read, which is why the reason has to reach
 // the TOOL RESULT and not just stderr.
@@ -19,6 +25,7 @@
 import { describe, expect, it } from "vitest";
 import { UiBridge } from "../../services/ui-bridge.js";
 import { unreachableReason, identityReason } from "../../orchestrator/fence-refusal.js";
+import { workflowIdentityParts } from "../../orchestrator/session-store.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import {
   buildPanelToolDefs,
@@ -235,12 +242,25 @@ describe("the refusal reasons distinguish an AMBIGUOUS turn", () => {
     expect(r).not.toMatch(/refreshing the tab will not change it/);
   });
 
-  it("gate 3: a genuine no-Origin connection KEEPS the structural remedy", () => {
+  it("gate 3: a genuine no-Origin connection says refreshing will not help", () => {
     const r = identityReason(TAB, undefined, UUID, undefined);
 
     expect(r).toMatch(/no server-observed Origin/);
-    expect(r).toMatch(/structural, not transient/);
-    expect(r).toMatch(/COMFYUI_MCP_TUNNEL_BACKEND=relay/);
+    expect(r).toMatch(/[Rr]efreshing the tab will not/);
+    // ...and names something the reader can actually check.
+    expect(r).toMatch(/COMFYUI_URL/);
+  });
+
+  it("gate 3: no longer blames the relay backend, which is FIXED", () => {
+    // The relay path now supplies the origin it already knows from COMFYUI_URL
+    // (#1077), so a relay session adopts fences like any other. Telling a reader
+    // to stop using that backend would send them to change the one thing that is
+    // no longer the reason — a remedy that is worse than none, because it looks
+    // specific.
+    const r = identityReason(TAB, undefined, UUID, undefined);
+
+    expect(r).not.toMatch(/COMFYUI_MCP_TUNNEL_BACKEND/);
+    expect(r).not.toMatch(/can never be adopted/);
   });
 
   it("gate 3: an origin that IS present reports a validation failure, not absence", () => {
@@ -249,5 +269,59 @@ describe("the refusal reasons distinguish an AMBIGUOUS turn", () => {
     expect(r).toMatch(/did not validate/);
     expect(r).toMatch(/not-a-uuid/);
     expect(r).not.toMatch(/no server-observed Origin/);
+  });
+});
+
+// #1255 — a refusal must describe the check it actually ran.
+//
+// identityReason's last branch used to end "a malformed uuid, or one bound to a
+// different origin". workflowIdentityParts never compares origins: it requires
+// one to be PRESENT, and nothing in the repo has ever read `identity.origin`
+// (both call sites take `.uuid`). So the second half named a mechanism that does
+// not exist.
+//
+// That is not a cosmetic complaint. Reasoning from that sentence produced a
+// filed issue, a written fix and 7 tests before anyone checked whether the
+// comparison existed; the PR closed unmerged. Prose in the codebase gets read as
+// evidence about the codebase, so a message that overstates is a defect.
+describe("identityReason describes the check it actually performs (#1255)", () => {
+  const reason = () =>
+    identityReason("wf:x", "http://127.0.0.1:8188", "not-a-uuid", undefined);
+
+  it("does not claim the identity may be bound to a DIFFERENT origin", () => {
+    expect(reason()).not.toMatch(/bound to a different origin/i);
+  });
+
+  it("names the uuid as the thing that failed", () => {
+    const text = reason();
+    expect(text).toContain("not-a-uuid");
+    expect(text).toMatch(/not a well-formed workflow uuid/i);
+  });
+
+  it("says the origin was ACCEPTED, so a reader does not go hunting there", () => {
+    const text = reason();
+    expect(text).toContain("http://127.0.0.1:8188");
+    expect(text).toMatch(/present and accepted/i);
+    expect(text).toMatch(/does not compare it against a previously bound one/i);
+  });
+
+  it("owns its own premise: a present origin IS accepted by the gate", () => {
+    // The message asserts the origin was accepted and is not compared. Nothing
+    // in this file held that claim to the CODE -- a reviewer showed that adding
+    // a real origin comparison to workflowIdentityParts leaves all of these
+    // green, so the sentence could silently become false again. This pins it:
+    // a well-formed uuid with a present origin must produce an identity.
+    expect(
+      workflowIdentityParts({
+        workflowUuid: "11111111-2222-4333-8444-555555555555",
+        origin: "http://127.0.0.1:8188",
+      }),
+    ).toBeDefined();
+  });
+
+  it("still routes an AMBIGUOUS turn to its own branch, unchanged", () => {
+    // The no-origin branches are correct and must not be disturbed by this.
+    expect(identityReason("wf:x", undefined, "u", "ambiguous")).toMatch(/no single tab/i);
+    expect(identityReason("wf:x", undefined, "u", undefined)).toMatch(/no server-observed Origin/i);
   });
 });

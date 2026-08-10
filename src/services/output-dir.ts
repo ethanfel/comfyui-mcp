@@ -135,6 +135,32 @@ function rawFlagValue(argv: string[] | undefined, flag: string): string | undefi
 }
 
 /**
+ * True when the server's launch argv carries a `--base-directory` that is PRESENT
+ * but UNRESOLVABLE — a relative value with no absolute server-reported cwd.
+ *
+ * This is the one shape in which every root we could otherwise derive is a
+ * WRONG answer rather than merely an unproven one. ComfyUI derives custom_nodes
+ * from `<server cwd>/<flag>`, and with no cwd that path cannot be computed — yet
+ * the install root (from argv) and the OS-observed process root are both still
+ * derivable, and both name a DIFFERENT tree than the one being served. A caller
+ * that gates a destructive directory swap must fail closed here, not adopt a
+ * confidently-derived root that the flag has already overridden.
+ *
+ * Narrower than `hasUnresolvableRelativeModelDirFlag` on purpose: that one also
+ * fires on `--models-directory`, which relocates MODELS and says nothing about
+ * where custom_nodes lives, so folding it in here would refuse panel operations
+ * for a flag that cannot affect them (the very over-refusal #1133 is about).
+ */
+export function hasUnresolvableRelativeBaseDirFlag(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): boolean {
+  if (serverCwd && isAbsolute(serverCwd)) return false; // all relatives resolvable
+  const base = rawFlagValue(argv, "--base-directory");
+  return base !== undefined && !isAbsolute(base);
+}
+
+/**
  * True when the server's launch argv carries a RELATIVE `--base-directory` or
  * `--models-directory` that we CANNOT resolve because it did not report an absolute
  * cwd. Callers must then NOT guess a local destination (they'd write to the wrong

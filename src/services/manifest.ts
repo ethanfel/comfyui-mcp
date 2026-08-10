@@ -857,7 +857,13 @@ async function applyManifestSections(
   // streaming and are reported "pending" with a job id to poll via
   // download_model action:"status". A still-running download is NEVER counted as "applied", so
   // top-level success never claims an unfinished download succeeded.
-  const enqueued: Array<{ item: string; job: DownloadJob; settled: Promise<void> }> = [];
+  const enqueued: Array<{
+    item: string;
+    job: DownloadJob;
+    settled: Promise<void>;
+    /** #1298 — a proven-irrelevant same-named file, noted on the applied item. */
+    staleOutsideLiveRoots?: string;
+  }> = [];
   for (const model of manifest.models) {
     const item = model.local_path ?? model.filename ?? model.url;
     try {
@@ -905,6 +911,10 @@ async function applyManifestSections(
       }
       const target = await resolveLocalModelPath(model);
       const existing = await findExistingModel(target);
+      // #1298 — set when a found file is PROVEN to be outside every tree the
+      // live server reads. It is then irrelevant, and rides along as a note on
+      // the download rather than vetoing it.
+      let staleOutsideLiveRoots: string | undefined;
       if (existing) {
         // "Already exists" is only a legitimate SKIP if the running ComfyUI can
         // actually load it. On a locally-configured (non-live-resolved) models root
@@ -926,21 +936,23 @@ async function applyManifestSections(
             target.targetSubfolder.split(/[\\/]+/).filter(Boolean)[0],
           )
         ).inRoots;
+        // #1298 — a PROVEN-irrelevant file is not evidence about anything.
+        //
+        // #369 made this FAIL, which fixed a false SKIP: a stale same-named file
+        // used to satisfy the manifest while the live server had never seen it,
+        // and the render failed later. That was the right call about SKIPPING.
+        // But failing is a third thing, and it vetoes a download that has
+        // nothing wrong with it — the live models root resolved correctly, and a
+        // leftover in an install the server does not read cannot make writing to
+        // the right place unsafe. The old remedy even told the user to repoint
+        // COMFYUI_PATH, which they cannot act on when it is already correct.
+        //
+        // So: fall through to the download, carrying the stale path as a NOTE.
+        // #369's requirement is preserved — the item is satisfied only if the
+        // DOWNLOAD succeeds, never by the mere existence of a file somewhere.
         if (visible === false) {
-          results.push(
-            report(
-              "model",
-              item,
-              "failed",
-              `A file exists at ${existing}, but it is NOT in any directory the connected ` +
-                "ComfyUI reads models from — it belongs to an install the running server does " +
-                "not use. Point COMFYUI_PATH at the ComfyUI that is actually running, or " +
-                "launch it with an absolute --base-directory.",
-            ),
-          );
-          continue;
-        }
-        if (visible === undefined) {
+          staleOutsideLiveRoots = existing;
+        } else if (visible === undefined) {
           // We could not establish that the running server reads from this path, so
           // "already exists" is an UNVERIFIED claim. Report it as pending, never as
           // a satisfied item (codex gate, rounds 4 and 8).
@@ -974,37 +986,43 @@ async function applyManifestSections(
           target.targetSubfolder,
           target.filename,
         );
-        results.push(
-          servedByLive === true
-            ? report("model", item, "skipped", `Model already exists at ${existing}.`)
-            : servedByLive === false
-              ? report(
-                  "model",
-                  item,
-                  "failed",
-                  `A file exists at ${existing}, but the connected ComfyUI does not list ` +
-                    `"${target.filename}" under "${target.targetSubfolder}" at all — the models ` +
-                    "directory it reported is not the one this file is in (this happens when " +
-                    "ComfyUI runs in a container or behind a port-forward and its path also " +
-                    "exists on this host). Confirm with list_local_models.",
-                )
-              : report(
-                  "model",
-                  item,
-                  "pending",
-                  `A file exists at ${existing}, but the connected ComfyUI could not be asked ` +
-                    `whether it serves "${target.filename}", so this is not confirmed as ` +
-                    "installed. Check list_local_models.",
-                ),
-        );
-        continue;
+        // NOTE: `servedByLive` above is deliberately computed and unused on the
+        // stale path. Keeping the call costs one cheap listing GET per stale item
+        // and avoids churn on this branch; it is NOT load-bearing here, and it
+        // reads as though it feeds the guard below, which it does not.
+        if (!staleOutsideLiveRoots) {
+          results.push(
+            servedByLive === true
+              ? report("model", item, "skipped", `Model already exists at ${existing}.`)
+              : servedByLive === false
+                ? report(
+                    "model",
+                    item,
+                    "failed",
+                    `A file exists at ${existing}, but the connected ComfyUI does not list ` +
+                      `"${target.filename}" under "${target.targetSubfolder}" at all — the models ` +
+                      "directory it reported is not the one this file is in (this happens when " +
+                      "ComfyUI runs in a container or behind a port-forward and its path also " +
+                      "exists on this host). Confirm with list_local_models.",
+                  )
+                : report(
+                    "model",
+                    item,
+                    "pending",
+                    `A file exists at ${existing}, but the connected ComfyUI could not be asked ` +
+                      `whether it serves "${target.filename}", so this is not confirmed as ` +
+                      "installed. Check list_local_models.",
+                  ),
+          );
+          continue;
+        }
       }
       const { job, settled } = await startDownloadJob(
         model.url,
         target.targetSubfolder,
         target.filename,
       );
-      enqueued.push({ item, job, settled });
+      enqueued.push({ item, job, settled, staleOutsideLiveRoots });
     } catch (err) {
       results.push(
         report(
@@ -1032,9 +1050,23 @@ async function applyManifestSections(
     // ONE resolution for the batch: a verdict made against a DIFFERENT ComfyUI than
     // the one connected now must not be re-asserted as an apply (#369).
     const liveRootNow = await currentLiveModelsRoot();
-    for (const { item, job } of enqueued) {
+    for (const { item, job, staleOutsideLiveRoots } of enqueued) {
+      // #1298 — the stale-copy note belongs on EVERY outcome, not just the happy
+      // one. Review measured it rendering on 1 of 6: a download slower than the
+      // 15s grace reports `pending` and the path was lost permanently, because
+      // it lives only in this local array and the `download_model status` poll
+      // the user is told to run cannot see it. That is the reporter's own case.
+      // Worst was `wrongPlace`: two same-named copies on disk and neither
+      // message naming the other.
+      const staleNote = staleOutsideLiveRoots
+        ? ` (Note: a same-named file also exists at ${staleOutsideLiveRoots}, which was NOT in ` +
+          "any directory the connected ComfyUI reported reading when this item was checked — it " +
+          "belongs to a different install and was ignored.)"
+        : "";
       if (job.status === "error") {
-        results.push(report("model", item, "failed", job.error ?? "Model download failed."));
+        results.push(
+          report("model", item, "failed", (job.error ?? "Model download failed.") + staleNote),
+        );
       } else if (job.status === "done") {
         // "applied" must mean the running ComfyUI can actually load it (#369). Same
         // shared placement policy as download_model: an unconfirmed or demonstrably
@@ -1050,20 +1082,21 @@ async function applyManifestSections(
                 "model",
                 item,
                 "applied",
-                `Model downloaded to ${job.path}${placement.pathQualifier}.`,
+                `Model downloaded to ${job.path}${placement.pathQualifier}.` + staleNote,
               )
             : placement.wrongPlace
               ? report(
                   "model",
                   item,
                   "failed",
-                  `Model ${placement.pathLabel} ${job.path}, but it is NOT usable by the connected ComfyUI: ${placement.warning}`,
+                  `Model ${placement.pathLabel} ${job.path}, but it is NOT usable by the connected ComfyUI: ${placement.warning}` +
+                    staleNote,
                 )
               : report(
                   "model",
                   item,
                   "pending",
-                  `Model ${placement.pathLabel} ${job.path}. ${placement.warning}`,
+                  `Model ${placement.pathLabel} ${job.path}. ${placement.warning}` + staleNote,
                 ),
         );
       } else {
@@ -1074,7 +1107,7 @@ async function applyManifestSections(
             "pending",
             `Model download is RUNNING in the background (job ${job.id}) — NOT yet complete, ` +
               `and NOT a failure. Poll download_model action:"status" with this id; the file lands on its own. ` +
-              `Do not re-issue the download.`,
+              `Do not re-issue the download.` + staleNote,
           ),
         );
       }

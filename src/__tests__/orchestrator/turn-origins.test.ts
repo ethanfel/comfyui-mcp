@@ -12,6 +12,16 @@ import {
   type ScopeRepinBridge,
 } from "../../orchestrator/turn-origins.js";
 
+/**
+ * #1077 Finding 2 — a declined repin now carries WHY, so it is an object rather
+ * than `undefined`. What these tests protect is unchanged: nothing was repinned.
+ * Asserting that directly says so, instead of pinning the representation.
+ */
+function expectDeclined(outcome: unknown): void {
+  expect(typeof outcome, "a declined repin must not return a tab id").not.toBe("string");
+  expect(outcome, "and it must say why").toMatchObject({ repinned: false });
+}
+
 const KEY = "orchestrator::claude";
 
 /** A tracker over a mutable backend map — mirrors index.ts's wiring exactly:
@@ -609,7 +619,7 @@ describe("makeScopeRepinHandler — explicit recovery gates (gate 3, P0)", () =>
     tracker.recordForMid("m1", "uuid-a", "tab-a");
     tracker.onSeen(KEY, "m1");
     await flushMicrotasks();
-    expect(repin("orchestrator")).toBeUndefined();
+    expectDeclined(repin("orchestrator"));
     expect(tracker.pinOf(KEY)).toBe("tab-a"); // untouched
   });
 
@@ -645,7 +655,7 @@ describe("makeScopeRepinHandler — explicit recovery gates (gate 3, P0)", () =>
       tabs: [{ id: "codex-tab", backend: "codex" }],
       active: "codex-tab",
     });
-    expect(repin("orchestrator")).toBeUndefined();
+    expectDeclined(repin("orchestrator"));
     expect(tracker.pinOf(KEY)).toBeUndefined();
   });
 
@@ -667,7 +677,7 @@ describe("makeScopeRepinHandler — explicit recovery gates (gate 3, P0)", () =>
       tabs: [{ id: "tab-a" }, { id: "tab-b" }],
       active: undefined,
     });
-    expect(repin("orchestrator")).toBeUndefined();
+    expectDeclined(repin("orchestrator"));
   });
 
   it("never adopts a headless viewer", () => {
@@ -675,6 +685,6 @@ describe("makeScopeRepinHandler — explicit recovery gates (gate 3, P0)", () =>
       tabs: [{ id: "phone", headless: true }],
       active: "phone",
     });
-    expect(repin("orchestrator")).toBeUndefined();
+    expectDeclined(repin("orchestrator"));
   });
 });

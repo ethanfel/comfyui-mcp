@@ -1218,7 +1218,14 @@ describe("UiBridge (multi-tab)", () => {
       // Even a DIRECT repin call must refuse: the pin reaches a live tab, so
       // there is nothing to recover from — moving it would re-aim the running
       // turn's tool calls at a workflow it was never about.
-      expect(bridge.repinScopeToActive(SHARED_SESSION_SCOPE)).toBeUndefined();
+      // #1077 Finding 2 — the refusal now carries WHY. What matters here is
+      // unchanged (no tab id came back, the pin did not move); it now also says
+      // the pin is healthy, which is the whole point of distinguishing this
+      // correct refusal from the ones a user can act on.
+      const declined = bridge.repinScopeToActive(SHARED_SESSION_SCOPE);
+      expect(typeof declined).not.toBe("string");
+      expect(declined).toMatchObject({ repinned: false });
+      expect((declined as { reason: string }).reason).toMatch(/still reaches a live tab/);
       expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json");
       const still = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
       expect(still).toMatchObject({ from: "tab-a" });
@@ -1358,7 +1365,7 @@ describe("UiBridge (multi-tab)", () => {
     });
 
     it("a pin whose id is REVIVED by another backend's tab is refused at resolution (codex gate-4 delta P0)", async () => {
-      // wf:<hash> ids are deterministic and recur. A Claude turn pins tab A;
+      // wf:<tabRouteId>:<path> ids are deterministic and recur. A Claude turn pins tab A;
       // A disconnects (no switch event will ever fire for it); a NEW socket
       // hellos under the SAME id on Codex. The pin now resolves exact-match
       // onto the revived tab, and a provider switch does not change the
@@ -1741,7 +1748,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("follows MIGRATION CHAINS: uuid → tmp: → wf: (the exact #210 field sequence)", async () => {
     // The reported failure re-helloed TWICE: legacy random UUID, then the
-    // unsaved-tab tmp:<uuid> id, then the saved wf:<hash> id. The ORIGINAL id
+    // unsaved-tab tmp:<uuid> id, then the saved wf:<tabRouteId>:<path> id. The ORIGINAL id
     // must still resolve after both hops (single-hop lookup lands on the dead
     // tmp: id) — the map path-compresses so every historical id points at the
     // live tab.
@@ -2513,9 +2520,22 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect(msg).toMatch(/UNCONFIRMED/);
     expect(msg).toMatch(/could not be read just now/);
     // …and the two costless checks must come before the remedy that has a cost.
-    expect(msg.search(/RETRY this command/)).toBeLessThan(
-      msg.search(/panel_action:'update'/),
-    );
+    //
+    // #1208 — this compared two `search()` indices WITHOUT asserting either term
+    // was present, so an absent term (-1) made the comparison meaningless and the
+    // test failed intermittently. The remedy has TWO wordings depending on
+    // `installPanelUsable`: "install_comfyui(action:'panel', panel_action:'update')"
+    // when this surface can drive the update, and "Update the panel ON THE
+    // COMFYUI HOST" when it cannot. Only the first contains `panel_action:'update'`,
+    // so on the other branch the index was -1 and `694 < -1` failed — an
+    // environmental difference, not a regression.
+    //
+    // Assert presence FIRST, and anchor on a pattern that covers both branches.
+    const retryAt = msg.search(/RETRY this command/);
+    const remedyAt = msg.search(/panel_action:'update'|Update the panel ON THE COMFYUI HOST/);
+    expect(retryAt, "the free RETRY check must be present").toBeGreaterThan(-1);
+    expect(remedyAt, "an update remedy must be present in either wording").toBeGreaterThan(-1);
+    expect(retryAt).toBeLessThan(remedyAt);
     expect(msg.search(/HARD-REFRESH/)).toBeLessThan(msg.search(/panel_action:'update'/));
     // The update is DEMOTED, not deleted — it is still right when the install
     // really is behind, and this branch cannot rule that out either.
@@ -4148,7 +4168,7 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
   });
 
   // #422 — the proven veto must SURVIVE a same-socket tab-id MIGRATION (tmp:<uuid> →
-  // wf:<hash>), which is exactly what a workflow-tab switch / graph edit triggers. A
+  // wf:<tabRouteId>:<path>), which is exactly what a workflow-tab switch / graph edit triggers. A
   // command served under the pre-migration id, then an undercutting-version hello under
   // the migrated id, must NOT be re-gated. FAIL-before: the migration deletes the old
   // conn, so the new conn started with an empty proven set and the gate fired.
@@ -4456,7 +4476,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     bridge.setTabGoneListener(() => {});
   });
 
-  // Coordinator gate: SAME KEY IS NOT THE SAME TAB. A `wf:<hash>` id names a
+  // Coordinator gate: SAME KEY IS NOT THE SAME TAB. A `wf:` route id names a
   // saved workflow, so a different browser tab opening that workflow takes the
   // key over. Keyed on the id alone, that stranger's hello cancelled the
   // departed tab's clock (and satisfied the timer's re-check), so the departed
@@ -4673,6 +4693,223 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // Give the late reply time to land; it must NOT be buffered under any ask id.
     await new Promise((r) => setTimeout(r, 120));
     expect(bridge.takeLateAskReply("tab-plain")).toBeUndefined();
+  });
+});
+
+// ── #694: the unsolved half. A MUTATION that times out and then applies is
+// invisible — the panel does reply, just after the deadline, and the bridge
+// drops it ("Everything else drops", ui-bridge.ts:2230).
+//
+// This is NOT the #486 shape and must not be built like it. #486 buffers for a
+// caller that is STILL ALIVE polling within a grace window; a mutation caller
+// has already been handed an outcome-unknown rejection and moved on. There is
+// no poller, so the outcome has to be retained for a LATER interaction to find.
+//
+// The reporter's case verbatim (0.50.36 / panel 0.11.44): graph_set_node_mode
+// timed out at 6000 ms, and panel_query_graph immediately after showed the node
+// already switched. The write landed. Nothing ever told the caller.
+describe("UiBridge (late MUTATION outcome — #694)", () => {
+  // Retention is FAIL-CLOSED: with no filter the bridge keeps nothing, because
+  // nothing could drain it either. Production installs this from
+  // RETRY_TOKEN_CMDS (orchestrator/index.ts); the suite states the same shape
+  // explicitly rather than importing it, so a change to that set shows up here
+  // as a deliberate decision instead of silently re-scoping these tests.
+  const RETAINED = new Set(["graph_set_node_mode", "graph_add_node"]);
+  beforeEach(() => bridge.setLateMutationFilter((c) => RETAINED.has(c)));
+  afterEach(() => bridge.setLateMutationFilter(null));
+
+  it("retains nothing when no filter is installed (fail closed)", async () => {
+    bridge.setLateMutationFilter(null);
+    const sock = await connectPanel("tab-nofilter", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-nofilter")).toBe(true),
+    );
+    let rid = "";
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "graph_set_node_mode") {
+        rid = msg.rid;
+        setTimeout(() => sock.send(JSON.stringify({ rid: msg.rid, ok: true })), 80);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "graph_set_node_mode", node_id: 1, mode: "active" },
+        { tabId: "tab-nofilter", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    await new Promise((r) => setTimeout(r, 140));
+    expect(bridge.takeLateMutation(rid)).toBeUndefined();
+    sock.close();
+  });
+
+  it("asks the FILTER, not the mutating flag — the #778 commands stay out", async () => {
+    // ctx.mutating is !BRIDGE_READONLY_CMDS.has(cmd), which this file documents
+    // as misclassifying graph_screenshot &c. The first cut of #694 gated on it
+    // and retained seven reads under a comment claiming reads were excluded.
+    // graph_screenshot is mutating:true AND not retainable — the exact pair that
+    // tells the two discriminators apart.
+    const sock = await connectPanel("tab-778", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-778")).toBe(true));
+    let rid = "";
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "graph_screenshot") {
+        rid = msg.rid;
+        setTimeout(() => sock.send(JSON.stringify({ rid: msg.rid, ok: true })), 80);
+      }
+    });
+    await expect(
+      bridge.send({ cmd: "graph_screenshot" }, { tabId: "tab-778", timeoutMs: 30 }),
+    ).rejects.toThrow(/did not reply/i);
+    await new Promise((r) => setTimeout(r, 140));
+    expect(rid, "graph_screenshot should have been dispatched").toBeTruthy();
+    expect(bridge.takeLateMutation(rid)).toBeUndefined();
+    sock.close();
+  });
+
+  /** Reply to `cmd` only after `delayMs`, and hand back the rid the bridge minted. */
+  function replyLate(sock: WebSocket, cmd: string, delayMs: number): Promise<string> {
+    return new Promise((resolve) => {
+      sock.on("message", (buf) => {
+        const msg = JSON.parse(buf.toString());
+        if (msg.rid && msg.cmd === cmd) {
+          resolve(msg.rid);
+          setTimeout(() => {
+            sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: { mode: "active" } }));
+          }, delayMs);
+        }
+      });
+    });
+  }
+
+  it("retains a successful late mutation reply so a later call can report it applied", async () => {
+    const sock = await connectPanel("tab-late-mut", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-late-mut")).toBe(true),
+    );
+    const ridP = replyLate(sock, "graph_set_node_mode", 80);
+
+    await expect(
+      bridge.send(
+        { cmd: "graph_set_node_mode", node_id: 126, mode: "active" },
+        { tabId: "tab-late-mut", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    const rid = await ridP;
+
+    // The write DID land. Today this assertion fails because the reply is
+    // dropped on the floor and the bridge keeps no record that it ever arrived.
+    const late = await vi.waitFor(() => {
+      const got = bridge.takeLateMutation(rid);
+      expect(got, "late mutation outcome should be retained").toBeTruthy();
+      return got;
+    });
+    expect(late?.ok).toBe(true);
+    expect(late?.cmd).toBe("graph_set_node_mode");
+    expect(late?.tabId).toBe("tab-late-mut");
+    sock.close();
+  });
+
+  it("drains once — a second reader must not be told the same thing twice", async () => {
+    const sock = await connectPanel("tab-late-drain", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-late-drain")).toBe(true),
+    );
+    const ridP = replyLate(sock, "graph_set_node_mode", 80);
+    await expect(
+      bridge.send(
+        { cmd: "graph_set_node_mode", node_id: 1, mode: "mute" },
+        { tabId: "tab-late-drain", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    const rid = await ridP;
+
+    await vi.waitFor(() => expect(bridge.takeLateMutation(rid)).toBeTruthy());
+    expect(bridge.takeLateMutation(rid)).toBeUndefined();
+    sock.close();
+  });
+
+  it("does NOT retain a mutation that replied IN TIME (nothing to report)", async () => {
+    // Guards the obvious over-fire: a normal successful mutation resolves its
+    // caller directly, so a retained record would make every write look like a
+    // recovered timeout.
+    const sock = await connectPanel("tab-on-time", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-on-time")).toBe(true),
+    );
+    let seen = "";
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "graph_set_node_mode") {
+        seen = msg.rid;
+        sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: { mode: "active" } }));
+      }
+    });
+    await bridge.send(
+      { cmd: "graph_set_node_mode", node_id: 7, mode: "active" },
+      { tabId: "tab-on-time", timeoutMs: 2000 },
+    );
+    expect(seen).toBeTruthy();
+    expect(bridge.takeLateMutation(seen)).toBeUndefined();
+    sock.close();
+  });
+
+  it("does NOT retain a late FAILURE — only a write that demonstrably applied", async () => {
+    // A late ok:false says the mutation was refused, which is not news the
+    // caller needs: they were already told it did not complete. Retaining it
+    // would turn "we never found out" into "it failed", the #796 fold in the
+    // opposite direction.
+    const sock = await connectPanel("tab-late-fail", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-late-fail")).toBe(true),
+    );
+    let rid = "";
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "graph_set_node_mode") {
+        rid = msg.rid;
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: "no such node" }));
+        }, 80);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "graph_set_node_mode", node_id: 999, mode: "active" },
+        { tabId: "tab-late-fail", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    await new Promise((r) => setTimeout(r, 140));
+    expect(rid).toBeTruthy();
+    expect(bridge.takeLateMutation(rid)).toBeUndefined();
+    sock.close();
+  });
+
+  it("does NOT retain a late READ reply — a read is retryable, so nothing is ambiguous", async () => {
+    // The asymmetry #1154 spells out: an abandoned read costs nothing because
+    // you just retry it. Retaining reads would make this buffer unbounded noise.
+    const sock = await connectPanel("tab-late-read", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-late-read")).toBe(true),
+    );
+    let rid = "";
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "graph_outline") {
+        rid = msg.rid;
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: { late: true } }));
+        }, 80);
+      }
+    });
+    await expect(
+      bridge.send({ cmd: "graph_outline" }, { tabId: "tab-late-read", timeoutMs: 30 }),
+    ).rejects.toThrow(/did not reply|disconnected|gone/i);
+    await new Promise((r) => setTimeout(r, 140));
+    expect(rid).toBeTruthy();
+    expect(bridge.takeLateMutation(rid)).toBeUndefined();
+    sock.close();
   });
 });
 

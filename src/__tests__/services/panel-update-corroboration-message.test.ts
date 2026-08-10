@@ -36,19 +36,34 @@ const workspace = vi.hoisted(() => ({
   base: undefined as string | undefined,
   liveArgv: undefined as string[] | undefined,
   reachable: false,
+  /** What the OS-observed process tier resolves to (#1133). undefined ⇒ the
+   *  observation fails, leaving the server genuinely underivable. */
+  observedRoot: undefined as string | undefined,
 }));
+const argvRoot = vi.hoisted(() => (argv: string[] | undefined) => {
+  // Stand-in faithful to the real derivation's contract: an ABSOLUTE main.py
+  // yields its dir; a RELATIVE one with no cwd yields nothing (the real
+  // liveRootFromArgv refuses to hand back a bogus relative root).
+  const main = argv?.find((a) => /(^|[\\/])main\.py$/.test(a));
+  if (!main) return undefined;
+  const dir = main.slice(0, main.length - "main.py".length).replace(/[\\/]$/, "");
+  if (dir === "") return undefined; // bare "main.py" needs a cwd we don't have
+  return dir;
+});
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: () => workspace.base,
   resolveLocalWorkspaceBase: () => workspace.base,
-  liveRootFromArgv: (argv: string[] | undefined, cwd?: string) => {
-    // Stand-in faithful to the real derivation's contract: an ABSOLUTE main.py
-    // yields its dir; a RELATIVE one with no cwd yields nothing (the real
-    // liveRootFromArgv refuses to hand back a bogus relative root).
-    const main = argv?.find((a) => /(^|[\\/])main\.py$/.test(a));
-    if (!main) return undefined;
-    const dir = main.slice(0, main.length - "main.py".length).replace(/[\\/]$/, "");
-    if (dir === "") return undefined; // bare "main.py" needs a cwd we don't have
-    return dir;
+  liveRootFromArgv: (argv: string[] | undefined) => argvRoot(argv),
+  // The real resolver's second tier (#1133) — the OS-observed process anchor —
+  // is OFF unless a test sets `workspace.observedRoot`, so the underivable
+  // assertions below still describe a genuinely underivable server.
+  resolveLiveServerRoot: (argv: string[] | undefined) => {
+    const fromArgv = argvRoot(argv);
+    if (fromArgv) return { root: fromArgv, source: "argv" };
+    if (workspace.observedRoot) {
+      return { root: workspace.observedRoot, source: "observed-process" };
+    }
+    return { source: "unresolved" };
   },
   getLiveServerSnapshot: async () => ({
     reachable: workspace.reachable,

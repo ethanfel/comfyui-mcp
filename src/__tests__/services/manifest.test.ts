@@ -453,7 +453,15 @@ describe("applyManifest", () => {
   });
 
   // #369 — "already exists" is a claim about a path the RUNNING server may not read.
-  it("FAILS an existing file that is not in any tree the connected ComfyUI reads", async () => {
+  // #1298 — and when that claim is DISPROVEN, the file is irrelevant, not fatal.
+  //
+  // #369 changed a false SKIP into a FAIL, which was right about skipping: a
+  // stale same-named file must never satisfy the manifest. But failing vetoes a
+  // download that has nothing wrong with it — the live root resolved correctly,
+  // and the old remedy told the user to repoint COMFYUI_PATH when nothing was
+  // misconfigured. #369's real requirement survives: the item is satisfied only
+  // if the DOWNLOAD succeeds, never by a file existing somewhere.
+  it("DOWNLOADS past an existing file that is not in any tree the connected ComfyUI reads", async () => {
     resolveExistingModelFileMock.mockResolvedValueOnce({
       path: "C:/stale/models/checkpoints/big.safetensors",
       root: "C:/stale/models",
@@ -473,12 +481,52 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
-    expect(result.results[0].message).toMatch(/NOT in any directory/);
-    expect(downloadModelMock).not.toHaveBeenCalled();
+    // The stale copy must NOT block the download...
+    expect(result.summary.failed).toBe(0);
+    expect(downloadModelMock).toHaveBeenCalled();
+    // ...and must still be NAMED, because a same-named file in another install
+    // is genuinely confusing later. #369 was right that the user should hear
+    // about it; it is a note on a success, not a veto.
+    const msg = result.results[0].message ?? "";
+    expect(msg).toMatch(/same-named file also exists/);
+    expect(msg).toMatch(/C:\/stale\/models/);
+    expect(msg).toMatch(/was ignored/);
+    // Re-pinned from the #369 tests this replaced: that clause IS the diagnostic
+    // half #369 wanted kept, and after the rewrite nothing held it — stripping it
+    // killed zero tests.
+    expect(msg).toMatch(/NOT in any directory/);
   });
 
-  it("FAILS a same-named existing file that is OUTSIDE every live model root (codex gate r5)", async () => {
+  it("does not accuse LATER items of a stale copy found for an earlier one", async () => {
+    // Surviving mutation: hoisting `let staleOutsideLiveRoots` above the per-item
+    // loop passes every other test, because both stale tests use a single-model
+    // manifest. Manifests are multi-model by definition, so the mutant ships a
+    // false accusation on every subsequent asset.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/stale/models/checkpoints/big.safetensors",
+      root: "C:/stale/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/big.safetensors", model_type: "checkpoints", filename: "big.safetensors" },
+          { url: "https://example.com/clean.safetensors", model_type: "loras", filename: "clean.safetensors" },
+        ],
+      },
+    });
+
+    const second = result.results.find((r) => String(r.item).includes("clean")) ?? result.results[1];
+    expect(second?.message ?? "").not.toMatch(/same-named file also exists/);
+  });
+
+  // #1298 — was "FAILS"; containment proving the file irrelevant now lets the
+  // download proceed. The containment CHECK is unchanged and still load-bearing:
+  // it is what distinguishes this from a live copy (which still skips) and from
+  // an unverifiable one (which is still pending).
+  it("DOWNLOADS past a same-named existing file OUTSIDE every live model root (codex gate r5)", async () => {
     // C:\Stale\...\big.safetensors exists locally AND the live server has its own
     // D:\Live\...\big.safetensors, so a name-only listing check would call it a skip.
     // The containment test is decisive and overrides it.
@@ -503,7 +551,11 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
+    expect(result.summary.failed).toBe(0);
+    // Re-pinned: the old test asserted downloadModel was NOT called, so the new
+    // contract needs the mirror assertion or "downloads past it" is unheld.
+    expect(downloadModelMock).toHaveBeenCalled();
+    expect(result.results[0].message).toMatch(/same-named file also exists/);
     expect(result.results[0].message).toMatch(/NOT in any directory/);
   });
 
@@ -887,6 +939,79 @@ describe("applyManifest", () => {
       if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
       else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
     }
+  });
+
+  it("names the stale copy on a STILL-RUNNING download — the reporter's own case", async () => {
+    // The note used to render on 1 of 6 outcomes. A download slower than the 15s
+    // grace reports `pending` and the stale path was lost PERMANENTLY: it lives
+    // only in applyManifest's local array, so the `download_model status` poll
+    // the user is told to run cannot see it. That is the case that filed #1298,
+    // so the fix is hollow without it.
+    const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+    process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "0";
+    downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/stale/models/checkpoints/slow.safetensors",
+      root: "C:/stale/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+
+    try {
+      const result = await applyManifest({
+        manifest: {
+          models: [
+            { url: "https://example.com/slow.safetensors", model_type: "checkpoints", filename: "slow.safetensors" },
+          ],
+        },
+      });
+      expect(result.results[0].status).toBe("pending");
+      expect(result.results[0].message).toMatch(/same-named file also exists/);
+      expect(result.results[0].message).toMatch(/C:\/stale\/models/);
+    } finally {
+      if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+      else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
+    }
+  });
+
+  // Round 2: three of the six note-renderings were unpinned — including
+  // wrongPlace, which my own commit called the worst case ("two same-named
+  // copies on disk and neither message mentions the other"). Deleting any of
+  // those three appends left a green suite, so each could regress silently to
+  // exactly the state round 1 shipped.
+  describe.each([
+    {
+      name: "a FAILED download",
+      file: "failcase.safetensors",
+      arm: () => downloadModelMock.mockRejectedValueOnce(new Error("boom")),
+    },
+    {
+      name: "a landed-but-NOT-VISIBLE placement (wrongPlace)",
+      file: "wrongplace.safetensors",
+      arm: () => verifyLandedModelMock.mockResolvedValueOnce({ liveVisible: "not-visible", note: "" }),
+    },
+    {
+      name: "an UNCONFIRMED placement",
+      file: "unconfirmed.safetensors",
+      arm: () => verifyLandedModelMock.mockResolvedValueOnce({ liveVisible: "unknown", note: "" }),
+    },
+  ])("names the stale copy on $name (#1298)", ({ file, arm }) => {
+    it("carries the note", async () => {
+      resolveExistingModelFileMock.mockResolvedValueOnce({
+        path: `C:/stale/models/checkpoints/${file}`,
+        root: "C:/stale/models",
+        info: { isFile: () => true },
+      });
+      isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+      arm();
+
+      const result = await applyManifest({
+        manifest: {
+          models: [{ url: `https://example.com/${file}`, model_type: "checkpoints", filename: file }],
+        },
+      });
+      expect(result.results[0].message ?? "").toMatch(/same-named file also exists/);
+    });
   });
 
   it("does not block on MANY slow downloads — enqueues all, one bounded grace (#362)", async () => {

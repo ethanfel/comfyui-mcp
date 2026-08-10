@@ -366,13 +366,165 @@ describe("migrateInFlightJobs (#1148)", () => {
       JSON.stringify(rec),
     );
 
+  // The structural hole that produced BOTH key bugs in this function: every
+  // fixture here is hand-built, so a key the WRITER never emits still reads as
+  // "carried" and the test agrees with the mistake. `tray_id` vs `trayId` was
+  // caught by hand; `name`/`dest`/`target`/`total`/`received` — five keys that
+  // belong to the tray-row interface, not this record — survived for months and
+  // even had an assertion claiming bytes that are always undefined.
+  //
+  // This closes it by ROUND-TRIPPING a record the real writer produced.
+  it("round-trips a REAL persisted record, not a hand-built fixture", async () => {
+    const src = mkdtempSync(join(tmpdir(), "cm-rt-"));
+    const writer = await (async () => {
+      vi.resetModules();
+      process.env.COMFYUI_MCP_PROGRESS_DIR = src;
+      return import("../../services/download-progress.js");
+    })();
+
+    writer.persistDownloadJob({
+      id: "rt-1",
+      trayId: "tray-rt",
+      url: "https://example.invalid/m.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "m.safetensors",
+      status: "downloading",
+      started_at: 1_700_000_000_000,
+      via_manager: true,
+      progressId: "prog-rt",
+      resume: { etag: 'W/"abc"' },
+    } as never);
+
+    // Migrate with the module under test (its own dir), reading what the WRITER
+    // actually wrote.
+    // Capture the WRITER's own key set before the source dir goes away — that
+    // set, not a fixture, is the schema this migration must not invent keys on.
+    const writerKeys = new Set(
+      Object.keys(
+        JSON.parse(readFileSync(join(src, readdirSync(src).find((f) => f.includes("rt-1"))!), "utf8")),
+      ),
+    );
+    mod.migrateInFlightJobs(src, dir);
+    const rec = mod.readPersistedDownloadJob("rt-1");
+    rmSync(src, { recursive: true, force: true });
+
+    expect(rec, "a genuinely-written record must migrate").not.toBeNull();
+    // Every field the migration claims to carry, verified against the writer's
+    // own output rather than a fixture that could share my typo.
+    expect(rec!.trayId).toBe("tray-rt");
+    expect(rec!.filename).toBe("m.safetensors");
+    expect(rec!.target_subfolder).toBe("checkpoints");
+    expect(rec!.started_at).toBe(1_700_000_000_000);
+    expect(rec!.via_manager).toBe(true);
+    expect(rec!.url).toBeTruthy();
+    expect(rec!.progressId).toBe("prog-rt");
+    expect(rec!.resume).toEqual({ etag: "W/\"abc\"" });
+
+    // ...and the half that actually closes the class: NO key may appear that the
+    // writer does not emit. Asserting presence alone is what let five dead keys
+    // (`name`/`dest`/`target`/`total`/`received`, from the tray-row interface)
+    // survive for months — restoring them passed every test AND tsc, because
+    // `persistDownloadJob` spreads a variable (no excess-property check) and
+    // tsconfig EXCLUDES src/__tests__, so no fixture is ever typechecked.
+    // Keys the migration legitimately ADDS rather than carries.
+    for (const added of ["status", "error", "updated", "interrupted_by_restart"]) writerKeys.add(added);
+    const unknown = Object.keys(rec!).filter((k) => !writerKeys.has(k));
+    expect(unknown, "migrated record carries keys the writer never emits").toEqual([]);
+  });
+
+  // #1197 — the word "manager" appeared NOWHERE in this file, which is why a
+  // live host-side transfer could be reported stopped for months. A Manager
+  // dispatch is a server-side fetch: the ComfyUI HOST does the work, and a
+  // restart of THIS process does not touch it.
+  describe("a ComfyUI-Manager dispatch (#1197)", () => {
+    const managerJob = {
+      id: "mgr-12gb",
+      status: "downloading",
+      via_manager: true,
+      name: "wan22.safetensors",
+      trayId: "tray-abc",
+      filename: "wan22.safetensors",
+      target_subfolder: "diffusion_models",
+      started_at: 1_700_000_000_000,
+      pid: 4242,
+      updated: Date.now(),
+    };
+
+    it("never tells the caller it stopped, or to re-issue it", () => {
+      // The corrupt-model path: a second dispatch writes another copy to the
+      // same destination (node-management.ts:971-979).
+      writeJob(oldDir, managerJob);
+      mod.migrateInFlightJobs(oldDir, dir);
+      const msg = mod.readPersistedDownloadJob("mgr-12gb")!.error ?? "";
+      expect(msg).toMatch(/STILL RUNNING/);
+      expect(msg).toMatch(/Do NOT re-issue/);
+      expect(msg).toMatch(/CORRUPTS the model/);
+      // The old text said all three of these, and every one was false here.
+      expect(msg).not.toMatch(/the transfer stopped/i);
+      expect(msg).not.toMatch(/will not resume on its own/i);
+      expect(msg).not.toMatch(/Re-issue the download/);
+    });
+
+    it("does not offer a timer or an empty-listing check as proof", () => {
+      // An in-progress file is not listed until it COMPLETES, so "wait N
+      // minutes then decide" fires on a healthy multi-hour transfer.
+      writeJob(oldDir, managerJob);
+      mod.migrateInFlightJobs(oldDir, dir);
+      const msg = mod.readPersistedDownloadJob("mgr-12gb")!.error ?? "";
+      expect(msg).toMatch(/a timer is not a test/);
+      expect(msg).not.toMatch(/couple of minutes|within \d+ ?(?:min|second)/i);
+    });
+
+    it("CARRIES the route flag, so the caller can tell the two apart", () => {
+      // Dropping it is what made the old message render as a plain local
+      // interruption with no way to distinguish them.
+      writeJob(oldDir, managerJob);
+      mod.migrateInFlightJobs(oldDir, dir);
+      expect(mod.readPersistedDownloadJob("mgr-12gb")!.via_manager).toBe(true);
+    });
+
+    it("carries the fields the record needs to stay USABLE", () => {
+      // Without these a caller passing the tray_id they were handed gets
+      // "not found" on a record that exists, the row renders `(tray
+      // undefined)`, and the listing prints `NaN s ago`.
+      writeJob(oldDir, managerJob);
+      mod.migrateInFlightJobs(oldDir, dir);
+      const rec = mod.readPersistedDownloadJob("mgr-12gb")!;
+      // Asserted against the REAL persisted key. The first version of this
+      // test used `tray_id` in both the fixture and the assertion, so it
+      // passed while the migration copied nothing.
+      expect(rec.trayId).toBe("tray-abc");
+      expect(rec.filename).toBe("wan22.safetensors");
+      expect(rec.target_subfolder).toBe("diffusion_models");
+      expect(rec.started_at).toBe(1_700_000_000_000);
+      expect(rec.pid).toBe(4242);
+    });
+
+    it("a LOCAL record still gets its affirmative next step", () => {
+      // The other half must not regress: #1148's original harm was an agent
+      // that would not act, so the local case keeps a clear instruction.
+      writeJob(oldDir, { id: "local-1", status: "downloading", updated: Date.now() });
+      mod.migrateInFlightJobs(oldDir, dir);
+      const msg = mod.readPersistedDownloadJob("local-1")!.error ?? "";
+      expect(msg).toMatch(/picks up a resumable \.partial where one survives, and otherwise restarts/);
+      expect(msg).not.toMatch(/STILL RUNNING/);
+      expect(mod.readPersistedDownloadJob("local-1")!.via_manager).toBe(false);
+    });
+  });
+
   it("carries an IN-FLIGHT record forward as a findable terminal record", () => {
+    // Fields are the ones `persistDownloadJob` ACTUALLY writes. The previous
+    // fixture used `name`/`received`/`total`, which belong to the tray-row
+    // interface (`DownloadProgress`), not to this record — so the migration
+    // "carried" them from a hand-built fixture while copying nothing in
+    // production, and the assertion below claimed bytes that are always
+    // undefined. A fixture is not evidence; only the writer's schema is.
     writeJob(oldDir, {
       id: "53012d3181fd46b6",
       status: "downloading",
-      name: "krea2_turbo_fp8.safetensors",
-      received: 700000000,
-      total: 12010000000,
+      filename: "krea2_turbo_fp8.safetensors",
+      url: "https://example.invalid/krea2.safetensors",
+      started_at: 1_700_000_000_000,
       updated: Date.now(),
     });
 
@@ -382,19 +534,28 @@ describe("migrateInFlightJobs (#1148)", () => {
     expect(found).not.toBeNull();
     expect(found!.status).toBe("error");
     expect(found!.interrupted_by_restart).toBe(true);
-    // The bytes it had, so a reader can see what was lost.
-    expect(found!.received).toBe(700000000);
+    expect(found!.filename).toBe("krea2_turbo_fp8.safetensors");
   });
 
-  it("says the transfer is NOT running and will not resume itself", () => {
-    // The whole harm was an agent waiting forever on the documented contract.
+  it("ends the wait for a LOCAL stream without asserting a death it did not check", () => {
+    // The original harm was an agent waiting forever on the documented
+    // contract, so this must still end the wait and still give a next step.
+    //
+    // But this test used to REQUIRE "NOT running", "will not resume on its own"
+    // and a blanket "Re-issue the download" — claims this code cannot make. It
+    // reads neither the `pid` nor the `owner` it persists, `writerProcessGone()`
+    // exists to answer exactly that, and the cancel path refuses to close a
+    // stale record until that probe returns ESRCH (#761/#858). For a Manager
+    // dispatch those claims were not merely unproven but false, and following
+    // them corrupted the model (#1197) — so the test was holding the defect in
+    // place.
     writeJob(oldDir, { id: "abc", status: "downloading", updated: Date.now() });
     mod.migrateInFlightJobs(oldDir, dir);
     const msg = mod.readPersistedDownloadJob("abc")!.error ?? "";
-    expect(msg).toMatch(/INTERRUPTED/);
-    expect(msg).toMatch(/NOT running/);
-    expect(msg).toMatch(/will not resume on its own/);
-    expect(msg).toMatch(/Re-issue the download/);
+    expect(msg).toMatch(/no longer being WATCHED/);
+    expect(msg).toMatch(/nothing here is writing those bytes/);
+    expect(msg).toMatch(/picks up a resumable \.partial where one survives, and otherwise restarts/);
+    expect(msg).not.toMatch(/will not resume on its own/);
   });
 
   it("does NOT migrate a TERMINAL record — its outcome was already delivered", () => {

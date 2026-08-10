@@ -81,6 +81,14 @@ export interface ExtractDepsResult {
   missingPacks: string[];
   /** class_types that could not be mapped to any pack. */
   unresolved: string[];
+  /**
+   * #1136 — set when the Manager MAPPINGS lookup did not actually answer, which
+   * makes `unresolved` unsafe to read as "not known to ComfyUI-Manager".
+   *
+   * Stronger evidence than the getlist case: there we infer from an empty list,
+   * here we caught a real exception and logged it, then asserted absence anyway.
+   */
+  mappings_unavailable?: string;
 }
 
 export interface InstallDepsResult {
@@ -92,6 +100,13 @@ export interface InstallDepsResult {
   unresolved: string[];
   /** Queue status after processing, if available. */
   queue?: ManagerQueueStatus;
+  /**
+   * #1136 — set when the Manager catalogue came back EMPTY on a non-local
+   * channel, which makes `unresolved` unsafe to read as "these packs do not
+   * exist". Callers rendering `unresolved` must surface this instead of, or
+   * alongside, "not found in ComfyUI-Manager".
+   */
+  catalogue_unavailable?: string;
 }
 
 export interface ManagerQueueStatus {
@@ -355,12 +370,40 @@ export async function extractWorkflowDependencies(
     exact: new Map(),
     patterns: [],
   };
+  // #1136 — this catch used to be the whole story: log at warn, carry on, and
+  // let every unmapped class_type render as "neither installed nor known to
+  // ComfyUI-Manager". We KNOW Manager was never consulted -- we are holding the
+  // exception -- and we asserted absence anyway. A warn line is not a user-
+  // facing answer; the caller reads the tool result.
+  let mappingsUnavailable: string | undefined;
   try {
-    mappingIndex = buildMappingIndex(await deps.fetchManagerMappings());
+    const raw = await deps.fetchManagerMappings();
+    mappingIndex = buildMappingIndex(raw);
+    if (mappingIndex.exact.size === 0 && mappingIndex.patterns.length === 0) {
+      // A 200 carrying nothing is the same situation with no exception to hold:
+      // Manager answered, but with no mappings to match against.
+      // Distinguish "the response was empty" from "we could not read it".
+      // buildMappingIndex skips any entry whose value is not an Array, so a v4
+      // shape difference yields an empty index from a NON-empty body -- and
+      // calling that "came back EMPTY" asserts something about the response we
+      // never checked, which is this issue's own defect class one endpoint over.
+      const empty = !raw || typeof raw !== "object" || Object.keys(raw).length === 0;
+      mappingsUnavailable = empty
+        ? "The ComfyUI-Manager node mappings came back EMPTY, so nothing below was matched against " +
+          "the catalogue. This is NOT evidence that these node types are unknown to Manager."
+        : "The ComfyUI-Manager node mappings response carried no usable entries, so nothing below " +
+          "was matched against the catalogue. This is NOT evidence that these node types are " +
+          "unknown to Manager.";
+    }
   } catch (err) {
     logger.warn("ComfyUI-Manager mappings unavailable; relying on /object_info only", {
       error: err instanceof Error ? err.message : String(err),
     });
+    mappingsUnavailable =
+      `The ComfyUI-Manager node mappings could not be fetched (${err instanceof Error ? err.message : String(err)}), ` +
+      `so nothing below was matched against the catalogue. This is NOT evidence that these node types ` +
+      `are unknown to Manager -- only /object_info was consulted. Manager reaches the registry from the ` +
+      `ComfyUI host, so a blocked or filtered network there looks exactly like "not found" here.`;
   }
 
   const dependencies: NodeDependency[] = [];
@@ -418,6 +461,9 @@ export async function extractWorkflowDependencies(
     requiredPacks: [...requiredPackSet].sort(),
     missingPacks: [...missingPackSet].sort(),
     unresolved: unresolved.sort(),
+    ...(mappingsUnavailable && unresolved.length > 0
+      ? { mappings_unavailable: mappingsUnavailable }
+      : {}),
   };
 }
 
@@ -457,7 +503,7 @@ export async function installWorkflowDependencies(
   return installWorkflowDependenciesForAnalysis(analysis, deps);
 }
 
-async function installWorkflowDependenciesForAnalysis(
+export async function installWorkflowDependenciesForAnalysis(
   analysis: ExtractDepsResult,
   deps: WorkflowDepsDeps,
 ): Promise<InstallDepsResult> {
@@ -465,6 +511,25 @@ async function installWorkflowDependenciesForAnalysis(
   // Match missing packs to concrete Manager list entries for install payloads,
   // capturing the channel the list resolved against.
   const { channel = "default", packs, directInstall = false } = await deps.fetchManagerList();
+  // #1136 — an EMPTY legacy catalogue is not "these packs do not exist".
+  //
+  // Manager's /customnode/getlist returns dict(channel, node_packs) with no
+  // error and no staleness field, and it is called with mode=cache +
+  // skip_update=true, so a user whose registry is blocked or filtered gets a
+  // healthy HTTP 200 carrying an empty cache. We cannot see their DNS failure:
+  // it happened inside ComfyUI's process.
+  //
+  // What we CAN see is that a healthy legacy catalogue carries thousands of
+  // entries, so zero on a non-local channel is a strong local signal. Without
+  // this, every pack falls to `unresolved` and renders as "neither installed
+  // nor known to ComfyUI-Manager" / "Not found in ComfyUI-Manager" -- the
+  // reported harm verbatim, in the surface the reporting user was sent to
+  // three times.
+  //
+  // Deliberately NOT phrased as a diagnosis of their network. We do not know
+  // it is blocked; we know the catalogue is empty and that this is not the
+  // same fact as absence.
+  const catalogueEmpty = !directInstall && channel !== "local" && packs.length === 0;
   const byKey = new Map<string, ManagerNodePack>();
   for (const p of packs) {
     for (const key of [p.id, p.title, p.reference]) {
@@ -543,6 +608,21 @@ async function installWorkflowDependenciesForAnalysis(
     alreadyInstalled: analysis.requiredPacks.filter((p) => !missingSet.has(p)),
     unresolved: [...new Set(unresolved)].sort(),
     queue,
+    // Gated on there being something to mislead about. Round 3 caught a comment
+    // here claiming this gate existed when it did not -- the field's own
+    // docblock says callers rendering `unresolved` must surface it, so setting
+    // it with an empty `unresolved` contradicts the contract.
+    ...(catalogueEmpty && unresolved.length > 0
+      ? {
+          catalogue_unavailable:
+            `The ComfyUI-Manager catalogue came back EMPTY (channel "${channel}"), so nothing below ` +
+            `was actually looked up. A healthy catalogue carries thousands of entries, so this is ` +
+            `almost certainly a catalogue that could not be refreshed -- NOT evidence that these ` +
+            `packs do not exist. Manager fetches the registry from the ComfyUI host itself, so a ` +
+            `blocked or filtered network there looks exactly like an empty result here. Refresh the ` +
+            `Manager list on that host before concluding anything from "not found".`,
+        }
+      : {}),
     ...(panelNotes.length ? { panel_notes: panelNotes } : {}),
   };
 }

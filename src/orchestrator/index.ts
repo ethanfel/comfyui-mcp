@@ -81,6 +81,7 @@ import {
   makePanelToolCtx,
   resolvePinTarget,
   secretSavedReply,
+  RETRY_TOKEN_CMDS,
 } from "./panel-tools.js";
 import {
   optionsAckFrame,
@@ -2488,7 +2489,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // receipt for the ordinary path and must treat every answer as possibly lost;
   // with it, "the model read this" is a fact and only the genuinely unconfirmed
   // ones are held open (#486).
-  // #486 — a `wf:<hash>` tab id names a WORKFLOW, so a second browser tab can
+  // #486 — a `wf:` route tab id names a WORKFLOW, so a second browser tab can
   // take it over. The journal scopes every per-tab debt to whoever is actually
   // holding the key, so the newcomer can neither be told nor settle the
   // departed tab's owed disclosure.
@@ -2500,13 +2501,17 @@ export async function runPanelOrchestrator(): Promise<void> {
   // warning is owed), so it needs a LIFECYCLE end instead: a tab leaving the
   // bridge's connection map surfaces whatever it is still owed and retires it.
   // Journal entries survive — a disconnect is usually a reload.
-  // #486 — a DIFFERENT browser tab taking over a recurring `wf:<hash>` key is a
+  // #486 — a DIFFERENT browser tab taking over a recurring `wf:` route key is a
   // CONVERSATION BOUNDARY, exactly like New chat or a provider switch: the
   // newcomer never asked the previous occupant's questions, so its answers must
   // stop being recoverable and stop being pushed. closeAsks downgrades and
   // unsends; it never deletes, so those answers are still reported.
   bridge.setTabTakenOverListener((tabId) => AskAnswers.closeAsks(tabId));
   bridge.setTabGoneListener((tabId, incarnation) => AskAnswers.retireDebt(tabId, incarnation));
+  // #694 — the bridge retains a late mutation only for commands that can come
+  // back as a retry token, which is the retry-token layer's own set. Installed
+  // here because ui-bridge cannot import panel-tools (panel-tools imports it).
+  bridge.setLateMutationFilter((cmdName) => RETRY_TOKEN_CMDS.has(cmdName));
   bridge.setLateAskReplySink((askId, result, tabId) => {
     if (!AskAnswers.tracks(askId)) return;
     const entry = AskAnswers.record(askId, result, { tabId });

@@ -3675,8 +3675,18 @@ describe("#716 workflow UUID refresh after reconnect/open/re-pin", () => {
     };
 
     const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
-    expect(res.isError).toBeFalsy();
+    // #716 P1's subject — the uuid must NOT be adopted from a same-basename
+    // workflow in another directory — is unchanged and is still the point here.
     expect(refresh).not.toHaveBeenCalled();
+    // #887 — but the OPEN is no longer reported as a success. This assertion was
+    // `toBeFalsy()` and is deliberately inverted: the caller asked for
+    // workflows/a/foo.json, the panel's post-open re-read says workflows/b/foo.json
+    // is active, and answering "opened workflows/a/foo.json" to that is the exact
+    // report that let a reporter Save-As onto the wrong canvas. Suppressing the
+    // refresh protected the FENCE; it never protected the CALLER, who was told the
+    // open landed. Both halves are now covered.
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toContain("workflows/b/foo.json");
   });
 
   it("does not promote an alias request to a reply-resolved path for fast-success refresh (#716 P1)", async () => {
@@ -4693,7 +4703,11 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     // NOT answered — the scheduler question has no answer on file.
     expect(res.isError).toBe(true);
     const text = askText(res);
-    expect(text).toMatch(/not answered in time/i);
+    // #1243 — the wording now states the elapsed ceiling rather than a vague
+    // "in time", and distinguishes a timeout from a delivery failure. The
+    // assertion tracks the INTENT (it is reported as unanswered) rather than the
+    // old phrasing.
+    expect(text).toMatch(/went unanswered for \d+s|not answered within \d+s/i);
     // ...but the sampler answer is REPORTED rather than swallowed, quoted with
     // the question it actually answers and an explicit refusal to let it stand in.
     expect(text).toContain(SAMPLER.question);
@@ -4764,7 +4778,7 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     } as unknown as PanelToolCtx;
     const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
     expect(res.isError).toBe(true);
-    expect(askText(res)).toMatch(/not answered in time/i);
+    expect(askText(res)).toMatch(/went unanswered for \d+s|not answered within \d+s/i);
     expect(askText(res)).not.toMatch(/HOWEVER/);
   });
 
@@ -4998,6 +5012,9 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
      *  a safe fixture: it is the exact reply shape that let another canvas's uuid
      *  overwrite this tab's stamp, so the default must not encode it. */
     workflows?: Array<Record<string, unknown>>;
+    /** Send NO `workflows` field at all — an older build, as distinct from a
+     *  build that sends an empty one (#1292). */
+    omitWorkflows?: boolean;
     activeConfirmed?: boolean;
     listThrows?: string;
     refreshReturns?: boolean;
@@ -5020,6 +5037,14 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
           // Mirror `active` into a corroborating `active:true` entry unless the
           // test is deliberately modelling a stale/mixed/absent list.
           const workflows = opts.workflows ?? [{ ...opts.active, active: true }];
+          if (opts.omitWorkflows) {
+            return {
+              active: opts.active,
+              ...(opts.activeConfirmed === undefined
+                ? {}
+                : { active_confirmed: opts.activeConfirmed }),
+            };
+          }
           return {
             active: opts.active,
             workflows,
@@ -5180,9 +5205,14 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(text).toMatch(/name DIFFERENT workflows \(a stale or mixed reply\)/);
     // The reason it matters, stated: this is what protects the tab.
     expect(text).toMatch(/could have stamped ANOTHER canvas's identity onto this tab/);
-    // The remedy fits the cause — transient, so retry; not "update your panel".
-    expect(text).toMatch(/call this again in a moment/);
+    // The remedy fits the cause — not "update your panel", which is the sibling
+    // failure's fix and unactionable here.
     expect(text).not.toMatch(/must be UPDATED/);
+    // #1292 — and it no longer prescribes the retry the tool JUST PERFORMED. This
+    // stub never settles, so all four reads refused; saying "call this again in a
+    // moment" after that sends the caller to do the least likely thing left.
+    expect(text).toMatch(/ALREADY TRIED: the panel was re-read \d+ times/);
+    expect(text).not.toMatch(/call this again in a moment/);
   });
 
   it("REFUSES to adopt from a reply with no open-workflow list to corroborate against", async () => {
@@ -5196,7 +5226,31 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(refresh).not.toHaveBeenCalled();
     expect(currentStamp()).toBe(STALE);
     expect(res.isError).toBe(true);
+    // #1292 split what this message used to fold. An EMPTY list is a snapshot of
+    // what is open right now — a mid-restore panel reports it before its tabs
+    // come back, so it is worth re-reading. An ABSENT `workflows` field is a
+    // property of the installed build and will never change; that one keeps the
+    // original wording and is NOT re-read. Both still refuse.
+    expect(text).toMatch(/open-workflow list was empty, so nothing corroborates the active record/);
+  });
+
+  it("REFUSES — and does not re-read — a reply that carries NO open-workflow field at all", async () => {
+    // The other half of the split above: rechecking a build that cannot answer
+    // differently would only make the identical error ~2.9s slower (#1292).
+    const { bridge, refresh, tab, currentStamp, sent } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+      workflows: undefined as unknown as Array<Record<string, unknown>>,
+      omitWorkflows: true,
+    });
+    const { res, text } = await setCurrent(bridge, tab);
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(currentStamp()).toBe(STALE);
+    expect(res.isError).toBe(true);
     expect(text).toMatch(/no open-workflow list to corroborate the active record against/);
+    expect(sent.filter((c) => c.cmd === "workflow_list")).toHaveLength(1);
+    expect(text).toMatch(/WHY RETRYING WILL NOT HELP/);
   });
 
   it("REFUSES a MIXED list with two entries marked active, rather than arbitrating", async () => {

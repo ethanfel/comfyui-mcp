@@ -67,7 +67,19 @@ export type RunCorrelation =
   | { status: "matched"; promptId: string }
   /** Carries a prompt id, but no run this session queued has that id. Real, but
    *  NOT ours — it must never satisfy an outstanding `panel_run`. */
-  | { status: "foreign"; promptId: string }
+  /** `priorHistory` separates the two very different facts this used to fold
+   *  (#925). Both are UNDETERMINED and both are refused identically; they are
+   *  not the same claim:
+   *
+   *    false — no run this session queued has ever carried this id. "Not yours"
+   *            is a true statement.
+   *    true  — this id HAS been ours: its ticket was evicted (the map is capped),
+   *            or the completion was already delivered and acked, or the id was
+   *            re-queued and now stands for more than one run. We have forgotten
+   *            WHICH run it was, not WHETHER it was ours — and telling the agent
+   *            it "does NOT match any run you queued" is then a false claim,
+   *            about its own correct result. */
+  | { status: "foreign"; promptId: string; priorHistory?: boolean }
   /** No prompt id at all. Unattributable in principle; reported as such. */
   | { status: "unidentified" };
 
@@ -234,6 +246,11 @@ const MAX_ENTRIES_TOTAL = 96;
 const MAX_DELIVERED_MEMO = 512;
 /** Tabs whose evicted-completion counter is retained. */
 const MAX_DROPPED_KEYS = 64;
+/** Prompt ids whose ticket THIS party opened and which have since been evicted
+ *  (#925). Bounded, and keyed by the same owner the ticket was keyed by, because
+ *  the claim it supports is "you queued this", not "this id has been seen here"
+ *  (codex). Sized to outlive the ticket map several times over. */
+const MAX_FORGOTTEN_OWN_RUNS = 512;
 /** How many times a completion may be CARRIED BY A TURN THAT THEN ENDED without a
  *  provable ack before the journal settles it anyway.
  *
@@ -304,6 +321,9 @@ export class RunCompletionJournalImpl {
    *  exact match is proof of identity on its own and survives a session's tab
    *  id being rebound between the queue and the completion. */
   private tickets = new Map<string, RunTicket>();
+  /** `<owner>|<promptId>` for runs THIS party opened whose ticket was evicted.
+   *  Insertion-ordered and bounded; see MAX_FORGOTTEN_OWN_RUNS (#925). */
+  private forgottenOwnRuns = new Set<string>();
   /** token → entry (insertion-ordered, which is also delivery order). */
   private entries = new Map<string, JournalEntry>();
   /** (tab, run) pairs whose completion was ACKED — a bounded FIFO memo so a
@@ -513,8 +533,28 @@ export class RunCompletionJournalImpl {
     // A REUSED id proves nothing: the panel sends only the id, so a completion
     // for it could belong to either generation. Report it as foreign — real, but
     // UNDETERMINED — rather than claiming it is the run now outstanding.
-    return ticket && ownsRun(ticket, key, conversation) && !ticket.reused
-      ? { status: "matched", promptId: pid }
+    if (ticket && ownsRun(ticket, key, conversation) && !ticket.reused) {
+      return { status: "matched", promptId: pid };
+    }
+    // #925 — SAY WHICH KIND OF UNDETERMINED THIS IS. The refusal is unchanged;
+    // only the claim attached to it. `hasHistoryFor` answers "has this party ever
+    // seen this id" from stores that deliberately outlive the ticket map (the
+    // delivered-memo holds MAX_DELIVERED_MEMO pairs against MAX_TICKETS tickets),
+    // which is exactly the evidence separating "never yours" from "yours, and we
+    // no longer hold the ticket".
+    // OWNERSHIP EVIDENCE ONLY (codex). `hasHistoryFor` answers "has this party
+    // ever SEEN this id" — which is also true of a foreign completion delivered
+    // here once, and of another conversation's reused ticket. Neither means "you
+    // queued it", and the sentence this drives says exactly that. So the evidence
+    // is narrowed to two facts that are about OUR OWN runs:
+    //   • a ticket we opened and later evicted (recorded at the eviction), or
+    //   • a live ticket WE own whose id was re-queued, so it now stands for more
+    //     than one of our runs.
+    const priorHistory =
+      this.forgotOwnRun(pid, key, conversation) ||
+      Boolean(ticket?.reused && ownsRun(ticket, key, conversation));
+    return priorHistory
+      ? { status: "foreign", promptId: pid, priorHistory: true }
       : { status: "foreign", promptId: pid };
   }
 
@@ -792,6 +832,12 @@ export class RunCompletionJournalImpl {
       const payload: CompletionPayload = {
         ...entry.payload,
         run_correlation: entry.correlation.status,
+        // #925 — carried ALONGSIDE the status rather than as a fourth status, so
+        // every existing consumer of `run_correlation` keeps working and only the
+        // wording gains a case.
+        ...(entry.correlation.status === "foreign" && entry.correlation.priorHistory
+          ? { run_correlation_prior: true }
+          : {}),
         ...(entry.correlation.status === "unidentified"
           ? {}
           : { prompt_id: entry.correlation.promptId }),
@@ -1098,6 +1144,7 @@ export class RunCompletionJournalImpl {
     this.dropped.clear();
     this.delivered.clear();
     this.idlessSeen.clear();
+    this.forgottenOwnRuns.clear();
     this.seq = 0;
   }
   /** Evicted completions this tab has not been told about yet — wherever the
@@ -1107,6 +1154,31 @@ export class RunCompletionJournalImpl {
       .filter((e) => e.key === key)
       .reduce((n, e) => n + (e.disclose ?? 0), 0);
     return carried + (this.dropped.get(key) ?? 0);
+  }
+
+  /** The owner a ticket is keyed by, mirroring ownsRun(): the conversation when
+   *  there is one, else the tab. */
+  private ownerOf(ticket: RunTicket): string {
+    return ticket.conversation !== undefined ? ticket.conversation : ticket.tabId;
+  }
+
+  /** #925 — remember that a run WE opened has been forgotten, so a later
+   *  completion for it can be told apart from one this session never queued. */
+  private noteForgottenOwnRun(ticket: RunTicket): void {
+    this.forgottenOwnRuns.add(`${this.ownerOf(ticket)}|${ticket.promptId}`);
+    while (this.forgottenOwnRuns.size > MAX_FORGOTTEN_OWN_RUNS) {
+      const oldest = this.forgottenOwnRuns.values().next().value;
+      if (oldest === undefined) break;
+      this.forgottenOwnRuns.delete(oldest);
+    }
+  }
+
+  /** Did this party open a ticket for `pid` that has since been evicted? */
+  private forgotOwnRun(pid: string, key: string, conversation?: string): boolean {
+    if (conversation !== undefined && this.forgottenOwnRuns.has(`${conversation}|${pid}`)) {
+      return true;
+    }
+    return this.forgottenOwnRuns.has(`${key}|${pid}`);
   }
 
   private trimTickets(): void {
@@ -1127,6 +1199,12 @@ export class RunCompletionJournalImpl {
       // ack() writes it to the delivered memo at the same moment it sets
       // `settled`, and MAX_DELIVERED_MEMO is deliberately far larger than
       // MAX_TICKETS so the memo always outlives the ticket that mirrors it.
+      // #925 — RECORD THAT IT WAS OURS ON THE WAY OUT. This is the last moment
+      // the ownership is still known: once the ticket is gone, a later completion
+      // for the id is indistinguishable from a run this session never queued, and
+      // reporting it as such is the false claim this fixes.
+      const evicted = this.tickets.get(victim);
+      if (evicted) this.noteForgottenOwnRun(evicted);
       this.tickets.delete(victim);
     }
   }

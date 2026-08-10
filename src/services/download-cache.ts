@@ -18,6 +18,8 @@ import { basename, dirname, extname, join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { ModelError, describeFetchFailure } from "../utils/errors.js";
+import { config } from "../config.js";
+import { downloadFailureHint, readErrorBody } from "./download-failure-hint.js";
 import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
@@ -1711,15 +1713,18 @@ async function streamUrlToFile(
   }
 
   if (!res.ok) {
-    // Civitai requires an account token for ALL downloads (401 keyless, 403
-    // for gated/early-access) — a raw status code leaves agents flailing
-    // through retries (live E2E), so name the fix.
-    const civitaiAuthHint =
-      (res.status === 401 || res.status === 403) && /(^|\.)civitai\.com$/i.test(new URL(currentUrl).hostname)
-        ? " — CivitAI requires an API token for downloads. Set CIVITAI_API_TOKEN (panel Settings › “Set CivitAI token…”, or the env var; create one at civitai.com/user/account) and retry. Do NOT retry other model ids — they will all fail the same way until a token is set."
-        : "";
+    // #1300 — A BARE STATUS CODE COST A REPORTER FOUR ATTEMPTS. The host answers
+    // with a body explaining itself and we threw it away, so a missing-token
+    // failure and a wrong-URL failure were the same sentence. Read a bounded,
+    // scrubbed slice of it: it is the only thing that distinguishes them.
+    const body = await readErrorBody(res, currentUrl);
+    const hint = downloadFailureHint({
+      status: res.status,
+      url: currentUrl,
+      hasCivitaiToken: Boolean(config.civitaiApiToken),
+    });
     throw new ModelError(
-      `Download failed: ${res.status} ${res.statusText}${civitaiAuthHint}`,
+      `Download failed: ${res.status} ${res.statusText}${body ? ` — the server said: ${body}` : ""}${hint}`,
       { url: currentUrl === url ? logUrl : redactUrlForLogs(currentUrl), status: res.status },
     );
   }

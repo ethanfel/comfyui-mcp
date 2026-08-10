@@ -136,3 +136,81 @@ describe("#988: it must not UNDER-include — the failure the narrow range had",
     expect(section).toContain("unnumbered local fix");
   });
 });
+
+// #1309 — the subject THIS repo writes on every release was not recognised as a
+// release, so each release-reconcile commit appeared in the NEXT release's entry
+// under "Changed".
+//
+// `isReleaseSubject` matched `release: …` and a bare `0.50.85 (#1302)`. The flow
+// actually produces `chore(release): 0.50.85 (#1302)` — `npm version patch -m
+// "chore(release): %s"`, squash-merged with the PR number appended — which
+// matches neither, falls to the conventional-commit parser, and is read as a
+// `chore` with scope `release`.
+//
+// Nothing else catches it: the de-duplication that makes the deliberately-wide
+// range safe is "filter out PRs the changelog already documents", and a
+// release-reconcile PR is never documented, because it is not a change.
+describe("#1309: a release commit is not a change", () => {
+  /** A release commit touches the files a release touches — package.json and the
+   *  changelog. This matters: an earlier version of this test committed the same
+   *  scratch file as every other commit, and the entry was dropped for an
+   *  unrelated reason, so the test passed with the fix REVERTED. It was verifying
+   *  nothing. Reproduced against the real 0.50.86 history to find that out. */
+  function releaseCommit(subject: string): void {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: subject }));
+    git(["add", "-A"], dir);
+    git(["commit", "-q", "-m", subject], dir);
+  }
+
+  it("does not file the previous release under the next one", () => {
+    commit("fix(a): a real change (#101)");
+    generate("1.0.0");
+    // Exactly what the release flow writes, squash-merged.
+    releaseCommit("chore(release): 1.0.0 (#102)");
+    commit("fix(b): another real change (#103)");
+    const out = generate("1.0.1");
+
+    const section = out.slice(out.indexOf("## [1.0.1]"), out.indexOf("## [1.0.0]"));
+    expect(section, "the new change belongs here").toContain("another real change (#103)");
+    expect(section, "the release commit does not").not.toContain("(#102)");
+    expect(section).not.toContain("1.0.0 (#102)");
+  });
+
+  it("recognises the other two release shapes too — they were already handled", () => {
+    commit("fix(a): a real change (#101)");
+    generate("1.0.0");
+    releaseCommit("release: v1.0.0 — the hand-written form (#102)");
+    releaseCommit("1.0.0 (#104)");
+    commit("fix(b): another real change (#103)");
+    const out = generate("1.0.1");
+
+    const section = out.slice(out.indexOf("## [1.0.1]"), out.indexOf("## [1.0.0]"));
+    expect(section).toContain("another real change (#103)");
+    expect(section).not.toContain("(#102)");
+    expect(section).not.toContain("(#104)");
+  });
+
+  it("an ORDINARY chore is still a change — the skip is scoped, not blanket", () => {
+    // A general `chore:` skip would be the easy fix and the wrong one: an
+    // ordinary chore can be user-facing, and dropping entries silently is the
+    // failure this file exists to prevent. Only the `release` scope is a release.
+    commit("chore: bump the pinned frontend floor (#201)");
+    commit("chore(deps): update a runtime dependency (#202)");
+    const out = generate("1.0.0");
+
+    expect(out).toContain("(#201)");
+    expect(out).toContain("(#202)");
+  });
+
+  it("a breaking release subject is still a release", () => {
+    commit("fix(a): a real change (#101)");
+    generate("1.0.0");
+    releaseCommit("chore(release)!: 2.0.0 (#102)");
+    commit("fix(b): another real change (#103)");
+    const out = generate("2.0.1");
+
+    const section = out.slice(out.indexOf("## [2.0.1]"), out.indexOf("## [1.0.0]"));
+    expect(section).toContain("another real change (#103)");
+    expect(section).not.toContain("(#102)");
+  });
+});

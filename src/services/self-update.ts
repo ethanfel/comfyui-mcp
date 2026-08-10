@@ -32,6 +32,7 @@ import { execFile, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
 /** npm package name — authoritative for the registry lookup and update command. */
@@ -101,7 +102,7 @@ export interface SelfUpdateDeps {
   /** Read a UTF-8 file. May throw; callers guard. */
   readFile: (p: string) => string;
   /** Fetch the latest published version from the npm registry, or undefined. */
-  getLatestVersion: () => Promise<string | undefined>;
+  getLatestVersion: () => Promise<VersionProbe>;
   /**
    * Run an `npm` command (args are fixed constants — no user input).
    * Resolves and NEVER throws. stdout/stderr are captured so a failure can be
@@ -130,17 +131,65 @@ function defaultPackageDir(): string {
   return resolve(here, "..", "..");
 }
 
-async function defaultGetLatestVersion(): Promise<string | undefined> {
+/**
+ * The outcome of one registry probe (#1136).
+ *
+ * Three states, because the previous `string | undefined` had four conditions
+ * collapsing into the same `undefined` and the CONSUMER then asserted the most
+ * specific of them: a 500, a 429, a missing `version` field and a JSON parse
+ * failure were all reported as "npm registry unreachable". That is a verdict we
+ * did not earn -- it sends a user with a rate-limited registry off to debug
+ * their network.
+ *
+ * The line is drawn HERE, not by the message helper: the `try` below wraps only
+ * `await fetch(...)`, so a rejection means no response was received at all,
+ * while `!res.ok` / an unparseable body mean the host demonstrably answered.
+ * `unreachableHostMessage` draws no such boundary -- it always returns a
+ * message, splitting only timeout wording from refusal wording -- so do not
+ * read this type as "the transport proved unreachability". A slow-but-alive
+ * registry that trips our own AbortSignal also lands in `unreachable`; the text
+ * says "did not respond in time", which is honest, and nothing branches on the
+ * state.
+ */
+export type VersionProbe =
+  | { version: string }
+  | { unreachable: string }
+  | { undetermined: string };
+
+async function defaultGetLatestVersion(): Promise<VersionProbe> {
+  const url = `https://registry.npmjs.org/${PACKAGE_NAME}/latest`;
+  let res: Response;
   try {
-    const res = await fetch(`https://registry.npmjs.org/${PACKAGE_NAME}/latest`, {
+    res = await fetch(url, {
       signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
       headers: { accept: "application/json" },
     });
-    if (!res.ok) return undefined;
+  } catch (err) {
+    // `fetch` rejected: no response at all. That is the `unreachable` state --
+    // the three-way split is about whether we got an answer, not about which
+    // transport code we happened to see.
+    return { unreachable: unreachableHostMessage(err, url, "the version check").message };
+  }
+  if (!res.ok) {
+    // The registry ANSWERED. Whatever went wrong, the host was reachable, so
+    // saying otherwise would point the user at their network.
+    return {
+      undetermined: `registry.npmjs.org answered HTTP ${res.status} for the version check (the host IS reachable)`,
+    };
+  }
+  try {
     const json = (await res.json()) as { version?: unknown };
-    return typeof json.version === "string" ? json.version : undefined;
+    if (typeof json.version !== "string" || json.version.trim() === "") {
+      // The trim matters. `if (!latest)` on the old string|undefined shape caught
+      // an empty string; `"version" in probe` does not, so without this a body of
+      // {"version":""} reaches the consumer and renders as up-to-date with to:"".
+      // That is a non-answer read as a reassuring answer -- the exact failure the
+      // undetermined branch exists to prevent, reintroduced by its own type.
+      return { undetermined: "the registry response carried no usable version field" };
+    }
+    return { version: json.version };
   } catch {
-    return undefined;
+    return { undetermined: "the registry response was not valid JSON" };
   }
 }
 
@@ -535,7 +584,8 @@ export async function getLatestPublishedVersion(
   deps: SelfUpdateDeps = defaultDeps,
 ): Promise<string | undefined> {
   try {
-    return await deps.getLatestVersion();
+    const probe = await deps.getLatestVersion();
+    return "version" in probe ? probe.version : undefined;
   } catch {
     return undefined;
   }
@@ -730,15 +780,22 @@ async function checkInner(deps: SelfUpdateDeps): Promise<SelfUpdateResult> {
   }
 
   // 3) Registry probe.
-  const latest = await deps.getLatestVersion();
-  if (!latest) {
+  const probe = await deps.getLatestVersion();
+  if (!("version" in probe)) {
+    // #1136 — say which of the two it was. "unreachable" is a claim about the
+    // user's network and must not be made on the strength of a 500 or a
+    // malformed body; those get "could not determine", which is what we know.
     return {
       action: "unavailable",
       mode: info.mode,
       from: info.currentVersion,
-      note: "npm registry unreachable (offline or timed out).",
+      note:
+        "unreachable" in probe
+          ? probe.unreachable
+          : `Could not determine the latest published version — ${probe.undetermined}. This is NOT evidence that you are up to date.`,
     };
   }
+  const latest = probe.version;
 
   // 4) Up to date (also covers an unreadable current version → don't churn).
   if (!info.currentVersion || !isNewer(latest, info.currentVersion)) {
@@ -823,7 +880,18 @@ export async function selfUpdateStatus(
   } catch {
     info = { mode: "unknown", packageDir: "", currentVersion: undefined, isDevLink: false };
   }
-  const latest = await getLatestPublishedVersion(deps);
+  // #1136 — ask the PROBE. getLatestPublishedVersion flattens the three states
+  // back to string|undefined, which is the fold this change removes; reading it
+  // here made `action:"status"` report a 429 as "npm registry unreachable" AND
+  // discard the composed message on a genuine outage, losing the host name --
+  // the one thing #1136 asks for. `status` is the read-only action an agent
+  // reaches for while diagnosing exactly that situation.
+  const probe = await deps.getLatestVersion().catch(
+    (err: unknown): VersionProbe => ({
+      undetermined: `the version check threw: ${err instanceof Error ? err.message : String(err)}`,
+    }),
+  );
+  const latest = "version" in probe ? probe.version : undefined;
   const autoUpdateDisabled = isAutoUpdateDisabled(deps.env());
   const updateAvailable =
     !!latest && !!info.currentVersion && isNewer(latest, info.currentVersion);
@@ -832,7 +900,10 @@ export async function selfUpdateStatus(
   if (info.isDevLink || info.mode === "linked") {
     note = "Dev install (npm link / checkout) — self-update is disabled; update via git.";
   } else if (!latest) {
-    note = "npm registry unreachable; cannot determine the latest version.";
+    note =
+      "unreachable" in probe
+        ? probe.unreachable
+        : `Could not determine the latest published version — ${"undetermined" in probe ? probe.undetermined : "the registry did not answer usably"}. This is NOT evidence that you are up to date.`;
   } else if (!updateAvailable) {
     note = `Up to date (${info.currentVersion}).`;
   } else if (info.mode === "npx") {
@@ -890,15 +961,27 @@ export async function runSelfUpdate(
     );
   }
 
-  const latest = await getLatestPublishedVersion(deps);
-  if (!latest) {
+  // #1136 — ask the PROBE, not the flattening wrapper. getLatestPublishedVersion
+  // collapses the three states back into string|undefined, which is precisely
+  // the fold this change removes: it would report a 500 or an unparseable body
+  // as a network problem the user is expected to act on.
+  const probe = await deps.getLatestVersion().catch(
+    (err: unknown): VersionProbe => ({
+      undetermined: `the version check threw: ${err instanceof Error ? err.message : String(err)}`,
+    }),
+  );
+  if (!("version" in probe)) {
     return {
       action: "unavailable",
       mode: info.mode,
       from: info.currentVersion,
-      note: "npm registry unreachable (offline or timed out).",
+      note:
+        "unreachable" in probe
+          ? probe.unreachable
+          : `Could not determine the latest published version — ${probe.undetermined}. This is NOT evidence that you are up to date.`,
     };
   }
+  const latest = probe.version;
   if (!info.currentVersion || !isNewer(latest, info.currentVersion)) {
     return { action: "up-to-date", mode: info.mode, from: info.currentVersion, to: latest };
   }
