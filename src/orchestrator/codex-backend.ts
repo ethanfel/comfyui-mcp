@@ -574,6 +574,10 @@ export interface CodexBackendDeps {
   /** Replace the user's configured MCP table with an empty table. This is for
    *  narrow embedded assistants that must not inherit graph/filesystem tools. */
   disableMcp?: boolean;
+  /** Disable Codex's built-in action tools as well as any optional tool
+   *  surfaces. `disableMcp` alone does not remove shell, browser, delegation,
+   *  or other first-party tools. Prompt-only consumers must set both flags. */
+  disableTools?: boolean;
   /** Whether a newly-created app-server thread should be omitted from durable
    *  Codex history. The panel defaults to durable threads; short embedded jobs
    *  can opt into ephemeral ones. */
@@ -634,6 +638,60 @@ export function buildMcpConfigArgs(servers: Record<string, CodexMcpServerSpec>):
 // "workspace-write" or "read-only". Anything else falls back to the default.
 const CODEX_SANDBOX_MODES = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const CODEX_SANDBOX_DEFAULT = "danger-full-access";
+
+// These are current, strict-config-validated Codex feature names. Keep this
+// deny-list intentionally redundant: shell_tool and unified_exec are separate
+// execution implementations, while browser/apps/delegation expose actions that
+// do not travel through MCP. The runtime tool_call tripwire remains a final
+// defence if a future Codex release adds a new built-in surface.
+const CODEX_PROMPT_ONLY_DISABLED_FEATURES = [
+  "apps",
+  "auth_elicitation",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "code_mode",
+  "code_mode_buffered_exec",
+  "code_mode_host",
+  "code_mode_only",
+  "computer_use",
+  "deferred_executor",
+  "deferred_tool_world_state",
+  "enable_mcp_apps",
+  "goals",
+  "hooks",
+  "image_generation",
+  "in_app_browser",
+  "js_repl",
+  "multi_agent",
+  "multi_agent_v2",
+  "network_proxy",
+  "plugin_sharing",
+  "plugins",
+  "request_permissions_tool",
+  "shell_snapshot",
+  "shell_tool",
+  "skill_mcp_dependency_install",
+  "skill_search",
+  "standalone_web_search",
+  "tool_call_mcp_elicitation",
+  "tool_suggest",
+  "unified_exec",
+  "unified_exec_zsh_fork",
+  "workspace_dependencies",
+] as const;
+
+function promptOnlyToolConfigArgs(): string[] {
+  return [
+    "-c",
+    'web_search="disabled"',
+    ...CODEX_PROMPT_ONLY_DISABLED_FEATURES.flatMap((feature) => [
+      "-c",
+      `features.${feature}=false`,
+    ]),
+  ];
+}
+
 export function resolveCodexSandbox(): string {
   const raw = (process.env.COMFYUI_MCP_CODEX_SANDBOX ?? "").trim().toLowerCase();
   return CODEX_SANDBOX_MODES.has(raw) ? raw : CODEX_SANDBOX_DEFAULT;
@@ -855,6 +913,7 @@ export class CodexBackend implements AgentBackend {
         : this.deps.mcpServers
           ? buildMcpConfigArgs(this.deps.mcpServers)
           : []),
+      ...(this.deps.disableTools ? promptOnlyToolConfigArgs() : []),
       "-c",
       `sandbox_mode=${JSON.stringify(this.sandbox)}`,
       "-c",

@@ -1959,8 +1959,8 @@ export class UiBridge {
         const requestedSession = typeof msg.tab_session_id === "string" ? msg.tab_session_id.trim() : "";
         if (
           msg.client_kind !== "prompt_assistant" ||
-          !requestedTab.startsWith("prompt-assistant:") ||
-          !requestedSession ||
+          !/^[A-Za-z0-9._-]{1,128}$/.test(requestedSession) ||
+          requestedTab !== `prompt-assistant:${requestedSession}` ||
           (tabId !== null && tabId !== requestedTab)
         ) {
           logger.warn("[ui-bridge] rejected malformed prompt-assistant hello");
@@ -1991,6 +1991,22 @@ export class UiBridge {
         });
         this.sockIncarnation.set(sock, { tabId, incarnation: requestedSession });
         this.onPanelMessage?.(msg as PanelEvent);
+        // Auxiliary clients use the same bounded missed-frame store as ordinary
+        // tabs, but return before the ordinary hello replay path below. Replay
+        // here so an agent result produced during a reload is not orphaned.
+        const missed = this.missedFrames.get(tabId);
+        if (missed?.length) {
+          this.missedFrames.delete(tabId);
+          for (let index = 0; index < missed.length; index += 1) {
+            try {
+              sock.send(JSON.stringify(missed[index]));
+            } catch {
+              this.missedFrames.set(tabId, missed.slice(index));
+              break;
+            }
+          }
+          logger.debug(`[ui-bridge] replayed ${missed.length} auxiliary frame(s) to ${tabId.slice(0, 24)}`);
+        }
         return;
       }
 
@@ -4361,11 +4377,27 @@ export class UiBridge {
     if (tabId) {
       const auxiliary = this.auxiliaryConns.get(tabId);
       if (auxiliary) {
-        if (auxiliary.sock.readyState !== WebSocket.OPEN) return 0;
+        // `close` is asynchronous: there is a window where the route still
+        // exists but its socket is already CLOSING/CLOSED. Buffer in that
+        // window too; waiting for the close handler to delete the map entry
+        // otherwise loses the exact result a reload is trying to recover.
+        const bufferAuxiliaryFrame = () => {
+          const queued = this.missedFrames.get(tabId) ?? [];
+          queued.push(frame);
+          if (queued.length > UiBridge.MAX_MISSED_FRAMES) {
+            queued.splice(0, queued.length - UiBridge.MAX_MISSED_FRAMES);
+          }
+          this.missedFrames.set(tabId, queued);
+        };
+        if (auxiliary.sock.readyState !== WebSocket.OPEN) {
+          bufferAuxiliaryFrame();
+          return 0;
+        }
         try {
           auxiliary.sock.send(JSON.stringify(frame));
           return 1;
         } catch {
+          bufferAuxiliaryFrame();
           return 0;
         }
       }

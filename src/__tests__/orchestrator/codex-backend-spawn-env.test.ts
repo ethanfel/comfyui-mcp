@@ -103,12 +103,23 @@ describe("CodexBackend spawn env (tool-secret scoping)", () => {
     expect(found, "app-server args must include `-c notify=[]`").toBe(true);
   });
 
-  it("lets a narrow embedded consumer replace MCP config and force a read-only sandbox", async () => {
-    const backend = new CodexBackend({ disableMcp: true, sandbox: "read-only" });
+  it("lets a narrow embedded consumer disable MCP and built-in tools in a read-only sandbox", async () => {
+    const backend = new CodexBackend({ disableMcp: true, disableTools: true, sandbox: "read-only" });
     await backend.prepare().catch(() => {});
     const args = hoisted.spawnArgs[0] ?? [];
     expect(args).toContain("mcp_servers={}");
     expect(args).toContain('sandbox_mode="read-only"');
     expect(args).not.toContain('sandbox_mode="danger-full-access"');
+    expect(args).toContain('web_search="disabled"');
+    expect(args).toContain("features.shell_tool=false");
+    expect(args).toContain("features.unified_exec=false");
+    expect(args).toContain("features.browser_use=false");
+    expect(args).toContain("features.computer_use=false");
+    expect(args).toContain("features.multi_agent=false");
+    expect(args).toContain("features.hooks=false");
+    expect(args).toContain("features.plugins=false");
+    expect(args).toContain("features.code_mode_host=false");
+    expect(args).toContain("features.shell_snapshot=false");
+    expect(args).toContain("features.skill_mcp_dependency_install=false");
   });
 });

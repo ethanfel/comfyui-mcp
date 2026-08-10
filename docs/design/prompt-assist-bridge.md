@@ -73,21 +73,32 @@ Codex uses the existing app-server backend with prompt-lane overrides:
 
 - `sandbox: "read-only"`;
 - `mcp_servers={}` so user and ComfyUI MCP servers are not inherited;
+- an explicit deny configuration for shell, browser, app, delegation, and other
+  built-in Codex tool surfaces;
 - an ephemeral thread;
 - a strict structured-output schema;
 - immediate refusal if a tool call is nevertheless observed.
 
-Hermes uses `hermes --oneshot` with the valid, normally-empty
-`context_engine` toolset, workspace rules disabled, and an ephemeral system
-prompt that prohibits tools and graph/file actions. The user's configured
-model/provider and credentials remain authoritative. A persistent Hermes ACP
+Hermes uses a small adapter around its one-shot runner with a reserved
+zero-match toolset allowlist, workspace rules disabled, and an ephemeral system
+prompt that prohibits tools and graph/file actions. Hermes safe mode is enabled
+directly in the child environment to suppress plugins, MCP servers, and shell
+hooks, while user-config loading stays enabled so the configured custom model,
+base URL, and credentials remain authoritative. The adapter deliberately does
+not select `context_engine`, because an installed context engine can populate
+that nominally empty built-in toolset at runtime. A persistent Hermes ACP
 adapter can replace this runner later without changing the browser protocol.
 
 Recent conversation is stored only in the orchestrator process, bounded to ten
 items, and keyed by client route, conversation id, and provider. It is not
 serialized into the ComfyUI workflow. Provider switching therefore preserves
 separate Codex and Hermes prompt conversations without mixing either into the
-sidebar agent.
+sidebar agent. The editor mirrors this separation in its visible chat history.
+
+An in-flight request is recorded in browser `sessionStorage`. If the editor's
+socket reloads, the auxiliary route replays bounded result frames and the editor
+reconnects with the same incarnation id, restores correlation metadata, and
+stages the recovered result behind the normal source-revision fence.
 
 ## Remote ComfyUI
 

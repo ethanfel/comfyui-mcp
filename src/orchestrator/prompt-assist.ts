@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CodexBackend } from "./codex-backend.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { logger } from "../utils/logger.js";
@@ -85,6 +86,16 @@ const MAX_CONTEXT_FIELD = 60_000;
 const MAX_RESPONSE = 1_000_000;
 const MAX_TRANSCRIPT_ITEMS = 10;
 const MAX_TRANSCRIPT_TEXT = 12_000;
+// Hermes treats an explicit, non-null enabled-toolset list as an allowlist, but
+// its CLI rejects an allowlist containing no known names before agent startup.
+// The prompt-only helper passes this reserved name directly to the agent layer,
+// where it resolves to zero tools. HERMES_SAFE_MODE also suppresses user plugin
+// and MCP registration, so nothing can populate the reserved name at runtime.
+export const HERMES_PROMPT_ONLY_TOOLSET = "__comfyui_prompt_assist_no_tools__";
+
+export function hermesPromptOnlyHelperPath(): string {
+  return fileURLToPath(new URL("../../scripts/hermes-prompt-only.py", import.meta.url));
+}
 
 function boundedString(value: unknown, name: string, maximum: number, required = false): string {
   if (typeof value !== "string") {
@@ -202,6 +213,9 @@ export function parsePromptAssistResult(raw: string, mode: PromptAssistMode = "r
     if (typeof rewrite === "string" && rewrite.length > MAX_PROMPT) {
       throw new Error(`The proposed prompt is too long (maximum ${MAX_PROMPT} characters).`);
     }
+    if (typeof rewrite === "string" && !rewrite.trim()) {
+      throw new Error("The agent returned an empty rewritten_prompt. Use null when no rewrite is proposed.");
+    }
     return {
       message: (message || (typeof rewrite === "string" ? "I prepared a prompt draft." : "I reviewed the prompt.")).slice(0, 8_000),
       rewrittenPrompt: rewrite,
@@ -243,6 +257,7 @@ export class CodexPromptAssistRunner implements PromptAssistRunner {
       systemAppend: PROMPT_ASSIST_SYSTEM,
       sandbox: "read-only",
       disableMcp: true,
+      disableTools: true,
       ephemeral: true,
       outputSchema: PROMPT_ASSIST_OUTPUT_SCHEMA,
     });
@@ -285,13 +300,66 @@ export function resolveHermesBin(home = homedir()): string {
     ?? (process.platform === "win32" ? "hermes.exe" : "hermes");
 }
 
+function findOnPath(command: string): string | undefined {
+  const names = process.platform === "win32" && !command.toLowerCase().endsWith(".exe")
+    ? [`${command}.exe`, command]
+    : [command];
+  for (const directory of (process.env.PATH ?? "").split(delimiter).filter(Boolean)) {
+    for (const name of names) {
+      const candidate = join(directory, name);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/** Locate the Python interpreter belonging to the Hermes console script. */
+export function resolveHermesPython(hermesBin = resolveHermesBin()): string {
+  const located = hermesBin.includes("/") || hermesBin.includes("\\")
+    ? hermesBin
+    : findOnPath(hermesBin);
+  if (!located || !existsSync(located)) throw new Error(`Hermes executable '${hermesBin}' was not found.`);
+
+  const executable = realpathSync(located);
+  const siblingNames = process.platform === "win32"
+    ? ["python.exe", "python3.exe"]
+    : ["python3", "python"];
+  for (const name of siblingNames) {
+    const candidate = join(dirname(executable), name);
+    if (existsSync(candidate)) return candidate;
+  }
+
+  if (process.platform !== "win32") {
+    try {
+      const firstLine = readFileSync(executable, "utf8").split(/\r?\n/, 1)[0] ?? "";
+      const interpreter = firstLine.startsWith("#!") ? firstLine.slice(2).trim().split(/\s+/, 1)[0] : "";
+      if (interpreter && isAbsolute(interpreter) && existsSync(interpreter) && !interpreter.endsWith("/env")) {
+        return interpreter;
+      }
+    } catch {
+      // A native launcher cannot be read as text; fall through to PATH Python.
+    }
+  }
+
+  for (const name of siblingNames) {
+    const candidate = findOnPath(name);
+    if (candidate) return candidate;
+  }
+  throw new Error(`Could not locate the Python environment used by Hermes '${hermesBin}'.`);
+}
+
 export function hermesAvailable(home = homedir()): boolean {
   const resolved = resolveHermesBin(home);
-  if (resolved.includes("/") || resolved.includes("\\")) return existsSync(resolved);
-  const names = process.platform === "win32" ? ["hermes.exe", "hermes.cmd", "hermes"] : ["hermes"];
-  return (process.env.PATH ?? "").split(delimiter).filter(Boolean).some((directory) =>
-    names.some((name) => existsSync(join(directory, name))),
-  );
+  const executableExists = resolved.includes("/") || resolved.includes("\\")
+    ? existsSync(resolved)
+    : Boolean(findOnPath(resolved));
+  if (!executableExists || !existsSync(hermesPromptOnlyHelperPath())) return false;
+  try {
+    resolveHermesPython(resolved);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function terminateChild(child: ChildProcess): void {
@@ -322,8 +390,8 @@ export class HermesPromptAssistRunner implements PromptAssistRunner {
     if (signal.aborted) return Promise.reject(abortError());
     return new Promise<string>((resolve, reject) => {
       const child = spawn(
-        this.opts.bin ?? resolveHermesBin(),
-        ["--oneshot", prompt, "--toolsets", "context_engine", "--ignore-rules"],
+        resolveHermesPython(this.opts.bin ?? resolveHermesBin()),
+        [hermesPromptOnlyHelperPath()],
         {
           cwd: this.opts.cwd,
           windowsHide: true,
@@ -331,8 +399,13 @@ export class HermesPromptAssistRunner implements PromptAssistRunner {
             ...process.env,
             HERMES_EPHEMERAL_SYSTEM_PROMPT: PROMPT_ASSIST_SYSTEM,
             HERMES_IGNORE_RULES: "1",
+            // Setting the environment flag directly suppresses plugins, MCP,
+            // and shell hooks without using `hermes --safe-mode`, whose CLI
+            // handler would also discard the user's custom model/base URL.
+            HERMES_SAFE_MODE: "1",
+            HERMES_IGNORE_USER_CONFIG: "0",
           },
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: ["pipe", "pipe", "pipe"],
         },
       );
       let stdout = "";
@@ -355,6 +428,11 @@ export class HermesPromptAssistRunner implements PromptAssistRunner {
         finish(() => reject(new Error("Hermes prompt assistant timed out.")));
       }, this.opts.timeoutMs ?? 5 * 60_000);
       timeout.unref?.();
+
+      // Keep a potentially large prompt out of argv/process listings and avoid
+      // platform command-line length limits.
+      child.stdin.on("error", () => { /* child startup/exit reports the useful error */ });
+      child.stdin.end(prompt, "utf8");
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
@@ -390,6 +468,7 @@ type PushFrame = (frame: Record<string, unknown>, tabId: string) => void;
 export class PromptAssistManager {
   private readonly transcripts = new Map<string, TranscriptItem[]>();
   private readonly active = new Map<string, { requestId: string; abort: AbortController; task: Promise<void> }>();
+  private readonly pendingTasks = new Set<Promise<void>>();
   private readonly runners: Record<PromptAssistProvider, PromptAssistRunner>;
 
   constructor(opts: {
@@ -495,6 +574,9 @@ export class PromptAssistManager {
       .finally(() => {
         if (this.active.get(tabId)?.requestId === request.requestId) this.active.delete(tabId);
       });
+    this.pendingTasks.add(task);
+    const releasePending = () => { this.pendingTasks.delete(task); };
+    void task.then(releasePending, releasePending);
     this.active.set(tabId, { requestId: request.requestId, abort: controller, task });
   }
 
@@ -506,7 +588,13 @@ export class PromptAssistManager {
   }
 
   reset(tabId: string, conversationId?: string): void {
-    this.cancel(tabId);
+    const active = this.active.get(tabId);
+    if (active) {
+      active.abort.abort();
+      // Reset is a conversation boundary. Release the per-tab turn gate now so
+      // the replacement conversation need not wait for provider teardown.
+      this.active.delete(tabId);
+    }
     const prefix = conversationId
       ? `${tabId}\u0000${conversationId}\u0000`
       : `${tabId}\u0000`;
@@ -517,8 +605,9 @@ export class PromptAssistManager {
 
   async close(): Promise<void> {
     for (const active of this.active.values()) active.abort.abort();
-    await Promise.allSettled([...this.active.values()].map((active) => active.task));
+    await Promise.allSettled([...this.pendingTasks]);
     this.active.clear();
+    this.pendingTasks.clear();
     this.transcripts.clear();
   }
 }

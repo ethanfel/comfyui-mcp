@@ -3,8 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentBackend, AgentEvent, BackendStartOptions } from "../../orchestrator/agent-backend.js";
 import {
   CodexPromptAssistRunner,
+  HERMES_PROMPT_ONLY_TOOLSET,
   PromptAssistManager,
   buildPromptAssistPrompt,
+  hermesPromptOnlyHelperPath,
   normalizePromptAssistRequest,
   parsePromptAssistResult,
   type PromptAssistRunner,
@@ -62,6 +64,20 @@ describe("prompt-assist protocol", () => {
       .toEqual({ message: "The ending is underspecified.", rewrittenPrompt: null });
     expect(parsePromptAssistResult("CAMERA: Track left.", "rewrite"))
       .toEqual({ message: "I prepared a prompt draft.", rewrittenPrompt: "CAMERA: Track left." });
+  });
+
+  it("rejects an empty rewrite instead of allowing the UI to erase the prompt", () => {
+    expect(() => parsePromptAssistResult('{"message":"Done","rewritten_prompt":""}'))
+      .toThrow(/empty rewritten_prompt/);
+  });
+
+  it("ships a Hermes helper that gates the agent to a reserved zero-tool allowlist", () => {
+    const helper = readFileSync(hermesPromptOnlyHelperPath(), "utf8");
+    expect(helper).toContain(HERMES_PROMPT_ONLY_TOOLSET);
+    expect(helper).toContain('os.environ["HERMES_SAFE_MODE"] = "1"');
+    expect(helper).toContain("return [PROMPT_ONLY_TOOLSET], None");
+    expect(helper).toContain("toolsets=PROMPT_ONLY_TOOLSET");
+    expect(helper).not.toContain('toolsets="context_engine"');
   });
 });
 
@@ -146,6 +162,44 @@ describe("PromptAssistManager", () => {
     expect(prompts[2]).not.toContain("remembered turn");
     await manager.close();
   });
+
+  it("releases the turn gate immediately when an active conversation is reset", async () => {
+    let calls = 0;
+    const runner: PromptAssistRunner = {
+      run: vi.fn((_prompt, signal) => {
+        calls += 1;
+        if (calls > 1) {
+          return Promise.resolve('{"message":"fresh","rewritten_prompt":"Fresh draft"}');
+        }
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            queueMicrotask(() => {
+              const error = new Error("cancelled");
+              error.name = "AbortError";
+              reject(error);
+            });
+          }, { once: true });
+        });
+      }),
+    };
+    const manager = new PromptAssistManager({ cwd: "/tmp", runners: { codex: runner, hermes: runner } });
+    const frames: Record<string, unknown>[] = [];
+    const push = (frame: Record<string, unknown>) => frames.push(frame);
+    manager.start("prompt-assistant:tab-new-chat", request({ request_id: "old-request" }), push);
+    manager.reset("prompt-assistant:tab-new-chat", "conversation-1");
+    manager.start("prompt-assistant:tab-new-chat", request({ request_id: "fresh-request" }), push);
+
+    await vi.waitFor(() => expect(frames).toContainEqual(expect.objectContaining({
+      type: "prompt_assist_result",
+      request_id: "fresh-request",
+      rewritten_prompt: "Fresh draft",
+    })));
+    expect(frames).not.toContainEqual(expect.objectContaining({
+      type: "prompt_assist_error",
+      request_id: "fresh-request",
+    }));
+    await manager.close();
+  });
 });
 
 describe("Codex prompt-assist isolation", () => {
@@ -185,6 +239,7 @@ describe("Codex prompt-assist isolation", () => {
       model: "gpt-test",
       sandbox: "read-only",
       disableMcp: true,
+      disableTools: true,
       ephemeral: true,
     });
     expect(deps?.outputSchema).toBeTruthy();

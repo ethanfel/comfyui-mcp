@@ -390,6 +390,104 @@ describe("UiBridge auxiliary prompt-assistant route", () => {
     expect(bridge.tabs()).toEqual([]);
     expect(bridge.push({ type: "prompt_assist_ready" }, "prompt-assistant:missing-kind")).toBe(0);
   });
+
+  it("requires the auxiliary route to be bound to its session incarnation", async () => {
+    const malformed = await connectPanel();
+    const closed = new Promise<void>((resolve) => malformed.once("close", () => resolve()));
+    malformed.send(JSON.stringify({
+      type: "hello",
+      tab_id: "prompt-assistant:someone-else",
+      tab_session_id: "this-client",
+      headless: true,
+      client_kind: "prompt_assistant",
+    }));
+    await closed;
+    expect(bridge.push({ type: "prompt_assist_ready" }, "prompt-assistant:someone-else")).toBe(0);
+  });
+
+  it("replays a prompt result produced while the auxiliary client reloads", async () => {
+    const route = "prompt-assistant:reload-client";
+    const incarnation = "reload-client";
+    const first = await connectPanel();
+    first.send(JSON.stringify({
+      type: "hello",
+      tab_id: route,
+      tab_session_id: incarnation,
+      headless: true,
+      client_kind: "prompt_assistant",
+    }));
+    await vi.waitFor(() => expect(bridge.push({ type: "prompt_assist_progress" }, route)).toBe(1));
+
+    await new Promise<void>((resolve) => {
+      first.once("close", () => resolve());
+      first.close();
+    });
+    expect(bridge.push({
+      type: "prompt_assist_result",
+      request_id: "request-during-reload",
+      rewritten_prompt: "Recovered draft",
+    }, route)).toBe(0);
+
+    const received: Array<Record<string, unknown>> = [];
+    const second = await connectPanel();
+    second.on("message", (buf) => received.push(JSON.parse(buf.toString())));
+    second.send(JSON.stringify({
+      type: "hello",
+      tab_id: route,
+      tab_session_id: incarnation,
+      headless: true,
+      client_kind: "prompt_assistant",
+    }));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "prompt_assist_result",
+      request_id: "request-during-reload",
+      rewritten_prompt: "Recovered draft",
+    })));
+    second.close();
+  });
+
+  it("buffers an auxiliary result in the socket-closing race window", async () => {
+    const route = "prompt-assistant:closing-client";
+    const incarnation = "closing-client";
+    const first = await connectPanel();
+    first.send(JSON.stringify({
+      type: "hello",
+      tab_id: route,
+      tab_session_id: incarnation,
+      headless: true,
+      client_kind: "prompt_assistant",
+    }));
+    await vi.waitFor(() => expect(bridge.push({ type: "prompt_assist_progress" }, route)).toBe(1));
+
+    const serverSocket = (bridge as unknown as {
+      auxiliaryConns: Map<string, { sock: { close(): void } }>;
+    }).auxiliaryConns.get(route)?.sock;
+    expect(serverSocket).toBeDefined();
+    serverSocket!.close();
+    expect(bridge.push({
+      type: "prompt_assist_result",
+      request_id: "request-while-closing",
+      rewritten_prompt: "Recovered from closing window",
+    }, route)).toBe(0);
+
+    const received: Array<Record<string, unknown>> = [];
+    const second = await connectPanel();
+    second.on("message", (buf) => received.push(JSON.parse(buf.toString())));
+    second.send(JSON.stringify({
+      type: "hello",
+      tab_id: route,
+      tab_session_id: incarnation,
+      headless: true,
+      client_kind: "prompt_assistant",
+    }));
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: "prompt_assist_result",
+      request_id: "request-while-closing",
+      rewritten_prompt: "Recovered from closing window",
+    })));
+    first.close();
+    second.close();
+  });
 });
 
 describe("UiBridge (mailbox — offline render delivery)", () => {
