@@ -1029,7 +1029,9 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // A different browser tab taking over a recurring key is a conversation
     // boundary too — the ENTRIES are tab-keyed, so the newcomer must be shut out
     // of them at the hello, not merely kept from the debt.
-    expect(src).toMatch(/setTabTakenOverListener\(\(tabId\) => AskAnswers\.closeAsks\(tabId\)\)/);
+    const takeoverAt = src.indexOf("setTabTakenOverListener((tabId) =>");
+    expect(takeoverAt, "tab-takeover listener not found").toBeGreaterThan(-1);
+    expect(src.slice(takeoverAt, takeoverAt + 400)).toContain("AskAnswers.closeAsks(tabId)");
     expect(src).toContain("AskAnswers.setIncarnationResolver(");
     // The ack must carry WHO is acking, or a switched provider can certify the
     // previous conversation's answer.

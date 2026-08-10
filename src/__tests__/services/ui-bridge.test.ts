@@ -327,6 +327,71 @@ describe("UiBridge (on-demand pairing listener — addListener)", () => {
   });
 });
 
+describe("UiBridge auxiliary prompt-assistant route", () => {
+  it("routes explicit replies without becoming a panel/headless tab", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    bridge.onPanelMessage = (event) => events.push(event as unknown as Record<string, unknown>);
+    const received: Array<Record<string, unknown>> = [];
+    const assistant = await connectPanel();
+    assistant.on("message", (buf) => received.push(JSON.parse(buf.toString())));
+    assistant.send(JSON.stringify({
+      type: "hello",
+      tab_id: "prompt-assistant:test-client",
+      tab_session_id: "test-client",
+      title: "H3 Prompt Assistant",
+      headless: true,
+      client_kind: "prompt_assistant",
+    }));
+
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+      type: "hello",
+      tab_id: "prompt-assistant:test-client",
+      client_kind: "prompt_assistant",
+    })));
+    expect(bridge.connected()).toBe(false);
+    expect(bridge.tabs()).toEqual([]);
+    expect(bridge.hasLiveHeadlessClient()).toBe(false);
+    expect(bridge.push({ type: "prompt_assist_ready" }, "prompt-assistant:test-client")).toBe(1);
+    await vi.waitFor(() => expect(received).toContainEqual({ type: "prompt_assist_ready" }));
+
+    const panelReceived: Array<Record<string, unknown>> = [];
+    const panel = await connectPanel("real-panel");
+    panel.on("message", (buf) => panelReceived.push(JSON.parse(buf.toString())));
+    await vi.waitFor(() => expect(bridge.tabs().map((tab) => tab.tab_id)).toEqual(["real-panel"]));
+    bridge.push({ type: "say", text: "panel-only broadcast" });
+    await vi.waitFor(() => expect(panelReceived).toContainEqual({ type: "say", text: "panel-only broadcast" }));
+    expect(received).not.toContainEqual({ type: "say", text: "panel-only broadcast" });
+
+    assistant.send(JSON.stringify({
+      type: "prompt_assist_request",
+      tab_id: "prompt-assistant:forged-other-client",
+      request_id: "request-1",
+    }));
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+      type: "prompt_assist_request",
+      tab_id: "prompt-assistant:test-client",
+      request_id: "request-1",
+    })));
+    assistant.close();
+    panel.close();
+  });
+
+  it("reserves the prompt-assistant route prefix for validated auxiliary hellos", async () => {
+    const malformed = await connectPanel();
+    const closed = new Promise<void>((resolve) => malformed.once("close", () => resolve()));
+    malformed.send(JSON.stringify({
+      type: "hello",
+      tab_id: "prompt-assistant:missing-kind",
+      tab_session_id: "missing-kind",
+      headless: true,
+    }));
+    await closed;
+    expect(bridge.connected()).toBe(false);
+    expect(bridge.tabs()).toEqual([]);
+    expect(bridge.push({ type: "prompt_assist_ready" }, "prompt-assistant:missing-kind")).toBe(0);
+  });
+});
+
 describe("UiBridge (mailbox — offline render delivery)", () => {
   it("buffers show_media for an offline tab and flushes it on reconnect", async () => {
     // No tab connected. A finished-render delivery to a specific (offline) tab is

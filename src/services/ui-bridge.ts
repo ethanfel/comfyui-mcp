@@ -234,6 +234,13 @@ interface Conn {
   local: boolean;
 }
 
+interface AuxiliaryConn {
+  sock: BridgeSocket;
+  tabId: string;
+  clientKind: "prompt_assistant";
+  incarnationId: string;
+}
+
 /** Panel build that first implements the full graph_* / ui_* bridge command set.
  *  Used as the DEFAULT minimum for any bridge command not listed in
  *  BRIDGE_CMD_MIN_PANEL_VERSION below. Individual commands shipped EARLIER than
@@ -1358,6 +1365,11 @@ export class UiBridge {
    *  listener stays token-less so the local browser panel is unaffected. */
   private readonly extraServers: WebSocketServer[] = [];
   private conns = new Map<string, Conn>(); // tabId -> connection (canvas-owning primary)
+  /** Narrow non-panel clients that reuse the authenticated WebSocket transport
+   *  without entering canvas/headless tab routing. They can receive an explicit
+   *  push(tabId), but never affect connected(), tabs(), graph targeting,
+   *  mirroring, shared-session replay, or restart/headless decisions. */
+  private auxiliaryConns = new Map<string, AuxiliaryConn>();
   /**
    * EVERY accepted socket, from the moment it is accepted — including the ones
    * still ANONYMOUS because no `hello` has named a tab id yet.
@@ -1911,6 +1923,9 @@ export class UiBridge {
     sock.on("close", () => this.sockets.delete(sock));
     // The connection is anonymous until its hello frame names a tab id.
     let tabId: string | null = null;
+    // Auxiliary clients are pinned on their first hello, just like headless
+    // state, and may never turn the same socket into a normal panel connection.
+    let auxiliaryClientKind: "prompt_assistant" | null = null;
     // A socket's KIND (canvas-owning panel vs headless viewer) is pinned on its
     // FIRST hello and is authoritative thereafter. The `headless` flag on later
     // hellos is client-controlled, so a headless viewer could otherwise flip it to
@@ -1929,6 +1944,76 @@ export class UiBridge {
         msg = JSON.parse(raw) as Record<string, unknown>;
       } catch {
         logger.warn("[ui-bridge] dropping malformed frame from panel");
+        return;
+      }
+
+      // Product-embedded text assistants share only the bridge transport. Keep
+      // them out of `conns`: putting one there would make an editor count as a
+      // ComfyUI tab, interfere with default graph routing, receive shared agent
+      // output, and make restart logic think a headless viewer is present.
+      if (
+        msg.type === "hello" &&
+        (msg.client_kind === "prompt_assistant" || auxiliaryClientKind !== null)
+      ) {
+        const requestedTab = typeof msg.tab_id === "string" ? msg.tab_id : "";
+        const requestedSession = typeof msg.tab_session_id === "string" ? msg.tab_session_id.trim() : "";
+        if (
+          msg.client_kind !== "prompt_assistant" ||
+          !requestedTab.startsWith("prompt-assistant:") ||
+          !requestedSession ||
+          (tabId !== null && tabId !== requestedTab)
+        ) {
+          logger.warn("[ui-bridge] rejected malformed prompt-assistant hello");
+          try { sock.close(); } catch { /* already gone */ }
+          return;
+        }
+        auxiliaryClientKind = "prompt_assistant";
+        tabId = requestedTab;
+        const existing = this.auxiliaryConns.get(tabId);
+        if (existing && existing.sock !== sock) {
+          if (existing.incarnationId !== requestedSession) {
+            try {
+              this.onTabTakenOver?.(tabId, existing.incarnationId);
+            } catch (err) {
+              logger.warn(
+                `[ui-bridge] auxiliary takeover listener threw for ${tabId.slice(0, 24)}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+          try { existing.sock.close(); } catch { /* already gone */ }
+        }
+        this.cancelTabGone(tabId, requestedSession);
+        this.auxiliaryConns.set(tabId, {
+          sock,
+          tabId,
+          clientKind: "prompt_assistant",
+          incarnationId: requestedSession,
+        });
+        this.sockIncarnation.set(sock, { tabId, incarnation: requestedSession });
+        this.onPanelMessage?.(msg as PanelEvent);
+        return;
+      }
+
+      // Stamp every later auxiliary frame with its socket-bound route. A client
+      // cannot address another editor by forging tab_id in a request.
+      if (auxiliaryClientKind !== null) {
+        if (typeof msg.type === "string" && tabId) {
+          msg.tab_id = tabId;
+          this.onPanelMessage?.(msg as PanelEvent);
+        }
+        return;
+      }
+
+      // The prefix is reserved for the auxiliary route above. Without this
+      // guard, a malformed ordinary hello could occupy the same string in
+      // `conns`, after which explicit push routing would have two owners.
+      if (
+        msg.type === "hello" &&
+        typeof msg.tab_id === "string" &&
+        msg.tab_id.startsWith("prompt-assistant:")
+      ) {
+        logger.warn("[ui-bridge] rejected prompt-assistant route without a valid auxiliary hello");
+        try { sock.close(); } catch { /* already gone */ }
         return;
       }
 
@@ -2408,6 +2493,20 @@ export class UiBridge {
     });
 
     sock.on("close", () => {
+      if (auxiliaryClientKind !== null) {
+        const departing = this.sockIncarnation.get(sock);
+        this.sockIncarnation.delete(sock);
+        if (tabId && this.auxiliaryConns.get(tabId)?.sock === sock) {
+          this.auxiliaryConns.delete(tabId);
+        }
+        if (
+          departing &&
+          this.auxiliaryConns.get(departing.tabId)?.incarnationId !== departing.incarnation
+        ) {
+          this.armTabGone(departing.tabId, departing.incarnation);
+        }
+        return;
+      }
       // Prune this socket's migration aliases — they can only ever route to
       // this socket (socket-scoped), so they're inert once it dies. Keeps the
       // map bounded over long-lived orchestrators (codex review).
@@ -3200,7 +3299,10 @@ export class UiBridge {
     this.tabGoneTimers.delete(slot);
     // Re-check on the INCARNATION, not the key: something else may now hold this
     // recurring id, and a stranger holding the key is not this tab coming back.
-    if (this.conns.get(tabId)?.incarnationId === incarnation) return;
+    if (
+      this.conns.get(tabId)?.incarnationId === incarnation ||
+      this.auxiliaryConns.get(tabId)?.incarnationId === incarnation
+    ) return;
     try {
       this.onTabGone?.(tabId, incarnation);
     } catch (err) {
@@ -4256,6 +4358,18 @@ export class UiBridge {
   }
 
   push(frame: Record<string, unknown>, tabId?: string): number {
+    if (tabId) {
+      const auxiliary = this.auxiliaryConns.get(tabId);
+      if (auxiliary) {
+        if (auxiliary.sock.readyState !== WebSocket.OPEN) return 0;
+        try {
+          auxiliary.sock.send(JSON.stringify(frame));
+          return 1;
+        } catch {
+          return 0;
+        }
+      }
+    }
     let sent = 0;
     let targets: Conn[];
     if (tabId) {

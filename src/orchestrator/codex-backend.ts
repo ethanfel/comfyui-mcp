@@ -567,6 +567,19 @@ export interface CodexBackendDeps {
    * clearly-marked system/context preamble; later turns send plain text.
    */
   systemAppend?: string;
+  /** Override the panel-wide Codex sandbox posture for this backend instance.
+   *  Prompt-only consumers use read-only even when the autonomous panel agent
+   *  is configured for danger-full-access. */
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  /** Replace the user's configured MCP table with an empty table. This is for
+   *  narrow embedded assistants that must not inherit graph/filesystem tools. */
+  disableMcp?: boolean;
+  /** Whether a newly-created app-server thread should be omitted from durable
+   *  Codex history. The panel defaults to durable threads; short embedded jobs
+   *  can opt into ephemeral ones. */
+  ephemeral?: boolean;
+  /** Optional structured-output contract forwarded to turn/start. */
+  outputSchema?: Record<string, unknown> | null;
 }
 
 /**
@@ -654,7 +667,7 @@ export class CodexBackend implements AgentBackend {
   /** Sandbox posture for the app-server + every thread (COMFYUI_MCP_CODEX_SANDBOX,
    *  default danger-full-access — mirrors Claude's bypassPermissions). Read once at
    *  construction so it's stable for this backend instance. */
-  private readonly sandbox: string = resolveCodexSandbox();
+  private readonly sandbox: string;
   /** The live thread + turn ids — used for `turn/interrupt`. */
   private threadId: string | null = null;
   private turnId: string | null = null;
@@ -679,6 +692,7 @@ export class CodexBackend implements AgentBackend {
   constructor(deps: CodexBackendDeps = {}) {
     this.deps = deps;
     this.model = deps.model;
+    this.sandbox = deps.sandbox ?? resolveCodexSandbox();
   }
 
   private beginClientClose(client: AppServerClient, reason: string): Promise<void> {
@@ -836,7 +850,11 @@ export class CodexBackend implements AgentBackend {
     // consistent and covers any codex path that reads the config). Values are TOML
     // string literals via JSON.stringify, matching buildMcpConfigArgs.
     const extraArgs = [
-      ...(this.deps.mcpServers ? buildMcpConfigArgs(this.deps.mcpServers) : []),
+      ...(this.deps.disableMcp
+        ? ["-c", "mcp_servers={}"]
+        : this.deps.mcpServers
+          ? buildMcpConfigArgs(this.deps.mcpServers)
+          : []),
       "-c",
       `sandbox_mode=${JSON.stringify(this.sandbox)}`,
       "-c",
@@ -962,7 +980,7 @@ export class CodexBackend implements AgentBackend {
         model: this.resolveTurnModel(),
         approvalPolicy: "never",
         sandbox: this.sandbox,
-        ephemeral: false,
+        ephemeral: this.deps.ephemeral ?? false,
       });
       this.threadId = res.thread.id;
       threadModel = res.model;
@@ -1323,7 +1341,7 @@ export class CodexBackend implements AgentBackend {
             this.effort ?? undefined,
             this.liveCatalog?.find((m) => m.id === turnModel)?.supportedEffortLevels,
           ),
-          outputSchema: null,
+          outputSchema: this.deps.outputSchema ?? null,
         })
         .then((res) => {
           // Set the active turn id, flush the buffer (replaying only this turn's

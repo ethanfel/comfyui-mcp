@@ -108,6 +108,7 @@ import {
   type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
+import { PromptAssistManager } from "./prompt-assist.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
 import { AntigravityBackend } from "./antigravity-backend.js";
 import { PiBackend } from "./pi-backend.js";
@@ -2455,6 +2456,14 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Let refreshEnvCapabilities() feed a freshly-gathered env block into agents
   // spawned after a ComfyUI restart/reconnect.
   liveManager = manager;
+  // A deliberately separate lane for editor-embedded prompt help. It never
+  // enters PanelAgentManager's orchestrator-scoped sidebar conversation and its
+  // runners receive no ComfyUI/panel MCP servers.
+  const promptAssist = new PromptAssistManager({
+    cwd: comfyuiPath ?? process.cwd(),
+    ...(codexModel ? { codexModel } : {}),
+  });
+  const promptAssistTabs = new Set<string>();
 
   // #468 — let the journal pull a still-unread completion back off an agent's
   // queue when it has to WEAKEN that completion's correlation (a reused prompt
@@ -2506,8 +2515,14 @@ export async function runPanelOrchestrator(): Promise<void> {
   // newcomer never asked the previous occupant's questions, so its answers must
   // stop being recoverable and stop being pushed. closeAsks downgrades and
   // unsends; it never deletes, so those answers are still reported.
-  bridge.setTabTakenOverListener((tabId) => AskAnswers.closeAsks(tabId));
-  bridge.setTabGoneListener((tabId, incarnation) => AskAnswers.retireDebt(tabId, incarnation));
+  bridge.setTabTakenOverListener((tabId) => {
+    AskAnswers.closeAsks(tabId);
+    if (promptAssistTabs.delete(tabId)) promptAssist.reset(tabId);
+  });
+  bridge.setTabGoneListener((tabId, incarnation) => {
+    AskAnswers.retireDebt(tabId, incarnation);
+    if (promptAssistTabs.delete(tabId)) promptAssist.reset(tabId);
+  });
   // #694 — the bridge retains a late mutation only for commands that can come
   // back as a retry token, which is the retry-token layer's own set. Installed
   // here because ui-bridge cannot import panel-tools (panel-tools imports it).
@@ -3329,6 +3344,49 @@ export async function runPanelOrchestrator(): Promise<void> {
   }
 
   bridge.onPanelMessage = (event) => {
+    // Prompt editor companion clients share the authenticated bridge transport,
+    // but not the sidebar's agent, retargeting, graph tools, or transcript.
+    // Handle their hello before the normal panel hello can mutate any of that
+    // state. UiBridge has already registered this socket's unique route id.
+    if (
+      event.type === "hello" &&
+      event.tab_id &&
+      (event as { client_kind?: unknown }).client_kind === "prompt_assistant"
+    ) {
+      promptAssistTabs.add(event.tab_id);
+      bridge.push(promptAssist.readyFrame(), event.tab_id);
+      return;
+    }
+    if (event.type.startsWith("prompt_assist_") && event.tab_id) {
+      const tabId = event.tab_id;
+      if (!promptAssistTabs.has(tabId)) {
+        bridge.push({
+          type: "prompt_assist_error",
+          request_id: typeof event.request_id === "string" ? event.request_id : undefined,
+          error: "Prompt-assist client is not registered; reconnect the editor assistant.",
+        }, tabId);
+        return;
+      }
+      if (event.type === "prompt_assist_request") {
+        promptAssist.start(tabId, event, (frame, target) => bridge.push(frame, target));
+      } else if (event.type === "prompt_assist_cancel") {
+        const requestId = typeof event.request_id === "string" ? event.request_id : undefined;
+        bridge.push({
+          type: "prompt_assist_cancel_ack",
+          request_id: requestId,
+          cancelled: promptAssist.cancel(tabId, requestId),
+        }, tabId);
+      } else if (event.type === "prompt_assist_reset") {
+        const conversationId = typeof event.conversation_id === "string" ? event.conversation_id : undefined;
+        promptAssist.reset(tabId, conversationId);
+        bridge.push({ type: "prompt_assist_reset_ack", conversation_id: conversationId }, tabId);
+      } else if (event.type === "prompt_assist_close") {
+        promptAssist.reset(tabId);
+        promptAssistTabs.delete(tabId);
+      }
+      return;
+    }
+
     // Connect ack: the instant a panel tab connects, the orchestrator announces
     // itself so "connected" means "a real agent is attending" — not merely "a
     // socket is open." A bare/undriven bridge stays silent, so the panel can
@@ -5876,6 +5934,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     unsubscribeSecrets();
     unsubscribeAgentSecrets();
+    await promptAssist.close();
     await manager.stopAll();
     // Dispose the readiness-probe backends (kills each Codex/Gemini CLI child).
     for (const pb of probeBackends.values()) {

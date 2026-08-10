@@ -102,4 +102,13 @@ describe("CodexBackend spawn env (tool-secret scoping)", () => {
     }
     expect(found, "app-server args must include `-c notify=[]`").toBe(true);
   });
+
+  it("lets a narrow embedded consumer replace MCP config and force a read-only sandbox", async () => {
+    const backend = new CodexBackend({ disableMcp: true, sandbox: "read-only" });
+    await backend.prepare().catch(() => {});
+    const args = hoisted.spawnArgs[0] ?? [];
+    expect(args).toContain("mcp_servers={}");
+    expect(args).toContain('sandbox_mode="read-only"');
+    expect(args).not.toContain('sandbox_mode="danger-full-access"');
+  });
 });
