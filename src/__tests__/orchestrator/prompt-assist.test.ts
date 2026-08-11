@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentBackend, AgentEvent, BackendStartOptions } from "../../orchestrator/agent-backend.js";
+import { toolNameOf } from "../../orchestrator/codex-backend.js";
 import {
   CodexPromptAssistRunner,
   HERMES_PROMPT_ONLY_TOOLSET,
@@ -203,6 +204,12 @@ describe("PromptAssistManager", () => {
 });
 
 describe("Codex prompt-assist isolation", () => {
+  it("does not mistake the app-server userMessage input event for a tool call", () => {
+    expect(toolNameOf({ type: "userMessage", id: "input-1" })).toBeNull();
+    expect(toolNameOf({ type: "agentMessage", id: "output-1" })).toBeNull();
+    expect(toolNameOf({ type: "commandExecution", command: "pwd" })).toBe("pwd");
+  });
+
   it("requests an ephemeral read-only no-MCP structured turn", async () => {
     let deps: Record<string, unknown> | undefined;
     const backend: AgentBackend = {

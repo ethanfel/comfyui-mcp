@@ -519,7 +519,11 @@ export function toolNameOf(item: Record<string, unknown> | undefined): string | 
   const type = typeof item.type === "string" ? item.type : undefined;
   // These item types are text/reasoning, not tools — they're surfaced via the
   // assistant_delta / assistant commit paths, so don't double-report them.
-  if (type === "agentMessage" || type === "reasoning") return null;
+  // `userMessage` is the app-server's echo/record of the input we supplied,
+  // not an action performed by the model. Treat it like the assistant text and
+  // reasoning item types so prompt-only callers do not trip their tool guard on
+  // every ordinary turn.
+  if (type === "userMessage" || type === "agentMessage" || type === "reasoning") return null;
   // MCP tool calls carry a tool name (and often a server) — prefer the most
   // specific identifier available, then fall back to the item type.
   const pick = (...keys: string[]): string | undefined => {
