@@ -108,7 +108,12 @@ import {
   type SecretSaveReceipt,
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
-import { PromptAssistManager } from "./prompt-assist.js";
+import {
+  ClaudePromptAssistRunner,
+  GeminiPromptAssistRunner,
+  PromptAssistManager,
+  hermesAvailable,
+} from "./prompt-assist.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
 import { AntigravityBackend } from "./antigravity-backend.js";
 import { PiBackend } from "./pi-backend.js";
@@ -2462,6 +2467,43 @@ export async function runPanelOrchestrator(): Promise<void> {
   const promptAssist = new PromptAssistManager({
     cwd: comfyuiPath ?? process.cwd(),
     ...(codexModel ? { codexModel } : {}),
+    runners: {
+      claude: new ClaudePromptAssistRunner({ model }),
+      gemini: new GeminiPromptAssistRunner({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: geminiModel,
+      }),
+    },
+    providers: () => {
+      const readiness = new Map(
+        allBackendReadiness(KNOWN_BACKENDS, {
+          customEndpointConfigured: !!customBaseUrl,
+        }).backends.map((item) => [item.backend, item]),
+      );
+      const describe = (id: string, label: string) => {
+        const state = readiness.get(id);
+        const available = state?.ready === true;
+        return {
+          id,
+          label,
+          available,
+          ...(!available
+            ? { reason: state?.cli === false ? "runtime not installed" : state?.auth === false ? "not signed in" : "not configured" }
+            : {}),
+        };
+      };
+      return [
+        describe("claude", "Claude"),
+        describe("codex", "Codex"),
+        describe("gemini", "Gemini"),
+        {
+          id: "hermes",
+          label: "Hermes",
+          available: hermesAvailable(),
+          ...(!hermesAvailable() ? { reason: "Hermes prompt-only runtime not installed" } : {}),
+        },
+      ];
+    },
   });
   const promptAssistTabs = new Set<string>();
 

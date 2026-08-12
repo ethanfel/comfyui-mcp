@@ -67,7 +67,13 @@ draft; the bridge has no operation that edits a Plan or graph.
 turn, clear the named bounded transcript, and retire a client respectively.
 Only one request per client route may run at once.
 
-## Provider isolation
+## Provider discovery and isolation
+
+`prompt_assist_ready` advertises the prompt-only providers that the running
+orchestrator can safely isolate, including an availability flag and a short
+reason when a runtime is missing or signed out. Consumers must build their
+selector from that catalogue instead of maintaining a hard-coded provider
+list. The server repeats the availability check when a request starts.
 
 Codex uses the existing app-server backend with prompt-lane overrides:
 
@@ -78,6 +84,16 @@ Codex uses the existing app-server backend with prompt-lane overrides:
 - an ephemeral thread;
 - a strict structured-output schema;
 - immediate refusal if a tool call is nevertheless observed.
+
+Claude uses a disposable SDK query with no settings sources, no MCP servers,
+an empty built-in and allowed tool list, one turn, no persisted session, and
+the same strict result schema. The runner also rejects any tool-use block if a
+future SDK version violates those constraints.
+
+Gemini uses a disposable ACP session with no MCP servers and a shipped,
+highest-priority wildcard-deny policy. The deny policy removes built-in,
+extension, and MCP tools from the prompt-only session; the bridge still fails
+closed if it observes a tool call.
 
 Hermes uses a small adapter around its one-shot runner with a reserved
 zero-match toolset allowlist, workspace rules disabled, and an ephemeral system
@@ -92,8 +108,15 @@ adapter can replace this runner later without changing the browser protocol.
 Recent conversation is stored only in the orchestrator process, bounded to ten
 items, and keyed by client route, conversation id, and provider. It is not
 serialized into the ComfyUI workflow. Provider switching therefore preserves
-separate Codex and Hermes prompt conversations without mixing either into the
-sidebar agent. The editor mirrors this separation in its visible chat history.
+separate conversations for Claude, Codex, Gemini, and Hermes without mixing
+them into the sidebar agent. The editor mirrors this separation in its visible
+chat history.
+
+HTTP-only backends (including OpenRouter, Ollama, LM Studio, llama.cpp, and a
+custom endpoint) are intentionally not advertised yet. They cannot inherit the
+agent-runtime isolation guarantees above, and enabling one would send the
+scene prompt directly to its configured endpoint. That requires a separate,
+explicit user opt-in and endpoint disclosure in the editor.
 
 An in-flight request is recorded in browser `sessionStorage`. If the editor's
 socket reloads, the auxiliary route replays bounded result frames and the editor

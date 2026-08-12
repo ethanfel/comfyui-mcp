@@ -4,10 +4,13 @@ import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexBackend } from "./codex-backend.js";
+import { loadQuery } from "./claude-backend.js";
+import { GeminiBackend } from "./gemini-backend.js";
 import type { AgentBackend } from "./agent-backend.js";
+import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import { logger } from "../utils/logger.js";
 
-export type PromptAssistProvider = "codex" | "hermes";
+export type PromptAssistProvider = string;
 export type PromptAssistMode = "discuss" | "rewrite" | "continuity" | "shorten" | "critique";
 
 export interface PromptAssistContext {
@@ -41,6 +44,14 @@ export interface PromptAssistResult {
 
 export interface PromptAssistRunner {
   run(prompt: string, signal: AbortSignal, onActivity?: () => void): Promise<string>;
+}
+
+export interface PromptAssistProviderInfo {
+  id: string;
+  label: string;
+  available: boolean;
+  reason?: string;
+  experimental?: boolean;
 }
 
 export const PROMPT_ASSIST_OUTPUT_SCHEMA: Record<string, unknown> = {
@@ -78,7 +89,6 @@ const MODE_DEFAULTS: Record<PromptAssistMode, string> = {
   critique: "Critique the current scene prompt. Identify the highest-impact issues and do not rewrite unless I explicitly request it.",
 };
 
-const PROVIDERS = new Set<PromptAssistProvider>(["codex", "hermes"]);
 const MODES = new Set<PromptAssistMode>(["discuss", "rewrite", "continuity", "shorten", "critique"]);
 const MAX_INSTRUCTION = 6_000;
 const MAX_PROMPT = 60_000;
@@ -120,7 +130,9 @@ export function normalizePromptAssistRequest(value: unknown): PromptAssistReques
   const raw = value as Record<string, unknown>;
   const provider = boundedString(raw.provider, "provider", 24, true).toLowerCase() as PromptAssistProvider;
   const mode = boundedString(raw.mode, "mode", 24, true).toLowerCase() as PromptAssistMode;
-  if (!PROVIDERS.has(provider)) throw new Error(`Unsupported prompt-assist provider '${provider}'.`);
+  if (!/^[a-z][a-z0-9_-]*$/.test(provider)) {
+    throw new Error("provider may contain only lowercase letters, digits, _, and -.");
+  }
   if (!MODES.has(mode)) throw new Error(`Unsupported prompt-assist mode '${mode}'.`);
 
   const rawContext = raw.context;
@@ -288,6 +300,125 @@ export class CodexPromptAssistRunner implements PromptAssistRunner {
     } finally {
       signal.removeEventListener("abort", abort);
       await backend.close?.().catch(() => {});
+    }
+  }
+}
+
+/** Claude's SDK supports a genuinely empty built-in tool set, so this runner
+ * uses a one-turn, non-persisted SDK query instead of the privileged panel
+ * backend. It never inherits settings, skills, hooks, MCP servers, or files. */
+export class ClaudePromptAssistRunner implements PromptAssistRunner {
+  constructor(private readonly opts: { model?: string } = {}) {}
+
+  async run(prompt: string, signal: AbortSignal, onActivity?: () => void): Promise<string> {
+    if (signal.aborted) throw abortError();
+    const query = await loadQuery();
+    if (signal.aborted) throw abortError();
+    const controller = new AbortController();
+    let active: { interrupt(): Promise<void> } | null = null;
+    const abort = () => {
+      controller.abort();
+      void active?.interrupt().catch(() => {});
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    let finalText = "";
+    let streamedText = "";
+    let failure = "";
+    try {
+      const session = query({
+        prompt,
+        options: {
+          ...(this.opts.model ? { model: this.opts.model } : {}),
+          abortController: controller,
+          systemPrompt: PROMPT_ASSIST_SYSTEM,
+          tools: [],
+          allowedTools: [],
+          mcpServers: {},
+          strictMcpConfig: true,
+          settingSources: [],
+          maxTurns: 1,
+          persistSession: false,
+          permissionMode: "dontAsk",
+          outputFormat: { type: "json_schema", schema: PROMPT_ASSIST_OUTPUT_SCHEMA },
+          env: buildAgentSpawnEnv(),
+        } as never,
+      }) as AsyncIterable<Record<string, unknown>> & { interrupt(): Promise<void> };
+      active = session;
+      for await (const message of session) {
+        onActivity?.();
+        if (signal.aborted) throw abortError();
+        const value = message as any;
+        if (value?.type === "assistant" && Array.isArray(value.message?.content)) {
+          for (const block of value.message.content) {
+            if (block?.type === "tool_use") {
+              throw new Error(`The isolated Claude prompt assistant attempted to call '${block.name ?? "tool"}'.`);
+            }
+            if (block?.type === "text" && typeof block.text === "string") streamedText += block.text;
+          }
+        } else if (value?.type === "result") {
+          if (typeof value.result === "string") finalText = value.result;
+          if (value.is_error === true) {
+            failure = typeof value.result === "string" ? value.result : "Claude prompt assistant failed.";
+          }
+        }
+      }
+      if (signal.aborted) throw abortError();
+      if (failure) throw new Error(failure);
+      return finalText || streamedText;
+    } finally {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) await active?.interrupt().catch(() => {});
+    }
+  }
+}
+
+/** Gemini runs through ACP with a shipped highest-priority wildcard-deny policy.
+ * Gemini CLI excludes globally denied tools from model memory, and no MCP
+ * servers are declared for this disposable session. */
+export class GeminiPromptAssistRunner implements PromptAssistRunner {
+  constructor(private readonly opts: { cwd: string; model?: string } = { cwd: process.cwd() }) {}
+
+  async run(prompt: string, signal: AbortSignal, onActivity?: () => void): Promise<string> {
+    if (signal.aborted) throw abortError();
+    const backend = new GeminiBackend({
+      cwd: this.opts.cwd,
+      ...(this.opts.model ? { model: this.opts.model } : {}),
+      systemAppend: PROMPT_ASSIST_SYSTEM,
+      disableTools: true,
+    });
+    const abort = () => {
+      void backend.interrupt().finally(() => void backend.close?.());
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    let finalText = "";
+    let streamedText = "";
+    let failure = "";
+    try {
+      await backend.prepare();
+      if (signal.aborted) throw abortError();
+      for await (const event of backend.run({
+        cwd: this.opts.cwd,
+        ...(this.opts.model ? { model: this.opts.model } : {}),
+        channel: oneTurn(prompt),
+        onActivity,
+      })) {
+        if (signal.aborted) throw abortError();
+        if (event.type === "assistant_delta" && !event.thinking) streamedText += event.text;
+        if (event.type === "assistant") finalText = event.text;
+        if (event.type === "tool_call" && event.phase === "start") {
+          throw new Error(`The isolated Gemini prompt assistant attempted to call '${event.name}'.`);
+        }
+        if (event.type === "error") failure = event.message;
+        if (event.type === "result" && !event.ok) {
+          throw new Error(failure || "Gemini prompt assistant failed.");
+        }
+      }
+      if (signal.aborted) throw abortError();
+      if (failure) throw new Error(failure);
+      return finalText || streamedText;
+    } finally {
+      signal.removeEventListener("abort", abort);
+      await backend.close().catch(() => {});
     }
   }
 }
@@ -469,26 +600,34 @@ export class PromptAssistManager {
   private readonly transcripts = new Map<string, TranscriptItem[]>();
   private readonly active = new Map<string, { requestId: string; abort: AbortController; task: Promise<void> }>();
   private readonly pendingTasks = new Set<Promise<void>>();
-  private readonly runners: Record<PromptAssistProvider, PromptAssistRunner>;
+  private readonly runners: Record<string, PromptAssistRunner>;
+  private readonly providerCatalog: () => PromptAssistProviderInfo[];
 
   constructor(opts: {
     cwd: string;
     codexModel?: string;
-    runners?: Partial<Record<PromptAssistProvider, PromptAssistRunner>>;
+    runners?: Partial<Record<string, PromptAssistRunner>>;
+    providers?: PromptAssistProviderInfo[] | (() => PromptAssistProviderInfo[]);
   }) {
     this.runners = {
       codex: opts.runners?.codex ?? new CodexPromptAssistRunner({ cwd: opts.cwd, model: opts.codexModel }),
       hermes: opts.runners?.hermes ?? new HermesPromptAssistRunner({ cwd: opts.cwd }),
+      ...opts.runners,
     };
+    const providers = opts.providers;
+    this.providerCatalog = typeof providers === "function"
+      ? providers
+      : () => providers ?? Object.keys(this.runners).map((id) => ({
+          id,
+          label: id === "codex" ? "Codex" : id === "hermes" ? "Hermes" : id,
+          available: id === "hermes" ? hermesAvailable() : true,
+        }));
   }
 
   readyFrame(): Record<string, unknown> {
     return {
       type: "prompt_assist_ready",
-      providers: [
-        { id: "codex", label: "Codex", available: true },
-        { id: "hermes", label: "Hermes", available: hermesAvailable() },
-      ],
+      providers: this.providerCatalog(),
     };
   }
 
@@ -504,6 +643,33 @@ export class PromptAssistManager {
         type: "prompt_assist_error",
         ...(rawRequestId ? { request_id: rawRequestId } : {}),
         error: error instanceof Error ? error.message : String(error),
+      }, tabId);
+      return;
+    }
+
+    const runner = this.runners[request.provider];
+    const provider = this.providerCatalog().find((item) => item.id === request.provider);
+    if (!provider) {
+      push({
+        type: "prompt_assist_error",
+        request_id: request.requestId,
+        error: `Unsupported prompt-assist provider '${request.provider}'.`,
+      }, tabId);
+      return;
+    }
+    if (!provider.available) {
+      push({
+        type: "prompt_assist_error",
+        request_id: request.requestId,
+        error: `${provider.label} is unavailable${provider.reason ? `: ${provider.reason}` : "."}`,
+      }, tabId);
+      return;
+    }
+    if (!runner) {
+      push({
+        type: "prompt_assist_error",
+        request_id: request.requestId,
+        error: `${provider.label} has no isolated prompt-assist runner configured.`,
       }, tabId);
       return;
     }
@@ -534,7 +700,7 @@ export class PromptAssistManager {
       lastProgressAt = now;
       push({ type: "prompt_assist_progress", request_id: request.requestId }, tabId);
     };
-    const task = this.runners[request.provider]
+    const task = runner
       .run(prompt, controller.signal, onActivity)
       .then((rawResult) => {
         if (controller.signal.aborted) return;

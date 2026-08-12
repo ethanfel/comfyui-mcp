@@ -63,6 +63,7 @@
 
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import { logger } from "../utils/logger.js";
 import { errorText, promptText } from "./error-text.js";
@@ -497,6 +498,13 @@ export interface GeminiBackendDeps {
    * system/context preamble; later turns send plain text.
    */
   systemAppend?: string;
+  /** Remove every Gemini built-in/extension/MCP tool with a highest-priority
+   * wildcard deny policy. Used only by narrow embedded text assistants. */
+  disableTools?: boolean;
+}
+
+export function geminiPromptOnlyPolicyPath(): string {
+  return fileURLToPath(new URL("../../scripts/gemini-prompt-only-policy.toml", import.meta.url));
 }
 
 /**
@@ -567,7 +575,12 @@ export class GeminiBackend implements AgentBackend {
     // resolves to a `.cmd`/`.ps1` shim, which spawn can't find without a shell.
     const cmd = isJs ? process.execPath : bin ?? "gemini";
     const modelArgs = this.model ? ["--model", this.model] : [];
-    const args = isJs ? [bin as string, "--acp", ...modelArgs] : ["--acp", ...modelArgs];
+    const isolationArgs = this.deps.disableTools
+      ? ["--approval-mode", "plan", "--policy", geminiPromptOnlyPolicyPath()]
+      : [];
+    const args = isJs
+      ? [bin as string, "--acp", ...modelArgs, ...isolationArgs]
+      : ["--acp", ...modelArgs, ...isolationArgs];
     const useShell = !isJs && process.platform === "win32";
     this.spawnSpec = { cmd, args, useShell };
     return this.spawnSpec;
