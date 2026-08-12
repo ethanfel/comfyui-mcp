@@ -9,6 +9,7 @@ import {
   HttpPromptAssistRunner,
   HERMES_PROMPT_ONLY_TOOLSET,
   PromptAssistManager,
+  PROMPT_ASSIST_SYSTEM,
   buildPromptAssistPrompt,
   hermesPromptOnlyHelperPath,
   normalizePromptAssistRequest,
@@ -39,6 +40,14 @@ function request(overrides: Record<string, unknown> = {}) {
 }
 
 describe("prompt-assist protocol", () => {
+  it("keeps H3 edits scoped and grounded in supplied media evidence", () => {
+    expect(PROMPT_ASSIST_SYSTEM).toContain("do not turn a focused edit into an unsolicited full-format rewrite");
+    expect(PROMPT_ASSIST_SYSTEM).toContain("never invent image contents, video motion, lyrics, voice identity, timbre");
+    expect(PROMPT_ASSIST_SYSTEM).toContain("retain the reference label without elaborating it");
+    expect(PROMPT_ASSIST_SYSTEM).toContain("only when the user explicitly requests a full H3 rewrite");
+    expect(PROMPT_ASSIST_SYSTEM).toContain("inside the supplied scene duration");
+  });
+
   it("normalizes a bounded H3 scene request and quotes editor context", () => {
     const normalized = normalizePromptAssistRequest(request());
     expect(normalized.provider).toBe("codex");
