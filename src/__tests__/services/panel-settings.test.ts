@@ -111,6 +111,15 @@ describe("panel-settings agent model preferences", () => {
     expect(getAgentSettings().preferredModels).toEqual(["c:3"]);
   });
 
+  it("persists explicit direct-HTTP prompt-assistant consent and preserves it across other updates", () => {
+    expect(getAgentSettings().promptAssistHttp).toBeUndefined();
+    setAgentSettings({ promptAssistHttp: true });
+    setAgentSettings({ preferredModels: ["local/model"] });
+    expect(getAgentSettings().promptAssistHttp).toBe(true);
+    setAgentSettings({ promptAssistHttp: false });
+    expect(getAgentSettings().promptAssistHttp).toBe(false);
+  });
+
   it("merges ollama config per-key", () => {
     setAgentSettings({ ollama: { api: "openai", baseUrl: "https://openrouter.ai/api/v1" } });
     setAgentSettings({ ollama: { model: "xiaomi/mimo-v2.5" } });

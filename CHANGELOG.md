@@ -21,6 +21,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.50.92] - 2026-08-12
+
+### Added
+
+- Embedded prompt editors can discover Claude, Codex, Gemini, and Hermes as
+  isolated prompt-only runtimes, plus configured Kimi, Kimi K3, GLM, MiniMax,
+  Ollama, OpenRouter, LM Studio, llama.cpp, and custom HTTP endpoints behind an
+  explicit global opt-in. Direct HTTP requests never connect MCP clients and
+  omit both tool schemas and `tool_choice` from the provider request.
+
 ## [0.50.91] - 2026-08-10
 
 ### MCP

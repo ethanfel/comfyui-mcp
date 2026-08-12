@@ -88,6 +88,10 @@ export interface OllamaBackendDeps {
   mcpServers?: Record<string, GeminiMcpServerSpec>;
   /** Panel system prompt (persona), prepended to the system message. */
   systemAppend?: string;
+  /** Strict one-turn text-only surface used by embedded prompt assistants.
+   * When set, MCP clients are never connected, the supplied text replaces the
+   * normal tool-oriented system prompt, and no tool schema is sent on the wire. */
+  promptOnlySystem?: string;
   /** Context window tokens for /api/chat options.num_ctx. Default is
    *  MODEL-AWARE: for our fine-tune (artokun/gemma4-comfyui-mcp:*) num_ctx is
    *  OMITTED so the tag's baked Modelfile window (65536) governs — request
@@ -598,7 +602,7 @@ export class OllamaBackend implements AgentBackend {
           : `Ollama is not reachable at ${this.host} (${msgOf(err)}). Start it with \`ollama serve\` (install: https://ollama.com/download), then \`ollama pull ${this.model}\` — our gemma4 fine-tuned on the comfyui-mcp tool suite (free, runs locally; \`:e2b\` fits ~2 GB VRAM, \`:e4b\` ~3.5 GB, \`:12b\` ~8 GB).`,
       );
     }
-    await this.connectTools();
+    if (!this.deps.promptOnlySystem) await this.connectTools();
     this.prepared = true;
     logger.info(
       `[ollama-backend] ready (${this.api === "openai" ? `openai-compatible @ ${this.host}` : `ollama ${version}`}, model ${this.model}, ${this.comfyTools.length} comfyui tools, ${this.panelTools.length} panel tools behind the router)` +
@@ -682,6 +686,7 @@ export class OllamaBackend implements AgentBackend {
   /** The six OpenAI-style tool defs the model sees (three, when the panel router
    *  is unavailable — see panelRouterAvailable). */
   protected buildModelTools(): Array<Record<string, unknown>> {
+    if (this.deps.promptOnlySystem) return [];
     const defs: Array<Record<string, unknown>> = [];
     for (const t of this.comfyTools) {
       defs.push({
@@ -868,8 +873,7 @@ export class OllamaBackend implements AgentBackend {
               body: JSON.stringify({
                 model: this.model,
                 messages: toOpenAiMessages(messages),
-                tools,
-                tool_choice: "auto",
+                ...(tools.length ? { tools, tool_choice: "auto" } : {}),
                 stream: true,
                 stream_options: { include_usage: true },
                 // Cap the output reservation: without it some models default to
@@ -894,7 +898,7 @@ export class OllamaBackend implements AgentBackend {
               body: JSON.stringify({
                 model: this.model,
                 messages: toOllamaMessages(messages),
-                tools,
+                ...(tools.length ? { tools } : {}),
                 stream: true,
                 // See OllamaBackendDeps.numCtx: omit for our fine-tune so the
                 // tag's baked 65536 window governs instead of clamping it.
@@ -1106,6 +1110,7 @@ export class OllamaBackend implements AgentBackend {
    * override or tool mode changes that.
    */
   protected systemPromptForSurface(): string {
+    if (this.deps.promptOnlySystem) return this.deps.promptOnlySystem;
     return (
       resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision?.mode ?? "compact")) +
       ollamaPanelRetraction(this.panelRouterAvailable())

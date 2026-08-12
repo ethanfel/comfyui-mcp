@@ -37,6 +37,9 @@ export interface OllamaAgentConfig {
 export interface AgentSettings {
   /** User-curated model ids pinned to the top of the panel's model picker. */
   preferredModels?: string[];
+  /** Explicit consent for prompt-editor text to be sent directly to configured
+   * HTTP model endpoints. False/absent keeps those providers unavailable. */
+  promptAssistHttp?: boolean;
   ollama?: OllamaAgentConfig;
   /** LM Studio provider (issue #160) — same shape; api/baseUrl unused today
    *  (fixed openai dialect + COMFYUI_MCP_LMSTUDIO_HOST) but kept for #162. */
@@ -402,6 +405,9 @@ export function setAgentSettings(patch: AgentSettings): AgentSettings {
   const next: AgentSettings = { ...prev };
   if (patch.preferredModels !== undefined) {
     next.preferredModels = normalizePreferredModels(patch.preferredModels);
+  }
+  if (patch.promptAssistHttp !== undefined) {
+    next.promptAssistHttp = patch.promptAssistHttp === true;
   }
   if (patch.ollama !== undefined) {
     next.ollama = { ...prev.ollama, ...patch.ollama };

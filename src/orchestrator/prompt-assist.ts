@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { CodexBackend } from "./codex-backend.js";
 import { loadQuery } from "./claude-backend.js";
 import { GeminiBackend } from "./gemini-backend.js";
+import { OllamaBackend } from "./ollama-backend.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import { logger } from "../utils/logger.js";
@@ -52,6 +53,8 @@ export interface PromptAssistProviderInfo {
   available: boolean;
   reason?: string;
   experimental?: boolean;
+  transport?: "isolated_runtime" | "direct_http";
+  endpoint?: string;
 }
 
 export const PROMPT_ASSIST_OUTPUT_SCHEMA: Record<string, unknown> = {
@@ -411,6 +414,53 @@ export class GeminiPromptAssistRunner implements PromptAssistRunner {
         if (event.type === "error") failure = event.message;
         if (event.type === "result" && !event.ok) {
           throw new Error(failure || "Gemini prompt assistant failed.");
+        }
+      }
+      if (signal.aborted) throw abortError();
+      if (failure) throw new Error(failure);
+      return finalText || streamedText;
+    } finally {
+      signal.removeEventListener("abort", abort);
+      await backend.close().catch(() => {});
+    }
+  }
+}
+
+/** OpenAI-compatible and native Ollama providers share a disposable HTTP
+ * runner. The backend factory is evaluated for every request so live model,
+ * endpoint, and credential settings are honored. `promptOnlySystem` is set by
+ * the factory: it prevents MCP connection and removes the tool schema from the
+ * HTTP request instead of relying only on a prompt instruction. */
+export class HttpPromptAssistRunner implements PromptAssistRunner {
+  constructor(private readonly backendFactory: () => OllamaBackend) {}
+
+  async run(prompt: string, signal: AbortSignal, onActivity?: () => void): Promise<string> {
+    if (signal.aborted) throw abortError();
+    const backend = this.backendFactory();
+    const abort = () => {
+      void backend.interrupt().finally(() => void backend.close());
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    let finalText = "";
+    let streamedText = "";
+    let failure = "";
+    try {
+      await backend.prepare();
+      if (signal.aborted) throw abortError();
+      for await (const event of backend.run({
+        cwd: process.cwd(),
+        channel: oneTurn(prompt),
+        onActivity,
+      })) {
+        if (signal.aborted) throw abortError();
+        if (event.type === "assistant_delta" && !event.thinking) streamedText += event.text;
+        if (event.type === "assistant") finalText = event.text;
+        if (event.type === "tool_call" && event.phase === "start") {
+          throw new Error(`The direct-HTTP prompt assistant attempted to call '${event.name}'.`);
+        }
+        if (event.type === "error") failure = event.message;
+        if (event.type === "result" && !event.ok) {
+          throw new Error(failure || "Direct-HTTP prompt assistant failed.");
         }
       }
       if (signal.aborted) throw abortError();

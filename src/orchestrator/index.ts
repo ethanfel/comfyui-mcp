@@ -111,6 +111,8 @@ import { CodexBackend } from "./codex-backend.js";
 import {
   ClaudePromptAssistRunner,
   GeminiPromptAssistRunner,
+  HttpPromptAssistRunner,
+  PROMPT_ASSIST_SYSTEM,
   PromptAssistManager,
   hermesAvailable,
 } from "./prompt-assist.js";
@@ -1473,6 +1475,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     );
   }
   const persistedAgent = getAgentSettings();
+  let promptAssistHttpEnabled = persistedAgent.promptAssistHttp === true;
   let ollamaModel =
     process.env.COMFYUI_MCP_OLLAMA_MODEL ?? persistedAgent.ollama?.model ?? "artokun/gemma4-comfyui-mcp:e4b";
   const chatgptModel = process.env.COMFYUI_MCP_CHATGPT_MODEL ?? CHATGPT_DEFAULT_MODEL;
@@ -2473,6 +2476,49 @@ export async function runPanelOrchestrator(): Promise<void> {
         cwd: comfyuiPath ?? process.cwd(),
         model: geminiModel,
       }),
+      ollama: new HttpPromptAssistRunner(() => new OllamaBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: ollamaModel,
+        promptOnlySystem: PROMPT_ASSIST_SYSTEM,
+        ...ollamaDeps(),
+      })),
+      openrouter: new HttpPromptAssistRunner(() => new OllamaBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: openrouterModel,
+        promptOnlySystem: PROMPT_ASSIST_SYSTEM,
+        ...openrouterDeps(),
+      })),
+      lmstudio: new HttpPromptAssistRunner(() => new OllamaBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: lmstudioModel,
+        promptOnlySystem: PROMPT_ASSIST_SYSTEM,
+        ...lmstudioDeps(),
+      })),
+      llamacpp: new HttpPromptAssistRunner(() => new OllamaBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: llamacppModel,
+        promptOnlySystem: PROMPT_ASSIST_SYSTEM,
+        ...llamacppDeps(),
+      })),
+      custom: new HttpPromptAssistRunner(() => new OllamaBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: customModel,
+        promptOnlySystem: PROMPT_ASSIST_SYSTEM,
+        ...customDeps(),
+      })),
+      kimi: new HttpPromptAssistRunner(() => new KimiBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: kimiModel,
+        promptOnlySystem: PROMPT_ASSIST_SYSTEM,
+      })),
+      ...Object.fromEntries(
+        OPENAI_KEY_PROVIDER_IDS
+          .filter((id) => simpleKeyProvider(id))
+          .map((id) => [id, new HttpPromptAssistRunner(() => makeOpenAiKeyBackend(
+            openAiKeyProvider(id)!,
+            { promptOnlySystem: PROMPT_ASSIST_SYSTEM },
+          ))]),
+      ),
     },
     providers: () => {
       const readiness = new Map(
@@ -2492,16 +2538,42 @@ export async function runPanelOrchestrator(): Promise<void> {
             : {}),
         };
       };
+      const directHttp = (id: string, label: string, endpoint?: string) => {
+        const state = readiness.get(id);
+        const ready = state?.ready === true;
+        return {
+          id,
+          label,
+          available: promptAssistHttpEnabled && ready,
+          transport: "direct_http" as const,
+          ...(endpoint ? { endpoint } : {}),
+          ...(!promptAssistHttpEnabled
+            ? { reason: "enable direct HTTP providers in Settings → Comfy MCP Agent → Prompt assistant" }
+            : !ready
+              ? { reason: state?.cli === false ? "runtime or endpoint not available" : state?.auth === false ? "not signed in or API key missing" : "not configured" }
+              : {}),
+        };
+      };
       return [
-        describe("claude", "Claude"),
-        describe("codex", "Codex"),
-        describe("gemini", "Gemini"),
+        { ...describe("claude", "Claude"), transport: "isolated_runtime" as const },
+        { ...describe("codex", "Codex"), transport: "isolated_runtime" as const },
+        { ...describe("gemini", "Gemini"), transport: "isolated_runtime" as const },
         {
           id: "hermes",
           label: "Hermes",
           available: hermesAvailable(),
+          transport: "isolated_runtime" as const,
           ...(!hermesAvailable() ? { reason: "Hermes prompt-only runtime not installed" } : {}),
         },
+        directHttp("kimi", "Kimi"),
+        directHttp("moonshot", "Kimi K3 (Moonshot)"),
+        directHttp("glm", "GLM (z.ai)"),
+        directHttp("minimax", "MiniMax"),
+        directHttp("ollama", "Ollama", ollamaBaseUrl ?? process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434"),
+        directHttp("openrouter", "OpenRouter", OPENROUTER_BASE_URL),
+        directHttp("lmstudio", "LM Studio", LMSTUDIO_BASE_URL),
+        directHttp("llamacpp", "llama.cpp", LLAMACPP_BASE_URL),
+        directHttp("custom", "Custom endpoint", customBaseUrl || undefined),
       ];
     },
   });
@@ -4223,8 +4295,17 @@ export async function runPanelOrchestrator(): Promise<void> {
           );
         }
       }
-      const cfg = event as { preferred_models?: unknown; ollama?: unknown };
+      const cfg = event as { preferred_models?: unknown; ollama?: unknown; prompt_assist_http?: unknown };
       let ollamaChanged = false;
+      if (typeof cfg.prompt_assist_http === "boolean"
+          && cfg.prompt_assist_http !== promptAssistHttpEnabled) {
+        promptAssistHttpEnabled = cfg.prompt_assist_http;
+        setAgentSettings({ promptAssistHttp: promptAssistHttpEnabled });
+        for (const route of promptAssistTabs) bridge.push(promptAssist.readyFrame(), route);
+        logger.info(
+          `[panel-orchestrator] direct HTTP prompt-assist providers → ${promptAssistHttpEnabled ? "enabled" : "disabled"}`,
+        );
+      }
       if (Array.isArray(cfg.preferred_models)) {
         // The panel re-sends set_config on EVERY heartbeat. Only apply + re-push on
         // an ACTUAL change — otherwise re-pushing models makes the panel re-send,

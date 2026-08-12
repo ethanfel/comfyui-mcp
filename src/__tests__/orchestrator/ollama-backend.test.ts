@@ -168,6 +168,39 @@ afterEach(() => {
 });
 
 describe("OllamaBackend", () => {
+  it("prompt-only mode connects no MCP clients and sends no tool schema in either HTTP dialect", async () => {
+    const connectToolClients = vi.fn(async () => ({ comfyui: fakeMcpClient(COMFY_META).client }));
+    let backend = new OllamaBackend({
+      model: "qwen3:4b",
+      promptOnlySystem: "PROMPT-ONLY SYSTEM",
+      connectToolClients,
+    });
+    chatScript.push([{ message: { content: "ok" }, done: true }]);
+    await collect(backend, turnsOf({ text: "rewrite" }));
+    expect(connectToolClients).not.toHaveBeenCalled();
+    expect(chatRequests.at(-1)).not.toHaveProperty("tools");
+    expect(chatRequests.at(-1)?.messages[0]).toEqual({ role: "system", content: "PROMPT-ONLY SYSTEM" });
+    await backend.close();
+
+    modelsResponse = ["remote-model"];
+    backend = new OllamaBackend({
+      api: "openai",
+      host: "http://localhost:1234/v1",
+      model: "remote-model",
+      promptOnlySystem: "PROMPT-ONLY SYSTEM",
+      connectToolClients,
+    });
+    await collect(backend, turnsOf({ text: "rewrite" }));
+    const request = openaiChatRequests.at(-1) as Record<string, unknown>;
+    expect(request).not.toHaveProperty("tools");
+    expect(request).not.toHaveProperty("tool_choice");
+    expect((request.messages as Array<Record<string, unknown>>)[0]).toEqual({
+      role: "system",
+      content: "PROMPT-ONLY SYSTEM",
+    });
+    await backend.close();
+  });
+
   it("streams a plain text turn: session first, deltas, one assistant, exactly one ok result", async () => {
     const { client } = fakeMcpClient(COMFY_META);
     const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });

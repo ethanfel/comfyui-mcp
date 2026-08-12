@@ -112,11 +112,20 @@ separate conversations for Claude, Codex, Gemini, and Hermes without mixing
 them into the sidebar agent. The editor mirrors this separation in its visible
 chat history.
 
-HTTP-only backends (including OpenRouter, Ollama, LM Studio, llama.cpp, and a
-custom endpoint) are intentionally not advertised yet. They cannot inherit the
-agent-runtime isolation guarantees above, and enabling one would send the
-scene prompt directly to its configured endpoint. That requires a separate,
-explicit user opt-in and endpoint disclosure in the editor.
+HTTP-backed providers are disabled by default. The user can explicitly enable
+them globally in **Settings → Comfy MCP Agent → Prompt assistant → Allow direct
+HTTP providers**. The setting is persisted by the orchestrator and never stored
+inside a workflow. When enabled, the bridge advertises configured Kimi, Kimi K3,
+GLM, MiniMax, Ollama, OpenRouter, LM Studio, llama.cpp, and custom endpoints.
+The provider catalogue marks them as `direct_http` and may disclose the resolved
+endpoint URL to the editor.
+
+Each direct-HTTP request uses a disposable backend with the prompt-assist system
+prompt, never connects MCP clients, and omits `tools` and `tool_choice` entirely
+from the wire request. A tool call is still treated as a fatal isolation
+violation. This keeps the lane text-only, but it does not make a hosted/custom
+endpoint local: that endpoint receives the scene prompt under its own privacy
+and billing terms, which is why the global setting is an explicit opt-in.
 
 An in-flight request is recorded in browser `sessionStorage`. If the editor's
 socket reloads, the auxiliary route replays bounded result frames and the editor

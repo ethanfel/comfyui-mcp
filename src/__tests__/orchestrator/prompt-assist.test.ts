@@ -6,6 +6,7 @@ import {
   ClaudePromptAssistRunner,
   CodexPromptAssistRunner,
   GeminiPromptAssistRunner,
+  HttpPromptAssistRunner,
   HERMES_PROMPT_ONLY_TOOLSET,
   PromptAssistManager,
   buildPromptAssistPrompt,
@@ -307,6 +308,20 @@ describe("additional prompt-assist provider isolation", () => {
     expect(policy).toContain('decision = "deny"');
     expect(policy).toContain("priority = 999");
     expect(GeminiPromptAssistRunner).toBeTypeOf("function");
+  });
+
+  it("uses the HTTP runner only with Ollama's prompt-only surface", () => {
+    const promptAssist = readFileSync(new URL("../../orchestrator/prompt-assist.ts", import.meta.url), "utf8");
+    const ollama = readFileSync(new URL("../../orchestrator/ollama-backend.ts", import.meta.url), "utf8");
+    const wiring = readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf8");
+    expect(HttpPromptAssistRunner).toBeTypeOf("function");
+    expect(promptAssist).toContain("The direct-HTTP prompt assistant attempted to call");
+    expect(ollama).toContain("if (!this.deps.promptOnlySystem) await this.connectTools()");
+    expect(ollama).toContain("...(tools.length ? { tools, tool_choice: \"auto\" } : {})");
+    expect(wiring).toContain("promptOnlySystem: PROMPT_ASSIST_SYSTEM");
+    expect(wiring).toContain("promptAssistHttpEnabled && ready");
+    expect(wiring).toContain("setAgentSettings({ promptAssistHttp: promptAssistHttpEnabled })");
+    expect(wiring).toContain("for (const route of promptAssistTabs) bridge.push(promptAssist.readyFrame(), route)");
   });
 });
 
