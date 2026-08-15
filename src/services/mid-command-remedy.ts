@@ -35,15 +35,105 @@ export function isInteractiveCommand(cmd: string): boolean {
 /**
  * The "verify before retrying" clause, chosen by what the command actually did.
  *
- * Two kinds, because they have different evidence and different costs:
+ * The point of OUTCOME UNKNOWN is that the caller checks instead of retrying blind.
+ * That only works if the check named can actually hold the answer — and for a graph
+ * write it did not. Every non-interactive command got the same sentence:
  *
- *  • an INTERACTIVE card — nothing in the tool surface can observe it, and a
- *    the answer to it will NEVER arrive (the panel refuses to replay a reply of
- *    this kind across a reconnect), and a retry duplicates the card. Say all
- *    three, and give the route that works — which differs for a secret.
- *  • anything else — the existing queue/output check, which is real evidence for
- *    a run or a write.
+ *     Verify before retrying (e.g. check queue action:"list" /
+ *     get_image (action:"list_outputs"))
+ *
+ * which is RENDER evidence. panel#646's interrupted command was `graph_set_widget`.
+ * Neither the queue nor the output list can say whether a widget edit landed, so an
+ * agent following that advice looks somewhere structurally incapable of answering,
+ * learns nothing, and ends up exactly where the message was trying to keep it from:
+ * retry blindly or give up. The old doc here asserted the queue check was "real
+ * evidence for a run or a write". It is evidence for a run.
+ *
+ * So the kinds are separated by WHAT CAN BE OBSERVED:
+ *
+ *  • an INTERACTIVE card — nothing in the tool surface can observe it, the answer
+ *    will NEVER arrive, and a retry duplicates the card in front of a human.
+ *  • a RUN — the queue and the output list are exactly right, and stay.
+ *  • a GRAPH WRITE — read the graph back. A graph read is idempotent and safe to
+ *    run the instant a tab is connected, which makes it a better check than
+ *    anything the run path offers. This branch is LAST among the graph_* kinds:
+ *    the prefix alone does not mean the effect is on the canvas, and the two cases
+ *    above are the ones where it is not.
+ *  • a WORKFLOW mutator — the workflow list, not the graph: these change which
+ *    workflows exist or are open, which a canvas read does not see.
+ *  • a LIBRARY write (`graph_save_subgraph`) — panel_list_subgraphs. The graph is
+ *    identical after a blueprint save, so both graph readers show what they showed
+ *    before and prove nothing (codex review).
+ *  • a CLIPBOARD write (`graph_copy_nodes`) — nothing can read the clipboard, and
+ *    the graph is unchanged. This is the one interrupted write where re-issuing is
+ *    the right answer: a second copy of the same nodes is the same clipboard.
+ *  • anything else — say to verify without naming tools that may not apply.
+ *    Naming a plausible-but-wrong check is what this fix exists to remove; doing
+ *    it again in the default branch would be the same defect with a different tool.
+ *
+ * Classified by NAME here rather than by importing GRAPH_CMD_EFFECT, for two
+ * reasons: ui-bridge.ts imports this module, so reading its table would be a cycle;
+ * and that table answers a different question (does this need the workflow fence),
+ * which is not the same as what evidence exists for it afterwards.
  */
+/** The one command whose evidence really is the render queue (panel#646). */
+const RUN_COMMAND = "graph_run";
+
+/** Writes to the user's blueprint LIBRARY, not to the canvas (codex review, P1).
+ *  `graph_save_subgraph` publishes a subgraph as a reusable blueprint; the graph is
+ *  unchanged afterwards, so both graph readers show exactly what they showed before
+ *  and cannot tell a save that landed from one that did not. `panel_list_subgraphs`
+ *  is the reader that can. */
+const LIBRARY_COMMANDS = new Set<string>(["graph_save_subgraph"]);
+
+/** Writes the CLIPBOARD, which nothing in the tool surface can read (codex review).
+ *  Copying leaves the graph identical, so a canvas read is no evidence at all —
+ *  but unlike everything else here, re-issuing is harmless: a second copy of the
+ *  same nodes produces the same clipboard. That makes "just do it again" the
+ *  correct advice rather than a dangerous one. */
+const CLIPBOARD_COMMANDS = new Set<string>(["graph_copy_nodes"]);
+
+/** The four active-workflow mutators. A canvas read cannot see these — they change
+ *  which workflows exist or are open, not what is on the current graph. Mirrors
+ *  ACTIVE_WORKFLOW_MUTATORS in ui-bridge.ts, which cannot be imported here (it
+ *  imports this module). Duplicated deliberately and kept honest by a test that
+ *  reads the ui-bridge source and compares the two. */
+const WORKFLOW_MUTATORS = new Set<string>([
+  "workflow_save",
+  "workflow_save_as",
+  "workflow_rename",
+  "workflow_close",
+]);
+
+/** Workflow NAVIGATION/creation. Deliberately not in ACTIVE_WORKFLOW_MUTATORS — they
+ *  carry their own explicit or new target rather than mutating active content, so the
+ *  fence treats them differently. The question HERE is evidence, not fencing — and the
+ *  evidence for these is NOT the workflow list itself, which is where the first attempt
+ *  went wrong.
+ *
+ *  Found by running the LIVE panel's registered command names through this classifier
+ *  after the fix merged — these two fell to the default branch, which names no tool.
+ *
+ *  The first attempt sent them to `panel_list_workflows` on the reasoning that an opened
+ *  workflow appears there. Codex caught it, and the panel had already written the
+ *  rebuttal: `active` matching your target is NOT proof your open ran, because after a
+ *  backend reconnect the frontend restores a tab BY ITSELF (#433). Naming that reader
+ *  would have been the exact defect this module exists to remove — a confident check
+ *  that cannot answer — for the one command class that already has a purpose-built
+ *  correct mechanism.
+ *
+ *  That mechanism is the panel's OPEN RECEIPTS (#402): every workflow_open/workflow_new
+ *  that RAN is journaled with the selector it was asked for, the identity it resolved
+ *  to, and whether it applied. The latest one rides in the workflow-list reply as
+ *  `last_open` — that is the reply KEY; the panel's local variable is `lastOpenReceipt`,
+ *  and naming THAT is how the first version of this shipped a field no reply carries
+ *  (codex round 2), which is the very defect this module exists to remove. It answers
+ *  ONLY for the command whose id equals its `rid` —
+ *  so an EARLIER successful open of the same file is not evidence about a later dropped
+ *  one. The message says both halves, because the receipt is over-readable without the
+ *  rule that comes with it. */
+const WORKFLOW_NAVIGATION = new Set<string>(["workflow_open", "workflow_new"]);
+
 export function midCommandVerifyClause(cmd: string): string {
   if (isInteractiveCommand(cmd)) {
     // WAITING IS NOT A RECOVERY, and an earlier draft of this said it was
@@ -72,9 +162,66 @@ export function midCommandVerifyClause(cmd: string): string {
       `user may see two. Tell them which one to answer.`
     );
   }
+  if (cmd === RUN_COMMAND) {
+    // The one command the original sentence was actually right about.
+    return (
+      `Verify before retrying (check queue action:"list" / get_image ` +
+      `(action:"list_outputs")) instead of re-issuing it blindly — a second run costs ` +
+      `GPU time and produces a duplicate output.`
+    );
+  }
+  if (WORKFLOW_NAVIGATION.has(cmd)) {
+    return (
+      `Verify with panel_list_workflows and read its \`last_open\` — the panel's own ` +
+      `execution record for opens (#402). It answers ONLY for the command whose id equals ` +
+      `its \`rid\`: \`applied:true\` means it completed, \`applied:false\` means nothing was ` +
+      `applied and it is safe to re-issue, \`applied:"unknown"\` means it may have taken ` +
+      `effect and must NOT be blindly retried. Do NOT conclude anything from \`active\` ` +
+      `matching your target, and do not read an EARLIER receipt for the same file as ` +
+      `evidence about this one — after a backend reconnect the frontend restores a tab by ` +
+      `itself, which explains a matching \`active\` without your command ever running. A ` +
+      `blind retry costs: a second workflow_new leaves the user with two empty tabs.`
+    );
+  }
+  if (WORKFLOW_MUTATORS.has(cmd)) {
+    return (
+      `Verify with panel_list_workflows before retrying — these change which workflows ` +
+      `exist or are open, which a canvas read does not see. Re-issuing blindly can save ` +
+      `or close a second time.`
+    );
+  }
+  if (LIBRARY_COMMANDS.has(cmd)) {
+    return (
+      `Verify with panel_list_subgraphs before retrying — this writes to the blueprint ` +
+      `LIBRARY, not to the canvas, so the graph is identical either way and a graph read ` +
+      `cannot tell a save that landed from one that did not. If the blueprint is already ` +
+      `there, do NOT re-issue it: a second save collides on the name.`
+    );
+  }
+  if (CLIPBOARD_COMMANDS.has(cmd)) {
+    return (
+      `Nothing in the tool surface can check that — the clipboard is not readable, and the ` +
+      `graph is unchanged either way, so neither graph reader is evidence. Just re-issue it: ` +
+      `unlike the other interrupted writes, copying the same nodes twice produces the same ` +
+      `clipboard, so a retry here costs nothing and settles it.`
+    );
+  }
+  if (cmd.startsWith("graph_")) {
+    return (
+      `Verify with a graph READ before retrying — panel_query_graph on the node(s) this ` +
+      `touched (or panel_graph_outline for a structural change) and compare against what ` +
+      `you asked for. A read is idempotent, so it is safe the moment a tab is connected, ` +
+      `and it is the only check that can see a canvas edit: the render queue and the ` +
+      `output list cannot (panel#646). If the read shows the change already applied, do ` +
+      `NOT re-issue it. If the command only moved the view or the selection, it changed ` +
+      `no graph content, so there is nothing to verify and nothing worth re-issuing.`
+    );
+  }
+  // Deliberately names no tool. The defect being fixed was a confidently wrong
+  // check; an unrecognised command is exactly where a guess would be wrong again.
   return (
-    `Verify before retrying (e.g. check queue action:"list" / get_image (action:"list_outputs")) ` +
-    `instead of re-issuing it blindly.`
+    `Verify that it applied before retrying, rather than re-issuing it blindly — the ` +
+    `command reached the panel, so a retry may apply it twice.`
   );
 }
 

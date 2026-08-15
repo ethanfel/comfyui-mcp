@@ -1,0 +1,77 @@
+---
+title: "ComfyUI MCP"
+description: "ComfyUI のためのローカルファーストかつエージェントネイティブなコントロールプレーン — 自然言語で画像・動画・音声を生成し、ワークフローを作成・実行し、モデルとカスタムノードを管理する MCP サーバー + Claude Code プラグインです。ローカル、リモート、Comfy Cloud に対応します。"
+icon: "house"
+---
+
+**ComfyUI MCP** は [ComfyUI](https://github.com/comfyanonymous/ComfyUI) のための **ローカルファーストかつエージェントネイティブなコントロールプレーン** です — [MCP](https://modelcontextprotocol.io) サーバーであり、Claude Code プラグインでもあります。実行中の ComfyUI インスタンス — **ローカル**、**リモート**、または **[Comfy Cloud](https://cloud.comfy.org)** — に AI アシスタントを接続し、画像・動画・音声の生成、ワークフローの実行と作成、モデルとカスタムノードの管理、サーバーの制御を、すべて自然言語で行えます。単なるプロンプトから画像へのブリッジではなく、ComfyUI をあなたに代わって操作する本格的なエージェントです。
+
+<Frame caption="エージェントパネルが ComfyUI をエンドツーエンドで操作 — ローカルにインストール済みのものを読み取り、グラフを接続し、VRAM を解放し、レンダリングを実行">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="クイックスタート" icon="rocket" href="/docs/ja/quickstart">
+    Claude Code にサーバーを追加して、約 2 分で最初の画像を生成しましょう。
+  </Card>
+  <Card title="ツールリファレンス" icon="wrench" href="/docs/tools/image-generation">
+    37 個のツール。ライブスキーマから自動生成されたドキュメントです。
+  </Card>
+  <Card title="インストール" icon="download" href="/docs/ja/installation">
+    ComfyUI をインストールし、MCP サーバーを接続します（ローカルまたはリモート）。
+  </Card>
+  <Card title="設定" icon="gear" href="/docs/configuration">
+    環境変数、トランスポート、トークン、リモート接続先の指定について。
+  </Card>
+</CardGroup>
+
+## できること
+
+<CardGroup cols={3}>
+  <Card title="生成" icon="image">
+    `generate_image` によるテキストから画像への生成に加え、ControlNet と IP-Adapter によるコンディショニングにも対応します。
+  </Card>
+  <Card title="ワークフローの作成" icon="pen-ruler">
+    テンプレートから作成し、修正・検証・可視化を行い、コンパクトな DSL と相互に変換します。
+  </Card>
+  <Card title="モデルの管理" icon="box">
+    HuggingFace/CivitAI を検索し、モデルをダウンロード・一覧表示・削除します。
+  </Card>
+  <Card title="カスタムノード" icon="puzzle">
+    ComfyUI-Manager 経由でノードパックのインストール・更新・スナップショット・バイセクトを行います。
+  </Card>
+  <Card title="インストールと保守" icon="terminal">
+    ComfyUI のインストール／更新、環境の確認、サーバーの起動・停止を行います。
+  </Card>
+  <Card title="ローカル、リモート、クラウド" icon="globe">
+    ローカルインストールを自動検出し、`--comfyui-url` でリモートを指定し、`COMFYUI_API_KEY` で
+    [Comfy Cloud](https://cloud.comfy.org) と通信します — ローカルの ComfyUI は不要です。
+  </Card>
+</CardGroup>
+
+<Note>
+  **macOS**、**Linux**、**Windows** で動作し、ローカルの ComfyUI のインストール先とポートを自動検出します。ソースコードと Issue は [GitHub](https://github.com/artokun/comfyui-mcp) にあります。
+</Note>
+
+## 対象範囲: ローカル、リモート、Comfy Cloud
+
+`comfyui-mcp` は **ローカル**および**リモート**の ComfyUI 向けのコミュニティ MCP です — こちらが主な対象です（Mac/Linux/Windows へのインストール、RunPod、VPS、LAN など）。
+
+**Comfy Cloud** のユーザー向けには、Comfy-Org が [公式のエージェントツール](https://docs.comfy.org/agent-tools) — Comfy Cloud MCP（パブリックベータ）と Comfy In-App Agent（プライベートアルファ）— を提供しています。いずれも Comfy チームが保守し、Comfy Cloud 上で動作します。GPU がない場合や、セットアップを一切したくない場合は、そちらを使ってください（[並べて比較](/docs/local-vs-comfy-cloud)）。`comfyui-mcp` にもコミュニティ版のクラウドモード（`COMFYUI_API_KEY`）が含まれているため、1 つの MCP で 3 つのデプロイ形態すべてを 1 つの設定から対象にできます — ご自身のワークフローに合うものを選んでください。
+
+---
+
+## メンテナー
+
+[**@artokun**](https://github.com/artokun) が開発・保守しています — [Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)（v2 グラフレンダラー / サブグラフのレンダリング / プロモートされたウィジェット）と [ComfyUI Python コア](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun) への継続的なコントリビューターです。
+
+**Comfy-Org の方へ**（または ComfyUI エコシステム周辺で採用をご検討の方へ）: [art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com)。

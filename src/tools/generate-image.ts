@@ -376,7 +376,11 @@ export function registerGenerateImageTool(server: McpServer): void {
       audio_quality: z
         .enum(["V0", "128k", "320k"])
         .optional()
-        .describe("action:\"audio\" — SaveAudioMP3 bitrate/quality (ACE only, one of 'V0'/'128k'/'320k', default: '320k')."),
+        // #1458 — NOT "ACE only" any more. Both audio families end in SaveAudioMP3, and
+        // stable_audio_3 now sets `quality` from this same parameter, so telling a
+        // stable_audio_3 caller the knob does not apply to them is exactly the wrong
+        // answer this issue is about.
+        .describe("action:\"audio\" — SaveAudioMP3 bitrate/quality (ACE and stable_audio_3, one of 'V0'/'128k'/'320k', default: '320k')."),
 
       // ── re-render an existing asset ───────────────────────────────────────
       asset_id: z

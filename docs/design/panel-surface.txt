@@ -19,8 +19,8 @@ panel_create_group
 panel_create_subgraph
 panel_disable_adult_mode
 panel_disconnect
-panel_edit_node
 panel_edit_group
+panel_edit_node
 panel_enter_subgraph
 panel_exit_subgraph
 panel_expose_subgraph_input
@@ -54,6 +54,7 @@ panel_reload
 panel_remove_group
 panel_remove_mcp
 panel_remove_node
+panel_remove_widget
 panel_rename_workflow
 panel_request_adult_consent
 panel_request_secret

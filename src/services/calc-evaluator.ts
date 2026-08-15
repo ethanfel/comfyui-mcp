@@ -8,7 +8,7 @@ import { randomInt } from "node:crypto";
  * property access. Statement-level assignment (`name = expr`) persists across
  * lines. Seeded RNG (mulberry32) makes `rand`/`uniform`/`randint` reproducible.
  *
- * See docs/design/calculate-tool.md for the full design.
+ * See design/calculate-tool.md for the full design.
  */
 
 /** Hard caps to keep a single call bounded. */

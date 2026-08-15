@@ -1,0 +1,147 @@
+---
+title: "インストール"
+description: "ComfyUI をインストールして MCP サーバーに接続します — ローカル、リモート、または Comfy Cloud。"
+icon: "download"
+---
+
+## 1. ComfyUI をインストール
+
+<CardGroup cols={2}>
+  <Card title="ComfyUI Desktop" icon="desktop" href="https://www.comfy.org/download">
+    macOS / Windows で管理型インストールを最も簡単に済ませる方法です。
+  </Card>
+  <Card title="ソースから" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
+    自分でクローンして手動で実行する — または [`install_comfyui`](/docs/tools/install-environment) ツールを使います。
+  </Card>
+</CardGroup>
+
+## 2. MCP サーバーを追加
+
+ComfyUI MCP は npm に `comfyui-mcp` として公開されており、`npx` で実行します — グローバルインストールは不要です。
+
+<Tabs>
+  <Tab title="ローカル ComfyUI">
+    サーバーはローカルのインストールとそのポートを自動検出します。`~/.claude/settings.json` に追加してください:
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="リモート ComfyUI">
+    `--comfyui-url` で到達可能な任意のインスタンスを指定できます。HTTP ベースのツール（生成、キュー、
+    ワークフロー、モデル検索など）にローカルインストールは不要です。ホストがループバック以外の場合、
+    サーバーは **リモートモード** に入り、`COMFYUI_PATH` の自動検出をスキップします。これにより、
+    古いローカルインストールがアップロードを黙って吸い込むことはありません。
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp", "--comfyui-url", "https://my-comfy.example.com"]
+        }
+      }
+    }
+    ```
+
+    <Note>
+      ほとんどのツールはリモートの ComfyUI に対しても問題なく動作します — ComfyUI-Manager の
+      HTTP API を介したカスタムノードのインストールも含まれます。本当にローカルのインストールパスが
+      必要なのは、ComfyUI 自体のインストール、comfy-cli に依存する操作、ログの読み取り、モデル
+      ファイルの削除で、これらはリモートモードでは明確なエラーを返します。[しくみ](/docs/concepts)
+      を参照してください。
+    </Note>
+  </Tab>
+  <Tab title="Comfy Cloud">
+    `COMFYUI_API_KEY` を設定して [Comfy Cloud](https://cloud.comfy.org) を対象にします。サーバーは
+    **クラウドモード** に入ります: HTTP のプリミティブは `X-API-Key` 認証で `cloud.comfy.org` 経由に
+    ルーティングされます。WebSocket に依存するツールと、ローカルのファイルシステム / プロセスを使う
+    ツールは、明確な `CLOUD_UNSUPPORTED` エラーを投げます。
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "COMFYUI_API_KEY": "your-comfy-cloud-api-key"
+          }
+        }
+      }
+    }
+    ```
+
+    <Note>
+      クラウドモードはローカルの `COMFYUI_PATH` 自動検出をスキップし、クラウド自身のモデル
+      ライブラリを使用します。ローカルのプロセスやファイルシステムにアクセスするツールは
+      `CLOUD_UNSUPPORTED` を投げますが、それ以外のツールはエラーを投げる代わりに機能を縮退させます
+      — `list_local_models` は空のリストを返し、`apply_manifest` は全体をエラーにせず項目ごとに
+      `skipped`/`failed` を報告します。機能対応表の全体は [設定](/docs/configuration#deployment-modes)
+      ページを参照してください。
+    </Note>
+    <Note>
+      **クラウドだけをお使いですか？** [Comfy-Org の Comfy Cloud MCP](https://docs.comfy.org/agent-tools)（パブリックベータ）が本来の選択肢です — [ローカル vs. Comfy Cloud](/docs/local-vs-comfy-cloud) を参照してください。ローカル / リモート / クラウドを 1 つの MCP でまとめたい場合や、今すぐクラウド対応が必要な場合は、`comfyui-mcp` のクラウドモードを使ってください。
+    </Note>
+  </Tab>
+</Tabs>
+
+あとは Claude Code で `/mcp` を実行して接続してください。
+
+## 3. パネルオーケストレーターを起動する
+
+**サイドバーパネル** を使う場合にのみ必要です。Claude Code や他の MCP クライアントから ComfyUI を
+操作しているなら、この手順は飛ばしてかまいません — そちらの経路では上で設定した MCP サーバーを
+使います。
+
+パネルは純粋なフロントエンドの ComfyUI 拡張機能です。お使いのマシンでプロセスを起動できないため、
+**オーケストレーターはご自身で起動し**、パネルがそこに接続します。
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+これは `--panel-orchestrator` の短縮形です。ブラウザで開いている ComfyUI を自動的に対象にし、
+`ws://127.0.0.1:9180` でブリッジを提供し（`COMFYUI_MCP_BRIDGE_PORT` で変更可能）、パネルを使って
+いる間は実行したままにしておく必要があります。あとは **エージェント** タブを開き、プロバイダーを
+選んで **接続** をクリックしてください。
+
+**リモート** の ComfyUI を操作する場合 — クラウドのポッドや LAN 上の別のマシンでしょうか？ リモート
+側ではなく **ご自身のマシン** で同じコマンドを実行し、URL を渡してください:
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+プロバイダーへのログインとエージェントはローカルに留まり、リモートホストには何もインストールされ
+ません。トンネルの詳細は [クラウドデプロイ](/docs/cloud-deployment) を参照してください。
+
+## 4.（任意）トークン
+
+一部のツールは API トークンを使用します。サーバーの `env` ブロックで設定してください（[設定](/docs/configuration) を参照）:
+
+- `CIVITAI_API_TOKEN` — 制限付きの CivitAI ダウンロード
+- `HUGGINGFACE_TOKEN` — HuggingFace のレート制限の緩和
+- `GITHUB_TOKEN` — スキル生成 / ノードのメタデータ取得
+- `COMFY_API_KEY` — ホスト型の comfy.org API ノード
+
+## ローカル開発
+
+このプロジェクトは `npm link` を使うため、`npx comfyui-mcp` はローカルのビルドを指すようになります:
+
+```bash
+git clone https://github.com/artokun/comfyui-mcp
+cd comfyui-mcp
+npm install
+npm run build
+npm link
+```
+
+コードを変更したら `npm run build` を実行し、`/mcp` で再接続してください。

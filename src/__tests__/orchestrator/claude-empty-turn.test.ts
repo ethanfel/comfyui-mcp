@@ -13,6 +13,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent } from "../../orchestrator/agent-backend.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 // Keep the durable turn registry (#886) hermetic per test file — the backend
 // writes it on every submission, and the fixed INIT session id would otherwise
@@ -123,7 +124,7 @@ async function* channel() {
  *  which per-turn state tracking relies on. */
 async function runScript(script: unknown[]): Promise<AgentEvent[]> {
   const { events, done } = await startBackend(channel());
-  await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+  await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
   for (const m of script) hoisted.queue.push(m);
   hoisted.queue.end();
   await done;
@@ -188,15 +189,15 @@ describe("Claude backend #740 — blocking SDK informational messages", () => {
     }
     const { events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     // Turn A is hook-blocked and fails…
     hoisted.queue.push(informational({ prevent_continuation: true }));
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: false });
     // …and turn B then recovers and classifies cleanly on its own flags.
     releaseTurnB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.push(assistantMsg("recovered"));
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
@@ -266,7 +267,7 @@ describe("Claude backend #740 — an empty turn is never a success", () => {
     };
     hoisted.queue.push(INIT);
     // Wait until the turn is actually IN FLIGHT (submitted to the SDK)…
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     // …then stop it: the aborted empty result stays a clean ok:true.
     await backend.interrupt();
     await done;
@@ -291,16 +292,16 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
     // Turn A goes in flight, produces content, and completes successfully.
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.push(assistantMsg("A reply"));
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: true });
     // Idle now: turn A's result is consumed and turn B is not yet submitted.
     // This interrupt must leave NO state behind.
     await backend.interrupt();
     releaseTurnB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     // Turn B ends genuinely empty → still a failure with the synthetic error.
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
@@ -326,15 +327,15 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     }
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     // Interrupt turn A in flight → its aborted empty result stays ok:true…
     await backend.interrupt();
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: true });
     // …but the blessing dies with that result: turn B's empty result still fails.
     releaseTurnB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
     await done;
@@ -358,7 +359,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     }
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     // Turn A is interrupted mid-flight and produces NO result; the panel's
     // no-result fallback releases the gate and turn B is submitted. Per the
     // r10 contract, a killed turn SUPERSEDED by a newer submission never
@@ -367,9 +368,9 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     // pre-r10 this stream was attributed to A — that premise is rejected).
     await backend.interrupt();
     releaseTurnB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.push(RESULT_INTERRUPTED); // classifies as B's genuine error
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: false, turn: 2 });
     expect(errorsOf(events)).toHaveLength(0); // genuine error result — no synthetic error
     // A's genuinely late landing, if it ever arrives, is then tolerated via
@@ -395,7 +396,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
       for await (const ev of backend.run({ channel: channel() as never })) events1.push(ev);
     })();
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     await backend.interrupt();
     hoisted.queue.end();
     await done1;
@@ -407,11 +408,11 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
       for await (const ev of backend.run({ channel: channel() as never })) events.push(ev);
     })();
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     // Turn B ends genuinely empty → failure + the synthetic error (no leak of
     // session 1's blessing across the restart boundary).
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: false });
     expect(errorsOf(events)).toHaveLength(1);
     // A STRAY late result from the dead session must still FAIL CLOSED —
@@ -436,7 +437,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
   it("a result/success with NO matching turn fails closed (unverifiable) instead of forwarding ok:true", async () => {
     const { events, done } = await startBackend(channel());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     // One submission, TWO results: the second has no trace. A normal successful
     // turn ALWAYS has a trace (stamped at submission), so traceless is
     // anomalous by construction — it must not fabricate a success (#745 r3).
@@ -461,7 +462,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     const { events, done } = await startBackend(seventeenTurns());
     hoisted.queue.push(INIT);
     // The 17th submission overflows the 16-trace bound and evicts trace #1.
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(17));
     // Every turn's result arrives late. Turn 1's result crosses the evicted
     // gap (poisoned → unverifiable); turn 17's own result ends up traceless
     // (fail closed). NOTHING may be forwarded as ok:true.
@@ -480,11 +481,11 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     }
     const { events, done } = await startBackend(seventeenTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17)); // 17th submission evicts trace #1
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(17)); // 17th submission evicts trace #1
     // Turn 1's late result crosses the evicted gap → FIFO alignment is
     // UNRECOVERABLE → the session is poisoned terminally.
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: false });
     // Content streaming in afterward accrues to a MISMATCHED trace — it is not
     // proof of its own turn's success and must NOT rescue classification:
@@ -513,7 +514,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
       for await (const ev of backend.run({ channel: seventeenTurns() as never })) events1.push(ev);
     })();
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(17));
     hoisted.queue.push(RESULT_SUCCESS); // crosses the evicted gap → poison
     hoisted.queue.end();
     await done1;
@@ -529,7 +530,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
       for await (const ev of backend.run({ channel: channel() as never })) events.push(ev);
     })();
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.push(assistantMsg("hello again"));
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
@@ -553,7 +554,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
       for await (const ev of backend.run({ channel: seventeenTurns() as never })) events1.push(ev);
     })();
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(17));
     for (let i = 0; i < 17; i++) hoisted.queue.push(RESULT_SUCCESS); // gap → poison → all fail closed; FIFO drains to empty
     hoisted.queue.end();
     await done1;
@@ -569,7 +570,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
       for await (const ev of backend.run({ channel: channel() as never })) events.push(ev);
     })();
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.push(assistantMsg("back to normal"));
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();

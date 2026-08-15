@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**37 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**37 MCP tools** | **39 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **56 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -123,7 +123,7 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 
 ### Built-in skills
 
-35 skills total — model-family guides (Flux, WAN, LTX 2.3, Qwen, Z-Image, Ideogram 4, ERNIE, ANIMA + anime / WAN / Z-Image LoRA training), the **model-registry** (curated download URLs), the **civitai** pairing skill, node authoring, the **launch/performance-flags** matrix, and the core four below. Full list on the [plugin docs page](https://comfyui-mcp.artokun.io/docs/plugin).
+39 skills total — model-family guides (Flux, WAN, LTX 2.3, Qwen, Z-Image, Ideogram 4, ERNIE, ANIMA + anime / WAN / Z-Image LoRA training), the **model-registry** (curated download URLs), the **civitai** pairing skill, node authoring, the **launch/performance-flags** matrix, and the core four below. Full list on the [plugin docs page](https://comfyui-mcp.artokun.io/docs/plugin).
 
 > **Installer packs.** [`packs/`](packs/) bundles 13 one-command ComfyUI setups — ANIMA, Ideogram 4, LTX-2.3, ERNIE, WAN (animate / longer-videos / transparent), Qwen (image / image-edit), Z-Image (turbo / base / xy-plot) and artokun-flow (WAN Animate — replace / animate). Each is a manifest of custom nodes + model URLs + workflow that drives both `apply_manifest` and generated `install-windows.bat` / `install-runpod.sh`, with CI that validates every model link + payload size. See [`packs/README.md`](packs/README.md).
 
@@ -141,6 +141,7 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 | **comfy-explorer** | Sonnet | Researches custom node packs — reads docs, queries `/object_info`, generates comprehensive skill files |
 | **comfy-debugger** | Sonnet | Autonomously diagnoses workflow failures — gathers logs + history, identifies failing node, checks models + custom nodes, proposes and optionally applies fixes |
 | **comfy-optimizer** | Sonnet | Analyzes workflows for performance — detects redundant nodes, VRAM waste, wrong CFG/steps for model family, precision issues, suggests optimizations |
+| **comfy-researcher** | Sonnet | Discovers and ranks ComfyUI custom node packs for a stated image-generation problem |
 
 ### Hooks
 
@@ -193,10 +194,10 @@ your own path to it, e.g. an SSH port-forward). Either way the panel JS runs in
 **your local browser** and the agent — and your login — run only on **your**
 machine, so nothing is installed remotely.
 
-To finish: open the remote ComfyUI in your browser, turn on **Settings → General →
-"Use external/local orchestrator (advanced)"** in the Agent panel, then click
-**Connect**. (In that mode the panel connects straight to the local bridge instead
-of asking the ComfyUI host to spawn an orchestrator it can't run.)
+To finish: with `connect` still running on your machine, open the remote ComfyUI in
+your browser and click **Connect** in the Agent panel. (The panel is a pure-frontend
+extension — it links to the bridge your `connect` process is already serving, rather
+than asking the ComfyUI host to spawn an orchestrator it cannot run.)
 
 **Multi-provider, full parity.** The orchestrator depends on a provider-neutral
 **`AgentBackend`** port (dependency injection), with two adapters:
@@ -241,7 +242,7 @@ New tools that give every backend the same expertise and a cost guardrail:
 | `panel_load_workflow` | (panel tool) Load a full workflow onto the live canvas in one shot — by bundled `pack` name (read server-side, never shuttled through chat) or by graph JSON |
 | `panel_strip_workflow` / `panel_slice_workflow` | (panel tools) De-virtualize a tangled graph (Get/Set buses, Reroutes, subgraphs, bypass → real connections) or carve one rgthree-toggled pipeline out of a monolith — by `pack`, server-side `path`, or inline graph; for understanding/rebuilding expert workflows without hand-tracing |
 
-See the design doc — **[docs/design/agent-backend-injection.md](docs/design/agent-backend-injection.md)** —
+See the design doc — **[design/agent-backend-injection.md](design/agent-backend-injection.md)** —
 for the port, the capability matrix, and the per-provider "clink" points, and the
 **[panel docs](https://comfyui-mcp.artokun.io/docs/panel)** for the full sidebar UX.
 
@@ -606,7 +607,7 @@ npx -y comfyui-mcp@latest --comfyui-url http://localhost:8188 --force-remote
 | `REGISTRY_ACCESS_TOKEN` | | Comfy Registry API key for `node_pack` (`action: "publish"`) (env-only, never logged) |
 | `COMFYUI_DOWNLOAD_CACHE_DIR` | `~/.comfyui-mcp/cache` | Content-addressed model-download cache (dedup + concurrent coalescing) |
 | `COMFYUI_LRU_CACHE_SIZE_GB` | `0` | Cap the download cache in GB; `0` disables LRU eviction |
-| `COMFYUI_STARTUP_CHECK_INTERVAL_S` / `…_MAX_TRIES` | `1` / `20` | Readiness-probe interval + max tries when starting a local ComfyUI |
+| `COMFYUI_STARTUP_CHECK_INTERVAL_S` / `…_MAX_TRIES` | `1` / `60` | Readiness-probe interval + max tries when starting a local ComfyUI |
 | `COMFYUI_ALWAYS_RESTART` | `false` | Auto-restart a crashed local ComfyUI (bounded by `COMFYUI_RESTART_MAX_ATTEMPTS` / `COMFYUI_RESTART_WINDOW_S`) |
 | `COMFYUI_MCP_STALL_S` | `180` | Render-wedge watchdog: seconds a sampler step can re-emit the same progress before a STALL/BACKLOG note is prepended to the agent's next turn (clamped 15–3600s; live-tunable from the panel) |
 | `COMFYUI_MCP_INTERRUPT_S` | `30` | Seconds `queue` (action:"cancel") waits for an interrupt to actually stop a job before escalating to `/free` and reporting it wedged |
@@ -651,11 +652,12 @@ doesn't work). Thinking and vision are strongly recommended — without
 thinking, multi-step tool chains degrade; without vision the agent can
 generate but can't see its own outputs.
 
-**Compact tool mode is the default**: the server registers 3 meta-tools
-(`list_tools` → `describe_tool` → `call_tool`) instead of the full ~200-schema
-surface (~200 KB / ~50k tokens per `tools/list`), pulling schemas into context
-one tool at a time. Frontier-model harnesses opt back into the full surface
-with `--full` / `COMFYUI_MCP_TOOL_MODE=full`. **Run it locally
+**Compact tool mode is one flag away**: `--compact` /
+`COMFYUI_MCP_TOOL_MODE=compact` registers 3 meta-tools (`list_tools` →
+`describe_tool` → `call_tool`) instead of the direct surface, pulling schemas
+into context one tool at a time — the right trade for small local models. The
+direct surface is the default and is what frontier-model harnesses want.
+**Run it locally
 for free with our fine-tuned models**: `ollama pull artokun/gemma4-comfyui-mcp:e4b`
 (also `:e2b` for ~2 GB VRAM, `:12b` for ~8 GB) — Gemma 4 QLoRA-trained on 1,055
 server-verified trajectories over the full comfyui-mcp tool surface, and the

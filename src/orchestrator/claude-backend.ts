@@ -8,7 +8,7 @@
 // PanelAgent keeps all provider-agnostic orchestration (queue, turn-gate, bridge
 // push, rewind-anchor tracking, self-restart) and drives this backend via
 // `for await (const ev of backend.run({...}))`. See
-// docs/design/agent-backend-injection.md.
+// design/agent-backend-injection.md.
 
 import type {
   Query,

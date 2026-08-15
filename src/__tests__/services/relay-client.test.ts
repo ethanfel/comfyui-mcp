@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import { UiBridge } from "../../services/ui-bridge.js";
 import { RelayClient } from "../../services/relay-client.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 /**
  * A minimal stand-in for the comfyui-mcp-relay Durable Object, speaking the same
@@ -125,7 +126,7 @@ describe("RelayClient + UiBridge.attachRelayConnection (via a fake relay)", () =
     });
 
     panelSock.send(JSON.stringify({ type: "hello", tab_id: "relay-tab-1", title: "relay-workflow" }));
-    await vi.waitFor(() => expect(bridge.connected()).toBe(true));
+    await waitFor(() => expect(bridge.connected()).toBe(true));
     expect(bridge.tabs()).toHaveLength(1);
     expect(bridge.tabs()[0].title).toBe("relay-workflow");
 
@@ -163,7 +164,7 @@ describe("RelayClient + UiBridge.attachRelayConnection (via a fake relay)", () =
     await dial("tab-a", "workflow-a");
     await dial("tab-b", "workflow-b");
 
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
     const titles = bridge.tabs().map((t) => t.title).sort();
     expect(titles).toEqual(["workflow-a", "workflow-b"]);
   });
@@ -188,10 +189,10 @@ describe("RelayClient + UiBridge.attachRelayConnection (via a fake relay)", () =
     cleanup.push(() => panelSock.close());
     await new Promise<void>((resolve) => panelSock.on("open", () => resolve()));
     panelSock.send(JSON.stringify({ type: "hello", tab_id: "drop-tab", title: "wf" }));
-    await vi.waitFor(() => expect(bridge.connected()).toBe(true));
+    await waitFor(() => expect(bridge.connected()).toBe(true));
 
     // Kill the fake relay out from under the client — its control connection drops.
     await fakeRelay.close();
-    await vi.waitFor(() => expect(bridge.connected()).toBe(false), { timeout: 3000 });
+    await waitFor(() => expect(bridge.connected()).toBe(false), { timeout: 3000 });
   });
 });

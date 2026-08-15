@@ -5,13 +5,13 @@ kind: img2vid
 description: >-
   WAN 2.2 image-to-video workflow that renders transparent-background animated
   character expressions (looping, pingpong WebP + GIF with an alpha channel) for
-  use as SillyTavern expression sprites. Drives the WAN 2.2 I2V A14B (Q8_0 GGUF)
+  use as SillyTavern expression sprites. Drives the WAN 2.2 I2V A14B (Q4_K_S GGUF)
   high/low-noise UNets with the 4-step Lightning I2V LoRAs, then cuts the subject
   out per-frame with the ComfyUI-RMBG BiRefNetRMBG node (Alpha output, the
   BiRefNet_toonout matting model) so the exported animation has a transparent
   background. Single-pipeline graph sliced from the wan-transparent monolith
   (one "WAN 2.2 IMAGE TO VIDEO" group, un-bypassed into a standalone graph).
-vram: "12-24GB (Q8_0 I2V; drop to a smaller GGUF quant for <12GB)"
+vram: "<12GB (Q4_K_S I2V, 8.2GB per UNet; step up to Q5_K_S or Q8_0 for quality)"
 workflow: workflow.json
 skill: wan-t2v-video
 launch_args: []
@@ -31,7 +31,7 @@ notes:
     and a GIF with the alpha preserved.
   - Base WAN 2.2 weights (VAE, umt5 text encoder, I2V high/low UNets, Lightning I2V
     LoRAs) come from the WAN 2.2 ULTRA installer mirror; this pack only pulls the
-    subset the transparent workflow references (I2V branch, Q8_0).
+    subset the transparent workflow references (I2V branch, Q4_K_S).
   - >-
     Torch/CUDA fix — if a custom node (e.g. ComfyUI-RMBG) drags in a Torch
     version that breaks CUDA, reinstall the matching CUDA build, e.g.

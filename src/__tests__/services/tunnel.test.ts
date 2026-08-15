@@ -48,6 +48,7 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import { startQuickTunnel } from "../../services/tunnel.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 describe("startQuickTunnel", () => {
   beforeEach(() => {
@@ -65,7 +66,7 @@ describe("startQuickTunnel", () => {
     const promise = startQuickTunnel(8765);
 
     // Tunnel.quick should be invoked synchronously after ensureBinary().
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
 
     const call = quickCalls[0];
     expect(call.url).toBe("http://localhost:8765");
@@ -90,7 +91,7 @@ describe("startQuickTunnel", () => {
 
   it("stop() tears down the tunnel and marks state stopped", async () => {
     const promise = startQuickTunnel(9000);
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
     state.lastTunnel!.emit("url", "https://abc.trycloudflare.com");
     const handle = await promise;
 
@@ -101,14 +102,14 @@ describe("startQuickTunnel", () => {
 
   it("rejects when the tunnel errors before becoming ready", async () => {
     const promise = startQuickTunnel(9100);
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
     state.lastTunnel!.emit("error", new Error("boom"));
     await expect(promise).rejects.toThrow(/boom/);
   });
 
   it("rejects when cloudflared exits before the url event", async () => {
     const promise = startQuickTunnel(9200);
-    await vi.waitFor(() => expect(quickCalls).toHaveLength(1));
+    await waitFor(() => expect(quickCalls).toHaveLength(1));
     state.lastTunnel!.emit("exit", 1, null);
     await expect(promise).rejects.toThrow(/exited before tunnel was ready/);
   });

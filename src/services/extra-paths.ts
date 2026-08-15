@@ -4,6 +4,7 @@ import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { config, isRemoteMode } from "../config.js";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import {
   parseExtraModelPathsConfigsFromArgvRaw,
   type LiveServerSnapshot,
@@ -404,7 +405,14 @@ function standaloneRoot(): {
   // an env var naming a Desktop-installer WRAPPER yields `<wrapper>/ComfyUI` — a path
   // this process INFERRED, which can vanish while the wrapper survives (codex round 4).
   // Anything inferred is gated exactly like the saved default workspace.
-  const envPath = process.env.COMFYUI_PATH;
+  // #1512 — normalized, and NOT optional here. This compares against
+  // `config.comfyuiPath`, which is normalized at ingestion; leaving this side raw
+  // would make a value with a trailing space fail `samePath` and silently
+  // reclassify an explicitly-named root as "comfyui-path-inferred" — a DIFFERENT,
+  // gated branch. Before the trim both sides were equally malformed and matched by
+  // accident, so normalizing only the other side would have introduced that
+  // divergence rather than fixed it.
+  const envPath = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path;
   const source: StandaloneRootSource = !config.comfyuiPath
     ? "default-workspace"
     : envPath && samePath(config.comfyuiPath, envPath)

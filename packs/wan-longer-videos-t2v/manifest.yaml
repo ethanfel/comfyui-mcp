@@ -26,7 +26,7 @@ models:
   - url: https://huggingface.co/Aitrepreneur/FLX/resolve/main/wan_2.1_vae.safetensors
     local_path: vae/wan_2.1_vae.safetensors
 
-  # --- UNets / diffusion models (GGUF, Q8_0 tier) ---
+  # --- UNets / diffusion models (GGUF, Q4_K_S tier — the <12GB tier) ---
   - url: https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-T2V-A14B-HighNoise-Q4_K_S.gguf
     local_path: unet/Wan2.2-T2V-A14B-HighNoise-Q4_K_S.gguf
   - url: https://huggingface.co/Aitrepreneur/FLX/resolve/main/Wan2.2-T2V-A14B-LowNoise-Q4_K_S.gguf

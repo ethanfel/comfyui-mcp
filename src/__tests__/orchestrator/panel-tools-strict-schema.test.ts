@@ -121,17 +121,28 @@ describe("panel-tools #754: strict schemas reject unknown argument keys", () => 
     const here = dirname(fileURLToPath(import.meta.url));
     const src = readFileSync(join(here, "../../orchestrator/panel-tools.ts"), "utf8");
 
+    // Slice each function to the START OF THE NEXT top-level declaration rather than a
+    // fixed byte count. #873 inserted a policy check at the top of BOTH functions and
+    // pushed the schema line past a 1200- and then an 1800-byte window; each time the
+    // test failed for a reason that had nothing to do with what it asserts. The claim is
+    // WHICH schema builder each call site uses — a window that depends on how much
+    // unrelated code sits above it measures the wrong thing, and the natural repair
+    // (widen it again) leaves the same trap armed for the next edit.
+    const functionBody = (marker: string): string => {
+      const start = src.indexOf(marker);
+      expect(start, `${marker} not found`).toBeGreaterThan(0);
+      const rest = src.slice(start + marker.length);
+      const end = rest.search(/\nexport (async )?function |\nexport const /);
+      return rest.slice(0, end === -1 ? undefined : end);
+    };
+
     // registerPanelTools (MCP SDK / Codex HTTP transport).
-    const registerIdx = src.indexOf("export function registerPanelTools(");
-    expect(registerIdx).toBeGreaterThan(0);
-    const registerBlock = src.slice(registerIdx, registerIdx + 1200);
+    const registerBlock = functionBody("export function registerPanelTools(");
     expect(registerBlock).toMatch(/inputSchema:\s*strictPanelSchema\(d\.schema\)/);
     expect(registerBlock).not.toMatch(/inputSchema:\s*d\.schema[,\s]/);
 
     // createPanelMcpServer (Anthropic Agent SDK / Claude in-process transport).
-    const createIdx = src.indexOf("export function createPanelMcpServer(");
-    expect(createIdx).toBeGreaterThan(0);
-    const createBlock = src.slice(createIdx, createIdx + 1800);
+    const createBlock = functionBody("export function createPanelMcpServer(");
     expect(createBlock).toMatch(/strictPanelSchema\(d\.schema\)/);
   });
 });

@@ -39,6 +39,7 @@ import { DefaultsManager } from "../services/defaults-manager.js";
 import { ToolCatalog } from "./catalog.js";
 import { registerCompactTools } from "./compact.js";
 import { logger } from "../utils/logger.js";
+import { resolveToolSurfacePolicy, withToolSurfaceFilter } from "./tool-surface-filter.js";
 
 /**
  * Every static tool group, in registration order (order is observable in
@@ -161,9 +162,24 @@ export async function registerAllTools(server: McpServer): Promise<void> {
   // Hydrate persisted defaults before any tool registration so subsequent
   // tools can consult DefaultsManager.apply() against a fully-resolved view.
   await DefaultsManager.load();
-  const gated = withBlindImageGate(server);
+  // #873 — the operator's tool-surface policy, applied in the SAME position as the
+  // blind-image gate. collectToolCatalog() applies it too, which is what stops the
+  // compact `call_tool` facade being a way around it.
+  const policy = resolveToolSurfacePolicy();
+  const filtered: string[] = [];
+  const gated = withToolSurfaceFilter(withBlindImageGate(server), policy, (n) => filtered.push(n));
   for (const [, register] of TOOL_GROUPS) register(gated);
   await registerAutoloadedWorkflows(gated);
+  if (policy.active) {
+    // Logged, never pushed to the model: the point is that it does not learn these
+    // exist. The OPERATOR needs to see it, and a silent filter is how a misconfigured
+    // allow list becomes an afternoon of "why can't it render".
+    logger.info(
+      `[tools] surface restricted by policy${policy.preset ? ` (preset "${policy.preset}")` : ""} — ` +
+        `${filtered.length} tool(s) withheld` +
+        (filtered.length ? `: ${filtered.slice(0, 12).join(", ")}${filtered.length > 12 ? ", …" : ""}` : ""),
+    );
+  }
 }
 
 /**
@@ -237,7 +253,15 @@ export async function registerFullTools(
 export async function collectToolCatalog(): Promise<ToolCatalog> {
   await DefaultsManager.load();
   const catalog = new ToolCatalog();
-  const registrar = withBlindImageGate(catalog.asRegistrar());
+  // #873 — THE LOAD-BEARING HALF. `call_tool` dispatches through this catalog and
+  // `list_tools` is built from it, so filtering here is what makes the policy a boundary
+  // rather than a suggestion: a denied tool is neither listed nor reachable by name.
+  // Filtering only the direct registration above would leave the facade as a clean
+  // bypass, which is precisely what the report calls out.
+  const registrar = withToolSurfaceFilter(
+    withBlindImageGate(catalog.asRegistrar()),
+    resolveToolSurfacePolicy(),
+  );
   for (const [category, register] of TOOL_GROUPS) {
     catalog.setCategory(category);
     register(registrar);

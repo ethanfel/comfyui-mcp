@@ -16,18 +16,22 @@
 
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { extname, basename, dirname, join } from "node:path";
 import {
   downloadModel,
   liveListingHasEntry,
+  managerJobFilename,
   resolveDownloadTarget,
   shouldDispatchDownloadToManager,
   verifyLandedModel,
+  verifyManagerVisibility,
 } from "./model-resolver.js";
+import type { ListedBeforeBaseline } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
 import { ModelError } from "../utils/errors.js";
 import {
+  readDownloadProgress,
   persistDownloadJob,
   readPersistedDownloadJob,
   listPersistedDownloadJobs,
@@ -128,6 +132,10 @@ export interface DownloadJob {
   /** A persisted in-flight record missed its owner heartbeat. It stays visible
    *  because this is not proof the physical transfer stopped (#761). */
   staleInflight?: boolean;
+  /** The writer's process is PROVEN gone — its pid answers ESRCH (#1479). Only ever
+   *  `true` or absent: "cannot tell" must never render as death, which is the whole
+   *  reason `staleInflight` alone was the wrong branch for the status note. */
+  writerProvenGone?: boolean;
   /** Age of the missing persisted heartbeat, used only for status diagnostics. */
   staleForMs?: number;
   /** This "cancelled" record was written by a LATER session reclaiming a stale
@@ -255,6 +263,32 @@ function remoteSerializeKey(url: string, targetSubfolder: string, filename?: str
     .filter(Boolean)
     .join("/");
   return `remote:${sub}/${(name || "model").trim()}`.toLowerCase();
+}
+
+/**
+ * Read the pre-download listing baseline as a TRI-STATE (#1374 review, P1-1).
+ *
+ * Three distinct things used to arrive as `undefined` and be treated alike:
+ * the caller named no file, the listing call threw, and the server answered
+ * "cannot say". None of them is "the server did not list it before", and reading
+ * them as that is what lets a pre-existing file be credited to a dispatch that
+ * fetched nothing. Only a real, answered `false` is a negative baseline.
+ *
+ * Never throws — a baseline is a nicety and must not fail a download.
+ */
+async function captureListingBaseline(
+  targetSubfolder: string,
+  name: string | undefined,
+): Promise<ListedBeforeBaseline> {
+  if (!name) return "unknown";
+  try {
+    const has = await liveListingHasEntry(targetSubfolder, name);
+    // liveListingHasEntry ITSELF returns undefined for "could not be asked", and
+    // that is the state this whole helper exists to keep distinct.
+    return has === undefined ? "unknown" : has;
+  } catch {
+    return "unknown";
+  }
 }
 
 /**
@@ -400,23 +434,33 @@ export async function startDownloadJob(
   // too (the local callback race is inherently local, but this keeps the server
   // write single-writer and the last-started result deterministic).
   let serializeKey: string;
-  /** Did the live server ALREADY list this exact entry before we started? Captured
-   *  HERE, before any bytes are written, so the post-landing check can tell "the
-   *  server sees it BECAUSE we wrote it" from "it already knew that name" (#369). */
-  let listedBefore: boolean | undefined;
+  /** Did the live server ALREADY list this exact entry before we started? Filled in
+   *  by `captureListingBaseline` inside `settled` — NOT here. See #1374 review P1-2
+   *  at the capture site for why the position matters. */
+  let listedBefore: ListedBeforeBaseline = "unknown";
+  /** The entry the baseline is about: the RESOLVED local filename on the local
+   *  route, the requested name on the Manager route. `undefined` on the Manager
+   *  route when the caller named no file — the Manager decides the name from the
+   *  URL and only reports it in the dispatch descriptor, so guessing one here
+   *  would baseline the WRONG entry, which is worse than having no baseline. */
+  let baselineName: string | undefined;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
-    try {
-      listedBefore = await liveListingHasEntry(targetSubfolder, target.filename);
-    } catch {
-      listedBefore = undefined; // unknowable → the check stays conservative
-    }
+    baselineName = target.filename;
     // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
     // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
     // (different representations) and must NOT dedup to one writer/one job.
     destKey = downloadJobIdFor(`${target.targetPath}\n${authIdentity(auth)}`);
     serializeKey = await localSerializeKey(target.targetPath);
   } else {
+    // #1374 — BASELINE THE MANAGER ROUTE TOO. The post-dispatch check below asks
+    // the connected server whether it now lists the file; without a baseline, a
+    // pre-existing file of the same name reads as a successful landing, which is
+    // the exact trap `listedBefore` was added for on the local path (#369). The
+    // Manager route resolves no local target, so the name asked for is the name
+    // to ask about — that is also what `managerJobFilename` will report, so the
+    // baseline and the check are about the same entry.
+    baselineName = filename;
     serializeKey = remoteSerializeKey(url, targetSubfolder, filename);
   }
   // The PUBLIC id (download_model action:"status" handle): the destination key when we have one
@@ -577,18 +621,60 @@ export async function startDownloadJob(
     job.path = landedPath;
     job.status = "done";
     job.finished_at = Date.now();
-    // A LOCAL landing is not yet a verified placement. Mark it PENDING in the SAME
+    // A landing is not yet a verified placement. Mark it PENDING in the SAME
     // synchronous step that publishes "done" (and in the same persisted record), so
     // no reader — this session's tool call inside its grace window, or another
-    // session reading the record — can ever see a completed local download with no
+    // session reading the record — can ever see a completed download with no
     // verification field and render it as confirmed success (#369, codex gate).
-    if (!dispatchToManager) job.live_visible = "pending";
-    persistJobRecord(job);
+    //
+    // #1374 review, P1-3 — THE MANAGER ROUTE GETS THIS TOO. Its check runs a beat
+    // after this commit, so `done` with no field was a real, reachable window; a
+    // reader landing in it could not tell "not checked yet" from "pre-fix record"
+    // and the tool re-probed the server by hand to cover for it. With the field
+    // always populated, the record is the single source of the verdict.
+    job.live_visible = "pending";
+    // #1545 — this return value was DISCARDED, and it is the one that says
+    // whether any OTHER process can see the job finish. `persistDownloadJob`
+    // returns false when the atomic replace loses to a reader holding the record
+    // open, and it deliberately keeps the PRIOR complete record rather than
+    // risking a torn write — so the durable answer stays "downloading" until the
+    // ~15s heartbeat retries.
+    //
+    // That is the whole of #1545: the completion event is raised from THIS
+    // process's memory, while `download_model action:"status"` reads the record
+    // from the spawned stdio child. Silently dropping the failure is what let
+    // those two disagree for seconds with nothing to explain it.
+    //
+    // One immediate re-attempt (the call has its own backing-off retries), then
+    // say so. The heartbeat still heals it; the log is what makes a stale read
+    // explicable instead of mysterious.
+    if (!persistJobRecord(job) && !persistJobRecord(job)) {
+      logger.warn(
+        `[download] job ${job.id} finished but its record could not be published ` +
+          `(${job.filename}). Until the next heartbeat, download_model action:"status" ` +
+          `may still report "downloading" for it — the file itself has landed at ` +
+          `${landedPath}.`,
+      );
+    }
   };
   const settled = (async () => {
     // Wait for the prior same-destination job to fully finish (never fail THIS job
     // because that one errored — swallow its result).
     if (priorSameDest) await priorSameDest.catch(() => undefined);
+    // #1374 review, P1-2 — THE BASELINE IS TAKEN HERE, NOT BEFORE THE WAIT.
+    //
+    // It used to be read at job-construction time, which is BEFORE this job takes
+    // its turn in the same-destination chain (#467 P1-C). A second dispatch to the
+    // same (subfolder, name) therefore baselined a directory the FIRST job had not
+    // written to yet, sat in the queue while that job landed the file, and then
+    // read its own post-check as "it appeared → this dispatch landed it" — the
+    // #369 misattribution, manufactured by the serialization it was queued behind.
+    // Rejected second dispatches are exactly the case #1374 is about, so this
+    // window was the bug's own shape.
+    //
+    // Taken immediately before `downloadModel`, with nothing but this job's own
+    // transfer between the two observations.
+    listedBefore = await captureListingBaseline(targetSubfolder, baselineName);
     try {
       // A cancel that arrived before (or while waiting for) our turn makes downloadModel
       // throw at its up-front abort guard → the catch records the cancellation. So there
@@ -632,7 +718,14 @@ export async function startDownloadJob(
       // and the catch below keeps `done`.
       if (!dispatchToManager && (job.status as DownloadJob["status"]) === "done") {
         try {
-          const verdict = await verifyLandedModel(path, targetSubfolder, { listedBefore });
+          const verdict = await verifyLandedModel(path, targetSubfolder, {
+            // verifyLandedModel's own `visible` verdict is gated on the
+            // DESTINATION being one the running server named, not on this
+            // baseline — it uses it only to word an already-inconclusive answer,
+            // and already words `undefined` as "could not be checked". So the
+            // tri-state's third state maps onto the `undefined` it expects.
+            listedBefore: listedBefore === "unknown" ? undefined : listedBefore,
+          });
           if (verdict.verifiedPath) job.path = verdict.verifiedPath;
           job.verified_root = verdict.verifiedAgainstRoot;
           // No verifiedPath means the on-disk stat did NOT succeed — the file was
@@ -647,6 +740,57 @@ export async function startDownloadJob(
           // post-download hook — swallowing this must not skip onComplete. The
           // on-disk check did not complete either, so nothing may claim it did.
           job.disk_verified = false;
+          job.live_visible = "unknown";
+          job.verify_note = `Placement could not be verified: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        persistJobRecord(job);
+      }
+      // #1374 — ASK, DON'T ASSUME, ON THE MANAGER ROUTE EITHER.
+      //
+      // A Manager-dispatched download settles "done" when the Manager QUEUE
+      // DRAINS, and Manager increments its done counter for a REJECTED item
+      // exactly as for a fetched one — the v2 status endpoint carries only
+      // aggregate counts, with no per-item result. So a reporter whose Manager
+      // refused the fetch outright (security_level / network_mode=personal_cloud)
+      // got a job that said `done` for a 13.2 GB file that a filesystem-wide
+      // search could not find. Everything downstream was honest about this in
+      // PROSE and nothing ever looked.
+      //
+      // `verifyManagerVisibility` (#1086) is the look, and it already exists: it
+      // asks the CONNECTED server whether it now lists the entry, which is
+      // answerable remotely where `verifyLandedModel`'s on-disk stat is not. This
+      // runs the same shape as the local branch above, in the same place, so a
+      // download that settles inside download_model's grace window is already
+      // checked when the tool answers — and `action:"status"` reads the verdict
+      // off the record rather than reprinting a static caveat.
+      //
+      // WHAT THIS MUST NOT BECOME. "not-listed" is NOT failure and the verdict is
+      // deliberately not allowed to demote `status`: a Manager dispatch returns on
+      // ACCEPTANCE, so a large file is still arriving for minutes afterwards, and
+      // "not there yet" is indistinguishable from "landed where the server cannot
+      // read" from here. What changes is that the report now carries an OBSERVED
+      // answer where one is obtainable, instead of a caveat that was true of every
+      // outcome and therefore distinguished none of them.
+      if (dispatchToManager && (job.status as DownloadJob["status"]) === "done") {
+        try {
+          const verdict = await verifyManagerVisibility(
+            targetSubfolder,
+            managerJobFilename(job),
+            { listedBefore },
+          );
+          // Mapped onto the SAME three-valued field the local path writes, so
+          // every renderer keeps one vocabulary. "not-listed" is the Manager
+          // route's spelling of "the connected server does not list this".
+          job.live_visible =
+            verdict.visibility === "visible"
+              ? "visible"
+              : verdict.visibility === "not-listed"
+                ? "not-visible"
+                : "unknown";
+          job.verify_note = verdict.note;
+        } catch (err) {
+          // verifyManagerVisibility documents that it never throws; this is the
+          // belt for that brace, and it fails to UNKNOWN — never to a verdict.
           job.live_visible = "unknown";
           job.verify_note = `Placement could not be verified: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -853,6 +997,11 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     verified_root: rec.verified_root,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
+    // #1479 — the cancel path already probed this and status never asked, so the two
+    // actions answered the same question with opposite verdicts. Carried as `true` or
+    // absent: `writerProcessGone` returns undefined when it cannot tell, and that must
+    // keep the cautious note rather than becoming a death claim.
+    writerProvenGone: writerProcessGone(rec) === true ? true : undefined,
     reclaimedDead: rec.reclaimed_dead,
     interruptedByRestart: rec.interrupted_by_restart,
   };
@@ -966,6 +1115,62 @@ export function describePlacement(
     };
   }
   if (job.viaManager) {
+    // #1374 — REPORT WHAT WAS OBSERVED, when anything was.
+    //
+    // This arm used to return one static sentence for every Manager outcome. It
+    // was true — the queue reports 'done' on a drain, not on a landing — and
+    // precisely because it was true of every outcome it distinguished none of
+    // them. A reporter whose Manager REFUSED the fetch on security_level read
+    // `done` and went looking for a 13.2 GB file that was never fetched.
+    //
+    // `verifyManagerVisibility` now runs on this route (see startDownloadJob), so
+    // there is usually a real answer to print. `confirmed` stays FALSE in every
+    // arm: a listing proves a file of that NAME exists somewhere the server
+    // reads, which is placement and not validity (#473 — a login page saved as a
+    // .safetensors lists perfectly happily).
+    if (job.live_visible === "not-visible") {
+      return {
+        confirmed: false,
+        // #1374 review, P1-4 — NOT `wrongPlace`, AND THE DIFFERENCE IS NOT
+        // COSMETIC.
+        //
+        // `wrongPlace` means DEMONSTRABLY misplaced, and its consumers act on it:
+        // apply_manifest renders it as `failed`. On the LOCAL route that is
+        // earned — the file was stat'd on disk, so "present but unlisted" is a
+        // real contradiction. Here nothing was stat'd at all. A Manager dispatch
+        // returns on ACCEPTANCE (and #1197: its queue can drain hours before the
+        // transfer does), so "not listed yet" is equally a 13 GB fetch still in
+        // flight or a stale listing. Calling that `failed` invents a failure, and
+        // a caller who believes it re-issues the download and pays for the
+        // transfer twice — the standing rule here is that a false failure costs
+        // more than an unconfirmed success.
+        //
+        // The finding is not softened, only correctly typed: the warning below
+        // states it in full, and `confirmed` stays false, so the item settles as
+        // PENDING — "the placement has not been established" — which is exactly
+        // what was observed.
+        wrongPlace: false,
+        pathLabel: "requested destination",
+        pathQualifier: "",
+        warning:
+          `the dispatch was ACCEPTED and the connected ComfyUI does NOT list this file — ` +
+          `${job.verify_note ?? "the running server does not list this entry."} ` +
+          `ComfyUI-Manager reports its queue task 'done' even when it refused the fetch ` +
+          `outright (a security_level / network_mode rejection is the common cause), so a ` +
+          `'done' here is not evidence the file exists.`,
+      };
+    }
+    if (job.live_visible === "visible") {
+      return {
+        confirmed: false,
+        wrongPlace: false,
+        pathLabel: "requested destination",
+        pathQualifier: " (the connected ComfyUI lists it)",
+        warning:
+          `the connected ComfyUI lists this file, so the dispatch landed somewhere it reads — ` +
+          `but that is PLACEMENT, not validity. ${job.verify_note ?? ""}`.trim(),
+      };
+    }
     return {
       confirmed: false,
       wrongPlace: false,
@@ -973,8 +1178,9 @@ export function describePlacement(
       pathQualifier: "",
       warning:
         "the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue " +
-        "task 'done' even on failure, so this does not guarantee the file is present. Confirm " +
-        "with list_local_models before relying on it.",
+        "task 'done' even on failure, so this does not guarantee the file is present. " +
+        (job.verify_note ? `${job.verify_note} ` : "") +
+        "Confirm with list_local_models before relying on it.",
     };
   }
   switch (job.live_visible) {
@@ -1661,4 +1867,167 @@ export function resetDownloadJobs(): void {
   }
   jobs.clear();
   destChains.clear();
+}
+
+/**
+ * In-flight downloads that a tool-session respawn would orphan (#1378).
+ *
+ * Saving a credential mid-flight respawns the comfyui tool session, and the new auth
+ * header changes each download's CACHE IDENTITY — so a `.partial` at 96% becomes
+ * unreachable and the re-issued download starts from zero. A reporter lost ~29 GB across
+ * two files that way, with nothing warning them and nothing indicating the bytes were
+ * still on disk.
+ *
+ * The two obvious repairs are both unsafe: reusing the old entry under the new identity
+ * would serve bytes fetched under one auth identity to a request made under another, which
+ * is exactly what folding headers into the key prevents. So this does not try to rescue the
+ * transfer — it exists so the caller can be told BEFORE the respawn, while waiting is still
+ * an option. Afterwards the choice is gone, which is what happened to the reporter.
+ *
+ * NEVER REPORTS THE URL. A download URL can carry query-string auth, and this string ends
+ * up in a chat transcript — the filename and the byte count are what the decision needs.
+ */
+/**
+ * A filename safe to print in a chat transcript (#1378).
+ *
+ * The URL is never reported, and a filename DERIVED from a url takes only the pathname —
+ * so the ordinary case cannot carry a query token. But an explicitly supplied `filename` is
+ * copied through unchanged, and its validation rejects separators and dot-names, not
+ * secret-looking content. A caller can legally pass `model-sk-live-abc123.safetensors`.
+ *
+ * So a name carrying a credential-shaped token is reported by its EXTENSION only. Losing
+ * the name costs the reader a little context; printing a live token into a transcript is
+ * not recoverable.
+ */
+/**
+ * Named credential shapes. A filename matching one of these is redacted WHOLE — no part of
+ * a known key is worth keeping for identification.
+ *
+ * These exist because length alone cannot catch them: an AWS access key ID is exactly 20
+ * characters with no separator, which is also the length of an ordinary model filename, so
+ * the generic run rule below cannot be lowered far enough to see it.
+ */
+const NAMED_CREDENTIAL_SHAPES: readonly RegExp[] = [
+  // Vendor prefixes, ENUMERATED on purpose. The obvious generalisation — "a short
+  // alphabetic prefix followed by a long opaque body" — cannot be made to work: it is the
+  // shape of `juggernautXL_v9Rundiffusionphoto2` as exactly as it is the shape of
+  // `glpat-8GMtG8Mf4EnMJzmAWDU`, and the rule that catches one redacts the other. Public
+  // token prefixes are a small, published, slow-moving set, which is why every real secret
+  // scanner enumerates them too.
+  //
+  // Hyphens and underscores INSIDE the token count: a real key is `sk-live-abc…`, and
+  // requiring 12 contiguous alphanumerics after the prefix missed exactly that shape.
+  /(sk|pk|rk|hf|ghp|gho|ghu|ghs|ghr|glpat|gldt|dop_v1|doo_v1|dor_v1|shpat|shpss|shpca|shppa|npm|pypi|sq0atp|sq0csp|xkeysib|SG|xox[baprs])[-_][A-Za-z0-9_-]{12,}/,
+  /github_pat_[A-Za-z0-9_]{20,}/,
+  /(api[-_]?key|secret|token|password|bearer)/i,
+  /(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ABIA)[A-Z0-9]{16}/,
+  /AIza[A-Za-z0-9_-]{35}/,
+  /ya29\.[A-Za-z0-9_-]{20,}/,
+  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
+];
+
+/**
+ * Part-level thresholds for the generic rule.
+ *
+ * PARTIAL redaction is what makes these numbers affordable. The previous version had to
+ * decide whether a whole filename was a secret, so every threshold traded a leak against
+ * destroying the user's ability to tell which download the warning was about — and it lost
+ * both ways: an exact-length hex credential was waved through as "a hash", while
+ * `realisticVisionV60B1_v51HyperVAE-inpainting` was redacted entirely. Replacing only the
+ * suspicious PART keeps the identifying prefix, so the rule can be strict without costing
+ * the warning its point, and there is no longer any need to guess hash-versus-secret: a
+ * long opaque part is replaced whatever it is.
+ */
+const MAX_KEPT_PART = 24;
+/** Interleaved letters-and-digits is the strongest blob signal, so several in one run is a
+ *  blob even when each is short. Real names reach two (`juggernautXL_v9Rundiffusion`);
+ *  three is where a name stops being plausible. */
+const MAX_MIXED_PARTS = 2;
+const MIN_MIXED_PART = 5;
+
+/** Is this part long enough and opaque enough that it should not be printed? */
+function partIsOpaque(part: string): boolean {
+  return part.length > MAX_KEPT_PART;
+}
+
+function partIsMixed(part: string): boolean {
+  return (
+    part.length >= MIN_MIXED_PART && /[A-Za-z]/.test(part) && /[0-9]/.test(part)
+  );
+}
+
+/** Replace the opaque parts of one long run, or the whole run when it is a blob. */
+function redactRun(run: string): string {
+  const parts = run.split(/([-_])/);
+  const words = parts.filter((x) => x !== "-" && x !== "_" && x !== "");
+  // Several interleaved parts in one run is a token spelled to look like a name —
+  // `auth-A1b2C3d4-E5f6G7h8-I9j0K1l2`. Each part alone reads as ordinary, so this can only
+  // be judged across the run.
+  if (words.filter(partIsMixed).length > MAX_MIXED_PARTS) return REDACTED;
+  return parts.map((x) => (partIsOpaque(x) ? REDACTED : x)).join("");
+}
+
+const REDACTED = "(redacted)";
+
+/**
+ * A filename with credential-shaped material removed, keeping what identifies the download.
+ *
+ * The warning this feeds exists so a user can decide whether to let a 29 GB transfer
+ * finish. A receipt that says "2 downloads are at risk" without saying WHICH has given up
+ * most of that value — so the goal is not to redact the most, it is to redact the
+ * credential and keep the name.
+ *
+ * ACCEPTED RESIDUAL, stated rather than hidden: a credential spelled as separator-
+ * delimited chunks that are each short, each of one character class, and no more than two
+ * of them interleaved, reads as a model name and survives. No shape rule closes that — a
+ * token spelled like a name IS spelled like a name, and the rule that catches it also
+ * catches `flux1-kontext-dev-Q8_0-fp8-e4m3fn`.
+ */
+function redactSecretishFilename(name: string | undefined): string {
+  if (!name) return "(unnamed)";
+  if (NAMED_CREDENTIAL_SHAPES.some((re) => re.test(name))) {
+    return `${REDACTED}${safeExtension(name)}`;
+  }
+  // Runs are examined and rewritten in place, so the parts that are ordinary survive.
+  return name.replace(/[A-Za-z0-9_-]{32,}/g, redactRun);
+}
+
+/**
+ * The extension, but only when it IS one.
+ *
+ * `extname` returns everything after the last dot, and filename validation rejects path
+ * separators and dot-names — not `?`. So `model-token.safetensors?token=SECRET` yielded
+ * `(redacted).safetensors?token=SECRET`, a redaction that published the credential it was
+ * removing (codex). An extension is letters and digits or it is not kept.
+ */
+function safeExtension(name: string): string {
+  const ext = extname(name);
+  return /^\.[A-Za-z0-9]{1,12}$/.test(ext) ? ext : "";
+}
+
+export function downloadsAtRiskOfRespawn(
+  /**
+   * Injectable for tests. Mocking `listDownloadJobs` does NOT work here: it is called from
+   * inside this module, and vi.mock replaces a module's EXPORT, not its internal binding.
+   * My first test did exactly that and reported an empty list against working code — the
+   * same "the double agreed with me" failure this session keeps producing, one layer down.
+   */
+  jobs: readonly DownloadJob[] = listDownloadJobs(),
+): { id: string; filename: string; bytes: number }[] {
+  const at: { id: string; filename: string; bytes: number }[] = [];
+  for (const job of jobs) {
+    if (job.status !== "downloading") continue;
+    const progress = readDownloadProgress(job.progressId ?? job.trayId);
+    at.push({
+      // AN IDENTITY THAT IS NOT THE DISPLAY NAME (codex P2). Two different downloads
+      // whose names are both credential-shaped redact to the SAME string, so a consumer
+      // deduplicating on the filename collapsed them into one entry and reported the
+      // larger byte count instead of both files and their total — under-reporting the
+      // loss precisely when the names are least informative.
+      id: job.progressId ?? job.trayId ?? job.filename ?? "",
+      filename: redactSecretishFilename(job.filename),
+      bytes: progress?.downloaded ?? 0,
+    });
+  }
+  return at;
 }

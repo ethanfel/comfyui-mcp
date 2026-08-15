@@ -1,0 +1,66 @@
+---
+title: "Быстрый старт"
+description: "Добавьте ComfyUI MCP в Claude Code и сгенерируйте первое изображение."
+icon: "rocket"
+---
+
+<Steps>
+  <Step title="Запустите экземпляр ComfyUI">
+    Установите [ComfyUI Desktop](https://www.comfy.org/download) или запустите ComfyUI
+    [из исходников](https://github.com/comfyanonymous/ComfyUI). ComfyUI MCP автоматически
+    определяет локальную установку и её порт (8188 / 8000). Чтобы подключиться к удалённому
+    экземпляру, см. [Настройки](/docs/configuration).
+  </Step>
+
+  <Step title="Добавьте MCP-сервер в Claude Code">
+    Добавьте его в конфигурацию Claude Code (`~/.claude/settings.json`). `npx` автоматически
+    подтягивает последний опубликованный пакет.
+
+    ```json ~/.claude/settings.json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "CIVITAI_API_TOKEN": ""
+          }
+        }
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="Переподключитесь">
+    Выполните `/mcp` в Claude Code (или перезапустите его), чтобы подключиться к серверу
+    `comfyui`. Инструменты ComfyUI MCP должны стать доступны.
+  </Step>
+
+  <Step title="Сгенерируйте что-нибудь">
+    Попросите ассистента на естественном языке:
+
+    > Сгенерируй изображение акварельной лисы в туманном лесу.
+
+    Под капотом это вызывает [`generate_image`](/docs/tools/image-generation): инструмент
+    собирает воркфлоу txt2img, автоматически выбирает чекпоинт, ставит его в очередь и
+    возвращает `prompt_id`. Готовое изображение приходит с уведомлением о завершении —
+    посмотреть его можно через [`get_image (action:"view")`](/docs/tools/assets-images).
+  </Step>
+</Steps>
+
+## Что дальше
+
+<CardGroup cols={2}>
+  <Card title="Подробнее об установке" icon="download" href="/docs/ru/installation">
+    Локальная и удалённая конфигурации, а также `npm link` для разработки.
+  </Card>
+  <Card title="Настройки" icon="gear" href="/docs/configuration">
+    Все переменные окружения и HTTP-транспорт.
+  </Card>
+  <Card title="Как это работает" icon="diagram-project" href="/docs/concepts">
+    Модель, стоящая за инструментами, — и какие из них требуют локальной установки.
+  </Card>
+  <Card title="Обзор инструментов" icon="wrench" href="/docs/tools/image-generation">
+    Полный справочник, сгенерированный из схем.
+  </Card>
+</CardGroup>

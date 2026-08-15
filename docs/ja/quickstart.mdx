@@ -1,0 +1,65 @@
+---
+title: "クイックスタート"
+description: "ComfyUI MCP を Claude Code に追加して、最初の画像を生成しましょう。"
+icon: "rocket"
+---
+
+<Steps>
+  <Step title="ComfyUI インスタンスを起動する">
+    [ComfyUI Desktop](https://www.comfy.org/download) をインストールするか、
+    [ソースから実行](https://github.com/comfyanonymous/ComfyUI)して起動してください。ComfyUI MCP は
+    ローカルインストールとそのポート（8188 / 8000）を自動検出します。リモートインスタンスを対象にする場合は、
+    [設定](/docs/configuration)を参照してください。
+  </Step>
+
+  <Step title="Claude Code に MCP サーバーを追加する">
+    Claude Code の設定（`~/.claude/settings.json`）に追加します。`npx` が公開されている最新の
+    パッケージを自動的に取得します。
+
+    ```json ~/.claude/settings.json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "CIVITAI_API_TOKEN": ""
+          }
+        }
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="再接続する">
+    Claude Code で `/mcp` を実行する（または Claude Code を再起動する）と、`comfyui` サーバーに接続します。
+    ComfyUI MCP のツールが利用できるようになるはずです。
+  </Step>
+
+  <Step title="何か生成してみる">
+    アシスタントに自然言語で頼んでみましょう:
+
+    > 霧の森にいる水彩画風のキツネの画像を生成して。
+
+    内部では [`generate_image`](/docs/tools/image-generation) が呼び出され、txt2img のワークフローを
+    組み立て、チェックポイントを自動選択し、キューに追加して `prompt_id` を返します。完成した画像は
+    完了通知で届きます — [`get_image (action:"view")`](/docs/tools/assets-images) で表示してください。
+  </Step>
+</Steps>
+
+## 次のステップ
+
+<CardGroup cols={2}>
+  <Card title="インストールの詳細" icon="download" href="/docs/ja/installation">
+    ローカル構成とリモート構成の違い、開発用の `npm link` について。
+  </Card>
+  <Card title="設定" icon="gear" href="/docs/configuration">
+    すべての環境変数と HTTP トランスポート。
+  </Card>
+  <Card title="仕組み" icon="diagram-project" href="/docs/concepts">
+    ツールの背後にあるモデル — そのうちローカルインストールが必要なものはどれか。
+  </Card>
+  <Card title="ツールを見る" icon="wrench" href="/docs/tools/image-generation">
+    スキーマから生成された完全なリファレンス。
+  </Card>
+</CardGroup>

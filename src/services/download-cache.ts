@@ -14,6 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -24,6 +25,7 @@ import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
+import { checkCacheVolumeSpace } from "./download-volume.js";
 import {
   abortableDelay,
   backoffDelayMs,
@@ -1095,8 +1097,25 @@ export interface DownloadCacheResult {
 }
 
 function cacheDir(): string {
-  return resolve(process.env.COMFYUI_DOWNLOAD_CACHE_DIR || DEFAULT_CACHE_DIR);
+  // #1526 — the one install-path env var still read raw. Its siblings all trim
+  // (`COMFYUI_MCP_DATA_DIR?.trim()` and friends); this one did not, so a trailing
+  // space — which `set VAR=<path> && <cmd>` bakes in on Windows (#1512) — sends
+  // partial downloads to a directory that is not the configured one. Silently:
+  // `resolve()` accepts it happily and nothing checks the result against intent.
+  //
+  // Uses the #1512 helper rather than a bare `.trim()` so a pasted quote pair is
+  // also stripped and the malformed value is REPORTED once at ingestion. It is
+  // non-destructive by construction: a directory that genuinely ends in a space
+  // is left alone, and no filesystem probe happens when nothing would change.
+  const configured = normalizeInstallPathEnv(process.env.COMFYUI_DOWNLOAD_CACHE_DIR, {
+    varName: "COMFYUI_DOWNLOAD_CACHE_DIR",
+  }).path;
+  return resolve(configured || DEFAULT_CACHE_DIR);
 }
+
+/** #1526 — expose the env-derived cache root so its normalization is testable
+ *  without reaching into module internals or touching the filesystem. */
+export const __downloadCacheTestHooks = { cacheDir };
 
 function cacheSizeLimitBytes(): number {
   const raw = Number(process.env.COMFYUI_LRU_CACHE_SIZE_GB ?? "0");
@@ -2073,6 +2092,45 @@ async function streamUrlToFile(
     onResume?.({ outcome: "resumed", discardedBytes: 0, discarded: false });
   }
 
+  // #1477 — REFUSE before the first byte when the staging volume cannot hold this.
+  //
+  // The whole file is staged in the download cache before it lands at its
+  // destination, and that cache lives under homedir() — on Windows, essentially
+  // always the system drive, while models are almost always on a big secondary
+  // volume. A 32 GB download to a volume with 1 TB free was written to one with
+  // 0.7 GB free, and took it to the edge of zero. Driving a system drive to zero
+  // risks the page file and general OS stability, so this failure does not stay
+  // confined to the download that caused it.
+  //
+  // Content-Length is already parsed here, so the check costs nothing. It fails
+  // SOFT: an unmeasurable volume must not become an unusable one.
+  {
+    const lengthHeaderPre = Number(res.headers.get("content-length") || 0);
+    const fresh200TotalPre = Math.max(lengthHeaderPre > 0 ? lengthHeaderPre : 0, redirectSize ?? 0);
+    // On a resume only the REMAINING bytes are written; the rest is already on disk.
+    //
+    // When the 206 carries no Content-Range total, `rangeTotal` is null and the old
+    // arithmetic produced 0 — silently SKIPPING the guard on exactly the resume path
+    // it was written to protect (review found this). Content-Length on a 206 is the
+    // remaining slice, which is precisely the quantity still to be written, so fall
+    // back to it rather than to nothing.
+    const remainingFromRange =
+      rangeTotal != null ? Math.max(rangeTotal - (resumeFromBytes || 0), 0) : undefined;
+    const needBytes = appendMode
+      ? (remainingFromRange ?? (lengthHeaderPre > 0 ? lengthHeaderPre : 0))
+      : fresh200TotalPre;
+    const refusal = await checkCacheVolumeSpace({
+      needBytes,
+      cacheDir: dirname(targetPath),
+      // `resuming` is "we are APPENDING"; `partialExists` is "there are bytes on disk
+      // either way". Review found these conflated, so a restart after a server ignored
+      // our Range told the user nothing had been downloaded while a partial sat there.
+      resuming: appendMode,
+      partialExists: (resumeFromBytes || 0) > 0,
+    });
+    if (refusal) throw new ModelError(refusal, { path: targetPath });
+  }
+
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
   const fileStream = createWriteStream(targetPath, { flags });
 
@@ -2347,7 +2405,7 @@ async function downloadIntoCache(
     // resumes from the byte it left off on the next call, rather than
     // restarting from zero. (See streamUrlToFile for the Range + flags
     // handshake.) Cleanup on terminal failure stays unchanged.
-    const partial = join(cacheDir(), `.${basename(target)}.partial`);
+    const partial = stagedPartialPathForTarget(target);
     const rejectedMarker = `${partial}.rejected`;
 
     /**
@@ -3301,4 +3359,78 @@ export async function downloadWithCache(
     }
     return { targetPath: options.targetPath, usedCache: false };
   }
+}
+
+/**
+ * The staged `.partial` path for a cache target. THE ONE DEFINITION (#1370).
+ *
+ * It is a HIDDEN file — `.<basename>.partial`, leading dot — in the cache dir. That dot
+ * cost two rounds. My first lookup searched for `.<destination filename>.partial` (wrong
+ * key: the writer stages by CACHE identity, not destination). The correction derived the
+ * cache path properly and then dropped the leading dot, so it looked for `hash.ext.partial`
+ * while the writer wrote `.hash.ext.partial` — still missing every real partial, still
+ * reporting "no partial found" to someone holding 30 GB of resumable bytes.
+ *
+ * Both times my tests agreed with me, because the fixtures were built by calling the same
+ * helper being tested. A fixture derived from the code under test cannot falsify it.
+ *
+ * So there is now exactly one expression, and the WRITER uses it too. Not a parallel
+ * derivation that happens to agree today — the same function, so they cannot disagree.
+ */
+export function stagedPartialPathForTarget(target: string): string {
+  return join(cacheDir(), `.${basename(target)}.partial`);
+}
+
+/**
+ * Where a download's resumable `.partial` is staged, derived the way the writer derives it
+ * (#1370).
+ *
+ * MY FIRST VERSION OF THIS GUESSED THE NAME AND GUESSED WRONG. It looked for
+ * `.<destination filename>.partial`, because that is what "the partial for this download"
+ * sounds like. The writer stages under `.<sha256(cacheIdentity)[0:32]><ext>.partial` —
+ * keyed by the CACHE identity, not the destination — so the lookup would have missed every
+ * time and reported "no partial was found" for downloads that had one. That is the same
+ * false claim this issue is about, pointing the other way, and it would have been worse:
+ * the original at least erred toward "your bytes are safe".
+ *
+ * The tests missed it because the fixtures created files under the name I was searching
+ * for. They encoded my belief about the naming rather than the naming, which is the third
+ * time that shape has cost me today. Building the path from `cachePathForUrl` — the same
+ * function the writer uses — is what makes the two definitions impossible to disagree.
+ *
+ * SCOPE, stated because the caller has to phrase its answer around it: `cacheIdentity`
+ * folds in representation-affecting request headers and cloud credentials, which a job
+ * record deliberately does not keep. So this reproduces the staged path exactly for an
+ * unauthenticated public download (the reporter's case, and the common one) and cannot for
+ * an authenticated variant. A miss therefore means "none found under this URL's staged
+ * name", never "none exists" — and the caller must not upgrade it to the latter.
+ */
+export function stagedPartialPathForUrl(url: string): string {
+  return stagedPartialPathForTarget(cachePathForUrl(url));
+}
+
+/**
+ * Stat the staged `.partial` for a URL. Returns null when there is nothing usable there.
+ *
+ * A zero-byte partial reports as absent: resuming from it saves nothing, and calling it
+ * resumable would restate this issue's bug in miniature — a claim of retained bytes where
+ * there are none.
+ */
+export async function findResumablePartial(
+  url: string | undefined,
+): Promise<{ path: string; bytes: number } | null> {
+  if (typeof url !== "string" || !url.trim()) return null;
+  let candidate: string;
+  try {
+    candidate = stagedPartialPathForUrl(url.trim());
+  } catch {
+    return null;
+  }
+  try {
+    const st = await stat(candidate);
+    if (st.isFile() && st.size > 0) return { path: candidate, bytes: st.size };
+  } catch {
+    // ENOENT is the common, expected answer.
+  }
+  return null;
 }

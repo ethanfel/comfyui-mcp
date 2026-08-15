@@ -32,6 +32,9 @@ describe("verifyManagerVisibility asks the live server", () => {
     const probe = vi.fn().mockResolvedValue(true);
 
     const r = await verifyManagerVisibility("clip_vision", "clip_vision_h.safetensors", {
+      // The baseline is EXPLICIT and negative — the only shape that lets a
+      // listing be credited to this dispatch (#1374 review, P1-1).
+      listedBefore: false,
       attempts: 1,
       probe,
     });
@@ -93,6 +96,7 @@ describe("verifyManagerVisibility asks the live server", () => {
     const probe = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
 
     const r = await verifyManagerVisibility("loras", "x.safetensors", {
+      listedBefore: false,
       attempts: 3,
       retryMs: 0,
       probe,
@@ -135,6 +139,7 @@ describe("a visible verdict never implies the payload is a real model", () => {
     const probe = vi.fn().mockResolvedValue(true);
 
     const r = await verifyManagerVisibility("loras", "KNP_000003000.safetensors", {
+      listedBefore: false,
       attempts: 1,
       probe,
     });
@@ -151,10 +156,71 @@ describe("a visible verdict never implies the payload is a real model", () => {
   it("does not use the word CONFIRMED for a Manager dispatch", async () => {
     const probe = vi.fn().mockResolvedValue(true);
 
-    const r = await verifyManagerVisibility("loras", "x.safetensors", { attempts: 1, probe });
+    const r = await verifyManagerVisibility("loras", "x.safetensors", {
+      listedBefore: false,
+      attempts: 1,
+      probe,
+    });
 
     // The label is the whole defect: "CONFIRMED" reads as "this worked".
     expect(r.note).not.toMatch(/\bCONFIRMED\b/);
+  });
+});
+
+// #1374 review, P1-1 — THE BASELINE IS A TRI-STATE AND THE THIRD STATE IS THE ONE
+// THAT WAS LOST.
+//
+// The guard checked `listedBefore === true` only, so BOTH "we asked and it was
+// not there" and "we never found out" arrived as `undefined` and were treated as
+// a clean negative. A dispatch that fetched nothing could then be credited with a
+// file that had been sitting there all along — #369, on the one route that had no
+// guard against it. Only an EXPLICIT `false` may license a `visible` verdict.
+describe("an UNKNOWN baseline is not a negative baseline", () => {
+  it("downgrades a listing to UNKNOWN when the baseline could not be established", async () => {
+    const probe = vi.fn().mockResolvedValue(true);
+
+    const r = await verifyManagerVisibility("checkpoints", "sdxl.safetensors", {
+      listedBefore: "unknown",
+      attempts: 1,
+      retryMs: 0,
+      probe,
+    });
+
+    expect(r.visibility).toBe("unknown");
+    expect(r.note).toMatch(/never established/);
+    // It must not borrow the confident wording of a real landing.
+    expect(r.note).not.toMatch(/so the dispatch landed/);
+  });
+
+  it("downgrades a listing to UNKNOWN when NO baseline was passed at all", async () => {
+    // Omission is the shape a caller reaches by accident, so it must fail the
+    // same safe way as an explicit "unknown" rather than silently permitting.
+    const probe = vi.fn().mockResolvedValue(true);
+
+    const r = await verifyManagerVisibility("checkpoints", "sdxl.safetensors", {
+      attempts: 1,
+      retryMs: 0,
+      probe,
+    });
+
+    expect(r.visibility).toBe("unknown");
+    expect(r.note).toMatch(/never established/);
+  });
+
+  it("still reports a NEGATIVE observation with an unknown baseline", async () => {
+    // Only the POSITIVE direction is withheld. "The server says no" is a real
+    // observation and does not need a baseline to be worth reporting — folding it
+    // into `unknown` would throw away the whole #1374 finding.
+    const probe = vi.fn().mockResolvedValue(false);
+
+    const r = await verifyManagerVisibility("checkpoints", "sdxl.safetensors", {
+      listedBefore: "unknown",
+      attempts: 1,
+      retryMs: 0,
+      probe,
+    });
+
+    expect(r.visibility).toBe("not-listed");
   });
 });
 
@@ -175,5 +241,40 @@ describe("the tool's Manager branch never labels a listing as confirmation", () 
     // The regression, stated exactly: `CONFIRMED: ${managerSeen.note}`.
     expect(branch).not.toMatch(/`CONFIRMED[:\s]/);
     expect(branch).toMatch(/LISTED \(placement only, NOT validity\)/);
+  });
+
+  // #1374 review, P1-3 — and it does not ASK AGAIN, either.
+  //
+  // downloadAction used to call verifyManagerVisibility a second time and prefer
+  // that result. The baseline lives inside startDownloadJob and is unreachable
+  // from a tool, so that call could never pass one — which made it structurally
+  // incapable of telling a landing from a pre-existing file, and preferring it
+  // DEFEATED the baselined verdict the job had just recorded. It also spent a
+  // second Manager-only network round trip on an answered question.
+  //
+  // A behavioural test cannot see this (both calls return the same thing on a
+  // healthy server — the defect is which one is trusted, and what it cost), so
+  // the call site is read, the way the label above is.
+  it("does not re-probe the server from the tool's hot path", () => {
+    const src = readFileSync(
+      new URL("../../tools/model-management.ts", import.meta.url),
+      "utf-8",
+    );
+    // Bound the slice to downloadAction's own body: a match anywhere else in this
+    // 1000-line file would be a different call site with different stakes.
+    const start = src.indexOf("async function downloadAction(");
+    expect(start, "downloadAction must still exist").toBeGreaterThan(-1);
+    const rest = src.slice(start);
+    const end = rest.indexOf("\r\n}\r\n") >= 0 ? rest.indexOf("\r\n}\r\n") : rest.indexOf("\n}\n");
+    expect(end, "downloadAction's body must be delimitable").toBeGreaterThan(0);
+    const body = rest.slice(0, end);
+
+    // Sanity: the slice really does contain the Manager render, or the assertion
+    // below would pass by looking at the wrong text.
+    expect(body).toMatch(/LISTED \(placement only, NOT validity\)/);
+    // The defect, stated exactly: a CALL, not the word in a comment.
+    expect(body).not.toMatch(/verifyManagerVisibility\s*\(/);
+    // And the replacement is actually wired: the verdict comes off the record.
+    expect(body).toMatch(/job\.live_visible === "visible"/);
   });
 });

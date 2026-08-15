@@ -8,7 +8,7 @@
 // PanelAgent keeps all provider-agnostic orchestration (queue, turn-gate, bridge
 // push, self-restart) and drives this backend via
 // `for await (const ev of backend.run({...}))`. See
-// docs/design/agent-backend-injection.md.
+// design/agent-backend-injection.md.
 //
 // PROTOCOL MAPPING (AgentBackend ↔ ACP, per agentclientprotocol.com + the
 // Gemini CLI docs/cli/acp-mode.md):

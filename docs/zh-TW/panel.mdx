@@ -1,0 +1,338 @@
+---
+title: "側邊欄面板"
+description: "ComfyUI Agent Panel —— ComfyUI 側邊欄裡的自主 AI 代理，能用任何 LLM 驅動你的畫布：用你自己的訂閱跑 Claude、ChatGPT 或 Gemini（不需 API 金鑰），透過 Ollama 跑免費的本機模型（連帳號都不用），或是任何走 OpenAI 相容端點的託管模型。已上架 Comfy Registry，套件名稱為 comfyui-agent-panel。"
+icon: "comments"
+---
+
+<Note>
+  **現已上架 Comfy Registry。** 請從 ComfyUI-Manager 安裝 **ComfyUI Agent Panel**
+  (`comfyui-agent-panel`)，或用 git 安裝以取得最新版本（見下方的
+  [設定](#設定)）。
+</Note>
+
+**[comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)** 在 ComfyUI 的側邊欄裡
+放進一個自主代理。跟它要一張圖片、一份工作流程或某個修改 —— 它會直接對著你的 ComfyUI
+動手，並就地回覆你。挑一個供應商 —— **Claude**、**ChatGPT**、**Gemini** 或
+**Ollama（本機）** —— 對應的代理就會在背景執行：訂閱制供應商**不需要 API 金鑰**，
+本機模型**連帳號都不用**（而且 Ollama 後端也連得上任何託管的 OpenAI 相容端點）。
+能力對照表請看[後端](/docs/backends)，各級模型實際跑起來如何請看
+[LLM 競技場](/docs/arena)。
+
+```
+you ⇄ panel (pick a provider) ⇄ loopback bridge ⇄ panel orchestrator ⇄ background agent: Claude · ChatGPT · Gemini · any LLM
+```
+
+訂閱制供應商**沒有 API 金鑰，也沒有按 token 計費** —— 本機模型則是完全免費、可離線
+執行。代理會用你磁碟上既有的登入資訊認證（Ollama 的話就只是跟本機的守護程式溝通）。
+一個協調器在一個回送橋接連接埠（`ws://127.0.0.1:9180`）上服務所有供應商；每個面板
+分頁在交握時選定自己的供應商。橋接只監聽回送位址，而面板只執行一份**固定允許清單**
+裡的節點圖指令（不執行任意 JavaScript）。
+
+<Note>
+  第一次接觸嗎？[後端／供應商](/docs/backends)會說明選擇器、與供應商無關的
+  `AgentBackend` 介面，以及能力對照表（Claude 與 ChatGPT 之間哪些完全一致，
+  又有哪幾處不同）。
+</Note>
+
+## 設定
+
+1. **安裝節點包** —— 在 ComfyUI-Manager 裡搜尋 `comfyui-agent-panel`，或用 git 安裝：
+
+   ```bash
+   cd ComfyUI/custom_nodes
+   git clone https://github.com/artokun/comfyui-mcp-panel
+   ```
+
+   <Warning>
+   **在 Manager 的版本下拉選單裡請選 `Latest`，不要選 `Nightly`。** 名字雖然這樣叫，
+   Manager 的 **Nightly** 並不是每晚建置的：它只在安裝當下複製儲存庫**一次**，之後
+   就再也不會追蹤那個分支。它會把你凍結在那天剛好是 `main` 的那個 commit 上，而
+   `Latest` 則會跟上每一次發布 —— 所以 Nightly 通常比 Latest 還*舊*，而且放著愈久
+   就悄悄落後愈多。它之所以回報沒有可用更新，是因為從它的角度看確實沒有。
+
+   想知道自己實際停在哪裡，請把 **Node Pack Info → Version** 底下的 SHA 拿去和
+   [儲存庫的 commit 歷史](https://github.com/artokun/comfyui-mcp-panel/commits/main)
+   比對。要脫身的話，可以在同一個下拉選單裡選 `Latest (x.y.z)`，或者 —— 如果你想
+   繼續走 git —— 在 `custom_nodes/comfyui-mcp-panel` 裡執行 `git pull`，它會乾淨地
+   快轉更新。
+   </Warning>
+
+2. 為了讓背景代理能使用你的訂閱，請先**登入你想用的那個供應商**一次：
+
+   ```bash
+   claude        # Claude — or: claude setup-token
+   codex login   # ChatGPT (Codex)
+   ```
+
+3. 在你自己的電腦上**啟動協調器**並讓它一直執行 —— 請看
+   [啟動面板協調器](/docs/zh-TW/installation#3-啟動面板協調器)：
+
+   ```bash
+   npx -y comfyui-mcp@latest connect
+   ```
+
+4. **重新啟動 ComfyUI**，打開**代理**分頁，**挑一個供應商**（Claude／ChatGPT
+   選項按鈕），然後按**連線**。面板會連上協調器的回送橋接。輸入一個請求，代理
+   就會回應。按**中斷連線**可以解除連結；協調器則會一直執行到你停掉它為止。
+
+不需要 `claude mcp add`，也不需要 API 金鑰。面板是純前端的擴充功能，沒辦法自己啟動
+協調器，所以協調器永遠是一個由你啟動的行程 —— 面板只會自動連上一個已經在執行的
+橋接。前置條件只有 PATH 上的 Node.js/`npx`，以及上面那一步的供應商登入。橋接連接埠
+可以用 `COMFYUI_MCP_BRIDGE_PORT` 更改。
+
+<Note>
+**要驅動遠端的 ComfyUI**（雲端 GPU Pod、區域網路裡的另一台機器）嗎？上面的設定同樣
+適用，但協調器要跑在**你自己的電腦上**，而不是那台遠端機器：
+`npx -y comfyui-mcp@latest connect <remote-url>` 會處理好其餘的部分，包括一條通回
+Pod HTTPS 頁面的安全通道。接著在面板裡按「連線」。完整流程請看
+[雲端部署](/docs/cloud-deployment)。
+</Note>
+
+<Note>
+  **供應商上手引導。** 按下「連線」時，面板會檢查每個供應商的準備狀態（PATH 上有它的
+  CLI ＋磁碟上有登入資訊；macOS 鑰匙圈也已處理好）。只有在**兩個供應商都沒有**登入時，
+  才會出現上手引導卡片。如果你儲存的選擇目前不能用，面板會**自動切換到一個已就緒的
+  供應商**（你儲存的偏好會保留），而尚未就緒的供應商那一列會提供一個**「設定」**動作，
+  幫你走完一次性的 `claude` / `codex login` 步驟。請看
+  [後端 → 準備狀態與上手引導](/docs/backends#connect-time-readiness--onboarding)。
+</Note>
+
+## 能做什麼
+
+代理（Claude *或* ChatGPT）會載入 comfyui-mcp 的模型技能（IDEOGRAM、WAN、LTX、Qwen
+等等），所以它一開始就懂你在跑的那些模型 —— Claude 是原生載入，ChatGPT 則是透過同一
+份知識、以 MCP 工具的形式取得（[知識一致性](/docs/tools/skills-knowledge)）。它能生成
+圖片、影片與音訊，檢視並管理你的 ComfyUI，也能針對你的環境進行推理 —— 然後在面板的
+聊天裡回覆你。
+
+它也能**一次載入整份工作流程或安裝包**（`panel_load_workflow pack:<name>`），而且
+**會考量成本**：內建的安裝包都是本機 GPU／免費的，至於臨時拼出來的節點圖，代理會先
+檢查執行環境（`list_packs` 搭配 `action:"check_runtime"`），並在**花掉付費 API 額度
+前先問過你**。請看[技能、安裝包與執行成本](/docs/tools/skills-knowledge)。
+
+## 驅動即時的節點圖
+
+自主代理是透過一份**固定的 `panel_*` 指令允許清單**來操作你正在跑的 ComfyUI ——
+不會執行任意 JavaScript。每一次節點圖的修改都會經過 LiteGraph 的變更追蹤，所以每一次
+都能用 **Ctrl+Z** 復原。同一套 `panel_*` 介面會以完全相同的方式開放給兩個後端（Claude
+走行程內，ChatGPT/Codex 走回送的 HTTP MCP），所以[一致性](/docs/backends)是自動成立的。
+
+### 讀取
+
+| 工具 | 作用 |
+|---|---|
+| `panel_query_graph` | 查詢正在檢視的節點圖 —— 篩選／走訪／彙總，並有 token 上限 |
+| `panel_get_subgraph` | 讀取子圖節點內部的節點圖 |
+| `panel_view_selected` | 讀取使用者**選取**的節點 —— 一次呼叫就回答得出「這個節點」 |
+| `panel_view_nodes_in_viewport` | 只讀取**畫面上看得到**的部分（視埠矩形＋縮放）—— 在大張節點圖上縮小工作範圍 |
+| `panel_get_errors` | 節點為什麼會變紅的**原因** —— 把每個出錯的節點跟它的成因對起來（缺少模型＋下載網址、缺少素材、驗證、執行期的 `exception_type`） |
+| `panel_list_workflows` | 列出開啟中的工作流程分頁，以及哪一個正在使用中 |
+| `panel_list_nodes` | 列出已安裝的自訂節點包 |
+| `panel_list_mcp` | 列出已連線的 MCP 伺服器 |
+| `panel_get_content_mode` | 讀取成人內容（NSFW）的同意狀態 |
+
+### 編輯節點圖（可復原）
+
+| 工具 | 作用 |
+|---|---|
+| `panel_add_node` | 依 class_type 新增節點 |
+| `panel_remove_node` | 移除節點 |
+| `panel_connect` / `panel_disconnect` | 依名稱或索引接線／斷線（`panel_connect` 兩個插槽都省略時會依型別自動比對；`auto_match:false` 則回到舊的索引 0 行為） |
+| `panel_set_widget` | 修改控制項的數值（steps、cfg、prompts…） |
+| `panel_edit_node` | 以單一動作移動、調整大小、改標題、改顏色、改形狀、收合或釘選一個以上的節點 |
+| `panel_auto_layout` | 依連線拓撲把整張節點圖（或其中一部分）自動排列成乾淨的流程／格線版面 —— 用 `dry_run` 可先預覽 |
+| `panel_clear` | 移除所有節點 —— 整次清空只要按一次 Ctrl+Z 就能還原 |
+
+### 子圖
+
+| 工具 | 作用 |
+|---|---|
+| `panel_select_nodes` | 在畫布上選取節點（可多重選取） |
+| `panel_create_subgraph` | 把選取的節點組成子圖（「Convert to Subgraph」） |
+| `panel_enter_subgraph` | 深入子圖以讀取／編輯它內部的節點 |
+| `panel_exit_subgraph` | 回到上層／最上層的節點圖 |
+
+### 空間版面
+
+代理看得到節點的幾何資訊 —— `panel_query_graph` 的詳細列會回傳每個節點的
+`pos`/`size`，加上子圖輸入／輸出的 `rails`、`groups`，以及每個節點的
+`color`/`collapsed` —— 並用一組對應的寫入操作來排布畫布，然後把結果**截圖**下來，
+自己評斷排出來的版面。`workflow-layout` 技能把這些串成依相依關係分層、互不重疊的
+自動版面，而它的首要規則是*永遠讓輸入與輸出露在外面*，好讓你可以直接接手。
+
+| 工具 | 作用 |
+|---|---|
+| `panel_move_rail` | 移動子圖的輸入／輸出軌，讓跨越邊界的接線保持短 |
+| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | 建立、移動、改標題／改顏色，或刪除一個有標籤的群組框（傳入 `node_ids` 可自動框住） |
+| `panel_screenshot` | 把畫布算成 PNG 並以圖片交回，讓代理可以驗證自己排的版面 |
+
+### 工作流程分頁
+
+| 工具 | 作用 |
+|---|---|
+| `panel_new_workflow` | 在**新**分頁開一份全新的空白工作流程（絕不會清掉目前這一份） |
+| `panel_open_workflow` | 依路徑／檔名切換工作流程 |
+| `panel_rename_workflow` | 重新命名工作流程 |
+| `panel_close_workflow` | 關閉分頁（有未儲存的變更時會拒絕，除非強制執行） |
+| `panel_save_workflow` | 以程式方式儲存／另存新檔 —— 不會跳出對話框 |
+
+### 一次載入整份工作流程
+
+| 工具 | 作用 |
+|---|---|
+| `panel_load_workflow` | 一次呼叫就用一整份工作流程取代現有的節點圖 —— 建議用 `pack:<name>` 載入內建安裝包的本機 GPU 工作流程，不必把 JSON 透過聊天搬來搬去。被取代掉的節點圖會成為一個復原點（連按兩次 Esc ／ `/revert`）。 |
+
+### 知識與成本意識
+
+代理會探索內建的專業知識，並在花掉額度之前先檢查執行成本（兩個後端用的是同一組
+工具 —— 請看[技能、安裝包與執行成本](/docs/tools/skills-knowledge)）：
+
+| 工具 | 作用 |
+|---|---|
+| `list_packs` (`action:"skill_list"` / `action:"skill_read"`) | 探索並閱讀內建的模型家族＋工作流程技能 |
+| `list_packs` (`action:"list"` / `action:"read_workflow"`) | 列出一行指令就裝得起來的安裝包（本機 GPU／免費），並讀取某個包的節點圖 |
+| `list_packs` (`action:"list_templates"`) | 列出已連線伺服器上官方的 ComfyUI 工作流程範本 |
+| `list_packs` (`action:"check_runtime"`) | 把一張節點圖歸類為 **local**（免費）或 **api/mixed/unknown**（付費）—— 代理在花掉付費 API 額度前會先問過你 |
+
+### 執行與檢視
+
+| 工具 | 作用 |
+|---|---|
+| `panel_run` | 把開啟中的工作流程排入佇列（等同按下 Queue Prompt） |
+| `panel_canvas` | 縮放至剛好顯示、置中到某個節點、平移或縮放視野 |
+
+### 自訂節點（內建的 ComfyUI Manager）
+
+| 工具 | 作用 |
+|---|---|
+| `panel_search_nodes` | 透過使用者自己的 Manager 搜尋可安裝的節點包 |
+| `panel_install_node` | 把節點包的安裝排入佇列（登錄庫 id 或 git 網址） |
+| `panel_node_queue_status` | 查看 Manager 的安裝／更新佇列 |
+| `panel_restart_comfyui` | 重新啟動 ComfyUI 以載入新節點 —— 面板會自動重新連線，代理接著繼續 |
+
+### MCP 與工作階段
+
+| 工具 | 作用 |
+|---|---|
+| `panel_add_mcp` / `panel_remove_mcp` | 在使用者的代理 MCP 設定（Claude 或 Codex）中連線／移除 MCP 伺服器 |
+| `panel_request_secret` | 安全地取得 API 權杖 —— 代理絕對看不到那個值 |
+| `panel_reload` | 軟性重新載入協調器（新的程式碼／工具）或面板介面，然後繼續 |
+
+### 與使用者互動
+
+| 工具 | 作用 |
+|---|---|
+| `panel_ask` | 請使用者在選項之間做選擇（顯示一張問題卡片，並等到有人選擇為止） |
+| `panel_set_todo` | 在面板底部的匣中顯示即時的 TODO 清單 |
+| `panel_request_adult_consent` / `panel_disable_adult_mode` | 切換 18+ NSFW 的同意閘門 |
+
+<Note>
+  每個工具都接受選填的 `tab_id` —— 每個瀏覽器分頁都持有自己的連線，而路由預設會
+  指向唯一的那個分頁，或使用者最後打字的那個分頁。
+</Note>
+
+## 倒回與還原
+
+過去的訊息並沒有被凍結。把滑鼠移到任何一則訊息上，**✎ 編輯**按鈕會開啟還原對話框：
+可以還原**程式碼**（把節點圖還原成那一回合的快照）、還原**對話**（把工作階段分支回
+那個時間點），或**兩者都還原**，然後從那裡重送一則編輯過的訊息。節點圖還原用的是每
+回合的快照，所以撤銷某一回合會精確還原成它開始時的那張節點圖。
+
+常見的情況有兩個快捷方式：
+
+- **`/revert`** —— 撤銷上一回合對節點圖所做的修改。
+- **連按兩次 Esc** —— 快速倒回上一回合：還原節點圖，並把訊息拉回輸入框，讓你編輯後
+  重送。
+
+<Note>
+  **程式碼**（節點圖）還原在**兩個供應商上都能用** —— 它靠協調器裡每回合的快照實作。
+  **對話**還原（把聊天分支回過去的某一回合）目前**只有 Claude 能用**；ChatGPT/Codex
+  後端只能整條對話續行，所以面板對它關掉了這個範圍。請看
+  [能力對照表](/docs/backends#capability-matrix)。
+</Note>
+
+## 待處理訊息匣
+
+在代理忙碌時打字，你的訊息不會淹沒在聊天裡 —— 它會停在一個固定的**待處理**匣，就
+停靠在下載匣上方，不進入聊天流。每一則待處理訊息都有**編輯**、**立即送出**與**刪除**
+按鈕，還有一個拖曳把手（≡，在左邊）可以**重新排序**代理清空它們的順序。**立即送出**
+會中斷目前這一回合，馬上把它導向新的方向。待處理訊息被取出時會出現在聊天的
+**最下方**，所以整份記錄讀起來就是代理（Claude 或 ChatGPT）實際處理它們的順序。
+
+## 破壞性操作的確認
+
+無法復原的動作會先問過你。`panel_clear`（清掉所有節點）與 `panel_restart_comfyui` 會
+跳出一張是／否卡片，只有在你選**是**時才會動作 —— 所以代理沒辦法悄悄炸掉你的節點圖，
+或把 ComfyUI 重開。
+
+## 重新連線的韌性
+
+卡住的協調器不會再讓面板孤立無援。如果前一個協調器還占著橋接連接埠，按**連線**會
+回收那個殭屍行程，而不是直接失敗 —— 面板會重新連上，而不是把你卡在原地。
+
+## 輸入框附件
+
+可以在輸入框附加檔案、拖放，或直接貼上。除了圖片之外，輸入框現在也接受**影片**、
+**工作流程 `.json`** 與**文字**檔，所以你可以直接把參考短片、想改寫的工作流程或
+筆記檔交給代理。
+
+## 代理回覆中的豐富媒體
+
+當一次執行的媒體被回饋給代理時，輸出不只是一個圖片區塊 —— 它還帶著代理可以拿來推理
+的**中繼資料**：每個輸出的路徑（相對於子資料夾）、檔案大小、像素尺寸，以及**素材集
+分組**（「這次執行的第 K 個輸出，共 N 個」以及同組的檔名，或是「單一輸出」），再加上
+算圖時間與完成時刻。影片分鏡在酬載帶有這些資訊時，還會加上格式與實際的影格數／fps。
+因此代理能準確說出實際存下來的結果，也能談論檔案大小、尺寸，以及一次執行產生了幾個
+檔案。
+
+## 程式碼區塊的複製與換行
+
+呈現出來的圍欄式程式碼區塊會有一個滑鼠移上去才出現的**複製**按鈕，以及一個會被記住
+的全域**自動換行**開關（預設關閉 —— 在你打開之前，過長的行會水平捲動）。行內程式碼
+也有自己的複製按鈕。兩者的樣式都與面板一致。
+
+## 算圖停滯警告
+
+協調器會對你的 ComfyUI 佇列跑一個被動的看門狗：節點／進度不再前進的算圖會被標記為
+**停滯**並告知代理（這樣它就不會盲目地把工作繼續堆在一個卡住的工作後面）。門檻值就是
+**設定 → Comfy MCP Agent → 一般**底下的**算圖停滯警告（秒）**設定（預設 180 秒，範圍
+15–3600）。它會在連線時送出，而且是**即時**推送的 —— 改了不用重新連線就會生效。請看
+[設定 → `COMFYUI_MCP_STALL_S`](/docs/configuration#panel-orchestrator--the-bridge)。
+
+## 背景分頁的可靠性
+
+即使 ComfyUI 分頁在**背景**，串流的回覆現在也照樣呈現得出來。以前回覆的打字機效果跑
+在 `requestAnimationFrame` 上，而瀏覽器會在隱藏的分頁裡把它暫停 —— 所以在一次多階段
+的長時間執行中切走，就會留下一個空的對話泡泡和卡住的串流游標，看起來就像代理「想到
+一半卡住了」，即使那一回合其實早就結束了。現在分頁被隱藏時，回覆會同步收尾，而
+`visibilitychange` 處理常式會在隱藏時把待處理的回覆輸出完，並在你回來時恢復打字機
+效果。前景的動畫維持不變。
+
+## RunPod 雲端控制
+
+工具列上的**主機標示**會顯示 **🟢 本機 · 你的機器**或 **🔵 RunPod · <pod> ·
+GPU · $/hr**，點下去會開啟 **RunPod 控制面板**：一張即時狀態卡（GPU／VRAM／執行時間
+／$·hr／ComfyUI 網址／閒置自動停止倒數）、一個依**名稱**列出你所有 Pod 的下拉選單、
+連線／啟動／停止／**使用本機**，以及一個需要先確認才會執行的**部署**按鈕。只要在
+API 金鑰卡片裡設定一次 `RUNPOD_API_KEY`，你就能部署、監看、在本機⇄Pod 之間切換，並
+停掉雲端 GPU，完全不用碰 RunPod 主控台 —— 主機標示隨時都會告訴你下一次算圖會在哪裡
+跑。請看[雲端部署](/docs/cloud-deployment)與部落格文章
+[在租來的雲端 GPU 上執行 ComfyUI](/docs/blog/runpod-comfyui)。
+
+## CivitAI 瀏覽器
+
+工具列上的 **Civitai** 按鈕會開啟一個完整的 CivitAI 瀏覽器 —— 圖片、影片、主模型、
+LoRA 與工作流程，可以搜尋、篩選，還有全螢幕檢視器。挑一個結果就能**分享給代理**、
+**下載到你的電腦**，或把**內嵌的工作流程存**到畫布上。完整的故事：
+[ComfyUI 裡的 CivitAI](/docs/blog/civitai-in-comfyui)。
+
+## 參見
+
+- [手機 App（Beta）](/docs/mobile) —— 把手機與面板配對，隨時隨地跟代理聊天
+- [後端／供應商](/docs/backends) —— Claude 與 ChatGPT 的比較、選擇器、能力一致性
+- [技能、安裝包與執行成本](/docs/tools/skills-knowledge) —— 知識一致性＋成本護欄
+- [橋接設定](/docs/configuration)
+- [雲端部署](/docs/cloud-deployment) —— 讓面板對著遠端的 ComfyUI Pod（RunPod 等）運作
+- [自架中繼](/docs/self-hosted-relay) —— 自行運行橋接所需的通道基礎架構
+- [Claude Code 外掛](/docs/plugin) —— 模型技能、斜線指令、代理
+- [GitHub 上的 comfyui-mcp](https://github.com/artokun/comfyui-mcp) · [GitHub 上的 comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)

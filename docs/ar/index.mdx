@@ -1,0 +1,87 @@
+---
+title: "ComfyUI MCP"
+description: "مستوى التحكّم المحلي أولًا والمصمَّم أصلًا للوكلاء الخاص بـ ComfyUI — خادم MCP وإضافة لـ Claude Code تولّد الصور والفيديو والصوت، وتؤلّف مسارات سير العمل وتشغّلها، وتدير النماذج والعقد المخصّصة باللغة الطبيعية. محليًا أو عن بُعد أو على Comfy Cloud."
+icon: "house"
+---
+
+**ComfyUI MCP** هو **مستوى التحكّم المحلي أولًا والمصمَّم أصلًا للوكلاء** الخاص بـ
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) — خادم [MCP](https://modelcontextprotocol.io)
+وإضافة لـ Claude Code. يربط مساعدك الذكي بنسخة ComfyUI قيد التشغيل — **محلية** أو **بعيدة** أو على
+**[Comfy Cloud](https://cloud.comfy.org)** — فتولّد الصور والفيديو والصوت، وتشغّل مسارات سير العمل
+وتؤلّفها، وتدير النماذج والعقد المخصّصة، وتتحكّم في الخادم، وكل ذلك باللغة الطبيعية. ليس جسرًا سطحيًا
+من الموجّه إلى الصورة — بل وكيل كامل يشغّل ComfyUI نيابةً عنك.
+
+<Frame caption="لوحة الوكيل تقود ComfyUI من البداية إلى النهاية — تقرأ ما هو مثبَّت محليًا، وتوصّل المخطط، وتحرّر ذاكرة VRAM، وتشغّل عملية التوليد">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="البداية السريعة" icon="rocket" href="/docs/ar/quickstart">
+    أضف الخادم إلى Claude Code وولّد أول صورة لك في نحو دقيقتين.
+  </Card>
+  <Card title="مرجع الأدوات" icon="wrench" href="/docs/tools/image-generation">
+    37 أداةً، موثّقة تلقائيًا من مخططاتها الحيّة.
+  </Card>
+  <Card title="التثبيت" icon="download" href="/docs/ar/installation">
+    ثبّت ComfyUI واربط خادم MCP (محليًا أو عن بُعد).
+  </Card>
+  <Card title="الإعدادات" icon="gear" href="/docs/configuration">
+    متغيّرات البيئة، وآليات النقل، والرموز، والتوجيه إلى خادم بعيد.
+  </Card>
+</CardGroup>
+
+## ما الذي يمكنك فعله
+
+<CardGroup cols={3}>
+  <Card title="التوليد" icon="image">
+    تحويل النص إلى صورة عبر `generate_image`، إضافةً إلى تكييف ControlNet وIP-Adapter.
+  </Card>
+  <Card title="تأليف مسارات سير العمل" icon="pen-ruler">
+    أنشئ من القوالب، وعدّل، وتحقّق، واعرض مرئيًا، وانتقل ذهابًا وإيابًا عبر لغة DSL مضغوطة.
+  </Card>
+  <Card title="إدارة النماذج" icon="box">
+    ابحث في HuggingFace/CivitAI، ونزّل النماذج واعرضها واحذفها.
+  </Card>
+  <Card title="العقد المخصّصة" icon="puzzle">
+    ثبّت حزم العقد، وحدّثها، والتقط لقطات لها، وتتبّع أعطالها بالتنصيف عبر ComfyUI-Manager.
+  </Card>
+  <Card title="التثبيت والصيانة" icon="terminal">
+    ثبّت ComfyUI أو حدّثه، وافحص البيئة، وشغّل الخادم أو أوقفه.
+  </Card>
+  <Card title="محلي أو عن بُعد أو سحابي" icon="globe">
+    يكتشف التثبيت المحلي تلقائيًا، أو يوجَّه إلى خادم بعيد عبر `--comfyui-url`، أو يتواصل مع
+    [Comfy Cloud](https://cloud.comfy.org) عبر `COMFYUI_API_KEY` — دون الحاجة إلى ComfyUI محلي.
+  </Card>
+</CardGroup>
+
+<Note>
+  يعمل على **macOS** و**Linux** و**Windows**، ويكتشف تلقائيًا تثبيت ComfyUI المحلي ومنفذه.
+  الشيفرة المصدرية والمشكلات على [GitHub](https://github.com/artokun/comfyui-mcp).
+</Note>
+
+## النطاق: محلي أو عن بُعد أو Comfy Cloud
+
+`comfyui-mcp` هو MCP المجتمعي لـ ComfyUI **المحلي** و**البعيد** — وهذا هو الهدف الأساسي (تثبيتات
+Mac/Linux/Windows، وRunPod، وخوادم VPS، والشبكة المحلية، وغيرها).
+
+لمستخدمي **Comfy Cloud**، تقدّم Comfy-Org [أدوات وكلاء رسمية](https://docs.comfy.org/agent-tools) — Comfy Cloud MCP (نسخة تجريبية عامة) وComfy In-App Agent (نسخة ألفا خاصة) — يصونها فريق Comfy وتعمل على Comfy Cloud. إن لم تكن لديك وحدة GPU أو أردت إعدادًا صفريًا، فاستخدمها ([مقارنة جنبًا إلى جنب](/docs/local-vs-comfy-cloud)). كما يتضمّن `comfyui-mcp` وضعًا سحابيًا مجتمعيًا (`COMFYUI_API_KEY`)، فيستطيع MCP واحد استهداف أشكال النشر الثلاثة كلها من إعداد واحد — اختر ما يناسب طريقة عملك.
+
+---
+
+## المشرف على المشروع
+
+طوّره ويصونه [**@artokun**](https://github.com/artokun) — مساهم منتظم في
+[Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)
+(مُحرّك عرض المخططات v2 / عرض المخططات الفرعية / عناصر التحكم المُرقّاة) وفي
+[نواة ComfyUI بلغة Python](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun).
+
+**فريق Comfy-Org** (أو أي جهة توظّف في محيط منظومة ComfyUI): [art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com).

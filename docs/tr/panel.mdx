@@ -1,0 +1,372 @@
+---
+title: "Kenar Çubuğu Paneli"
+description: "ComfyUI Agent Panel — ComfyUI'nin kenar çubuğunda çalışan, tuvalinizi HERHANGİ bir LLM ile süren otonom bir yapay zekâ ajanı: aboneliğinizle Claude, ChatGPT ya da Gemini (API anahtarı yok), Ollama üzerinden ücretsiz bir yerel model (hesap bile yok) ya da OpenAI uyumlu bir uç nokta üzerinden barındırılan herhangi bir model. Comfy Registry'de comfyui-agent-panel adıyla yayında."
+icon: "comments"
+---
+
+<Note>
+  **Artık Comfy Registry'de.** **ComfyUI Agent Panel**'i (`comfyui-agent-panel`)
+  ComfyUI-Manager'dan kurun ya da en güncel sürüm için git'ten kurun (aşağıdaki
+  [Kurulum](#kurulum) bölümüne bakın).
+</Note>
+
+**[comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)**, ComfyUI'nin
+kenar çubuğuna otonom bir ajan yerleştirir. Ondan bir görsel, bir iş akışı ya da bir
+değişiklik isteyin — kendi ComfyUI'niz üzerinde çalışır ve yanıtı tam orada verir. Bir
+sağlayıcı seçin — **Claude**, **ChatGPT**, **Gemini** ya da **Ollama (yerel)** — ve
+eşleşen ajan arka planda çalışsın: aboneliklerde **API anahtarı gerekmez**, yerel
+modellerde ise **hiç hesap gerekmez** (ayrıca Ollama arka ucu, barındırılan ve OpenAI
+uyumlu her uç noktaya da erişir). Matris için [Arka uçlar](/docs/backends), her model
+sınıfının gerçekte nasıl iş gördüğü için [LLM Arena](/docs/arena) sayfasına bakın.
+
+```
+you ⇄ panel (pick a provider) ⇄ loopback bridge ⇄ panel orchestrator ⇄ background agent: Claude · ChatGPT · Gemini · any LLM
+```
+
+Abonelik sağlayıcılarında **API anahtarı da yok, token başına faturalandırma da** —
+yerel modellerde ise tamamen ücretsiz/çevrimdışı. Ajan, diskteki oturumunuzla kimlik
+doğrular (Ollama söz konusuysa yalnızca yerel arka plan hizmetiyle konuşur). Tek bir
+loopback köprü bağlantı noktası (`ws://127.0.0.1:9180`) üzerindeki tek bir orkestratör
+her sağlayıcıya hizmet eder; her panel sekmesi kendi sağlayıcısını el sıkışma sırasında
+seçer. Köprü yalnızca loopback üzerindedir ve panel, grafik komutlarından oluşan
+**sabit bir izin listesini** çalıştırır (rastgele JavaScript yok).
+
+<Note>
+  Buraya yeni mi geldiniz: [Arka uçlar / sağlayıcılar](/docs/backends) sayfası seçiciyi,
+  sağlayıcıdan bağımsız `AgentBackend` portunu ve yetenek matrisini (Claude ile ChatGPT
+  arasında birebir aynı olanları ve farklılaşan birkaç noktayı) anlatır.
+</Note>
+
+## Kurulum
+
+1. **Paketi kurun** — ComfyUI-Manager'da `comfyui-agent-panel` araması yapın ya da git'ten:
+
+   ```bash
+   cd ComfyUI/custom_nodes
+   git clone https://github.com/artokun/comfyui-mcp-panel
+   ```
+
+   <Warning>
+   **Manager'ın sürüm açılır menüsünde `Nightly` değil `Latest` seçin.** Adına rağmen
+   Manager'ın **Nightly** sürümü her gece derlenmez: depoyu kurulum anında **bir kez**
+   klonlar ve sonra dalı bir daha hiç izlemez. Sizi o gün `main` dalında bulunan
+   commit'e sabitler; `Latest` ise her sürümle birlikte ilerler — yani Nightly çoğu
+   zaman Latest'tan *daha eskidir* ve öylece bıraktıkça sessizce daha da geride kalır.
+   Güncelleme yok demesinin nedeni, kendi açısından gerçekten olmamasıdır.
+
+   Gerçekte nerede olduğunuzu görmek için **Node Pack Info → Version** altındaki SHA'yı
+   [deponun commit geçmişiyle](https://github.com/artokun/comfyui-mcp-panel/commits/main)
+   karşılaştırın. Bundan kurtulmak için ya aynı açılır menüden `Latest (x.y.z)` seçin ya
+   da — git'te kalmak istiyorsanız — `custom_nodes/comfyui-mcp-panel` içinde `git pull`
+   çalıştırın; sorunsuzca fast-forward eder.
+   </Warning>
+
+2. Arka plandaki ajanın aboneliğinizi kullanabilmesi için **istediğiniz sağlayıcıya bir
+   kez giriş yapın**:
+
+   ```bash
+   claude        # Claude — or: claude setup-token
+   codex login   # ChatGPT (Codex)
+   ```
+
+3. **Orkestratörü** kendi makinenizde **başlatın** ve çalışır durumda bırakın — bkz.
+   [Panel orkestratörünü başlatma](/docs/tr/installation#3-panel-orkestratörünü-başlatma):
+
+   ```bash
+   npx -y comfyui-mcp@latest connect
+   ```
+
+4. **ComfyUI'yi yeniden başlatın**, **Ajan** sekmesini açın, **bir sağlayıcı seçin**
+   (Claude / ChatGPT çipleri) ve **Bağlan**'a tıklayın. Panel, orkestratörün loopback
+   köprüsüne bağlanır. Bir istek yazın; ajan yanıtlar. **Bağlantıyı kes** bağı çözer;
+   orkestratör siz durdurana kadar çalışmayı sürdürür.
+
+`claude mcp add` yok, API anahtarı yok. Panel saf bir ön uç eklentisidir ve orkestratörü
+kendisi başlatamaz, dolayısıyla orkestratör her zaman sizin başlattığınız bir süreçtir —
+panel, hâlihazırda çalışan bir köprüye kendiliğinden bağlanır. Ön koşullar, PATH'inizdeki
+Node.js/`npx` ve yukarıdaki sağlayıcı girişidir. Köprü bağlantı noktasını
+`COMFYUI_MCP_BRIDGE_PORT` ile değiştirebilirsiniz.
+
+<Note>
+**Uzak bir ComfyUI'yi mi sürüyorsunuz** (bir bulut GPU podu, LAN'daki başka bir makine)?
+Yukarıdaki kurulum yine geçerlidir, ama orkestratörü uzak makinede değil **kendi
+makinenizde** çalıştırın: `npx -y comfyui-mcp@latest connect <remote-url>`, podun HTTPS
+sayfasına açılan güvenli tünel dahil gerisini halleder. Sonra panelde Bağlan'a tıklayın.
+Baştan sona anlatım için [Bulut dağıtımı](/docs/cloud-deployment) sayfasına bakın.
+</Note>
+
+<Note>
+  **Sağlayıcı ilk kurulumu.** Bağlan anında panel, her sağlayıcının hazır olup olmadığını
+  denetler (PATH'inizdeki CLI + diskteki oturum; macOS Anahtar Zinciri de kapsanır).
+  İlk kurulum kartı yalnızca **hiçbir** sağlayıcıda oturum açılmamışsa görünür. Kayıtlı
+  seçiminiz kullanılabilir değilse panel **hazır bir sağlayıcıya kendiliğinden geçer**
+  (kayıtlı tercihiniz korunur) ve hazır olmayan sağlayıcının satırında, tek seferlik
+  `claude` / `codex login` adımını hazırlayan bir **"kur"** eylemi sunulur. Bkz.
+  [Arka uçlar → hazır olma durumu ve ilk kurulum](/docs/backends#connect-time-readiness--onboarding).
+</Note>
+
+## Yapabildikleri
+
+Ajan (Claude *ya da* ChatGPT) comfyui-mcp'nin model becerilerini (IDEOGRAM, WAN, LTX,
+Qwen ve daha fazlası) yükler, böylece çalıştırdığınız modelleri zaten bilir — Claude
+bunları doğrudan, ChatGPT ise aynı bilginin MCP araçları olarak sunulmuş hâliyle kullanır
+([bilgi paritesi](/docs/tools/skills-knowledge)). Görsel, video ve ses üretebilir,
+ComfyUI'nizi inceleyip yönetebilir ve kurulumunuz hakkında akıl yürütebilir — sonra da
+panel sohbetinde yanıt verir.
+
+Ayrıca **bütün bir iş akışını ya da kurulum paketini tek seferde yükleyebilir**
+(`panel_load_workflow pack:<name>`) ve **maliyete duyarlıdır**: birlikte gelen paketler
+yerel GPU / ücretsizdir; kendiliğinden oluşturulan bir grafik içinse ajan çalışma zamanını
+denetler (`list_packs` ile `action:"check_runtime"`) ve **ücretli API kredisi harcamadan
+önce sorar**. Bkz. [Beceriler, Paketler ve Çalışma Zamanı Maliyeti](/docs/tools/skills-knowledge).
+
+## Canlı grafiği sürme
+
+Otonom ajan, canlı ComfyUI'nizi `panel_*` komutlarından oluşan **sabit bir izin listesi**
+üzerinden çalıştırır — rastgele JavaScript yok. Her grafik değişikliği LiteGraph'in
+değişiklik takibinden geçer, dolayısıyla her biri **Ctrl+Z** ile geri alınabilir. Aynı
+`panel_*` yüzeyi her iki arka uca da birebir aynı biçimde sunulur (Claude için süreç
+içinde, ChatGPT/Codex için loopback HTTP MCP üzerinden), böylece
+[parite](/docs/backends) kendiliğinden sağlanır.
+
+### Okuma
+
+| Araç | Etki |
+|---|---|
+| `panel_query_graph` | Görüntülenen grafiği sorgula — filtrele/gez/topla, token sınırlı |
+| `panel_get_subgraph` | Bir alt grafik düğümünün iç grafiğini oku |
+| `panel_view_selected` | Kullanıcının **seçtiği** düğüm(ler)i oku — "bu düğüm" sorusunu tek çağrıda yanıtlar |
+| `panel_view_nodes_in_viewport` | Yalnızca **ekranda olanı** oku (görüntü alanı dikdörtgeni + yakınlaştırma) — büyük bir grafikte işi daraltır |
+| `panel_get_errors` | Bir düğümün **neden** kırmızı olduğu — hatalı her düğümü nedeniyle eşleştirir (eksik model + indirme adresi, eksik medya, doğrulama, çalışma zamanı `exception_type`) |
+| `panel_list_workflows` | Açık iş akışı sekmelerini ve hangisinin etkin olduğunu listele |
+| `panel_list_nodes` | Kurulu özel düğüm paketlerini listele |
+| `panel_list_mcp` | Bağlı MCP sunucularını listele |
+| `panel_get_content_mode` | Yetişkin içeriği (NSFW) onay durumunu oku |
+
+### Grafiği düzenleme (geri alınabilir)
+
+| Araç | Etki |
+|---|---|
+| `panel_add_node` | class_type ile düğüm ekle |
+| `panel_remove_node` | Düğüm kaldır |
+| `panel_connect` / `panel_disconnect` | Yuvaları ada ya da dizine göre bağla / çöz (`panel_connect`'te iki yuvayı da atlarsanız türe göre otomatik eşleşir; `auto_match:false` eski dizin-0 davranışını geri getirir) |
+| `panel_set_widget` | Bir widget değerini değiştir (steps, cfg, prompts, …) |
+| `panel_edit_node` | Bir ya da daha çok düğümü atomik olarak taşı, boyutlandır, yeniden adlandır, renklendir, biçimini değiştir, daralt ya da sabitle |
+| `panel_auto_layout` | Bağlantı topolojisine göre grafiğin tamamını (ya da bir bölümünü) temiz bir akış/ızgara düzenine otomatik yerleştir — önizleme için `dry_run` |
+| `panel_clear` | Her düğümü kaldır — silmenin tamamı tek bir Ctrl+Z'dir |
+
+### Alt grafikler
+
+| Araç | Etki |
+|---|---|
+| `panel_select_nodes` | Tuvalde düğüm seç (çoklu seçim) |
+| `panel_create_subgraph` | Seçili düğümleri bir alt grafikte topla ("Convert to Subgraph") |
+| `panel_enter_subgraph` | Bir alt grafiğe girip iç düğümlerini oku / düzenle |
+| `panel_exit_subgraph` | Üst / kök grafiğe dön |
+
+### Uzamsal yerleşim
+
+Ajan düğüm geometrisini görebilir — `panel_query_graph` ayrıntı satırları her düğümün
+`pos`/`size` değerlerini, ayrıca alt grafik giriş/çıkış `rails`, `groups` ve düğüm başına
+`color`/`collapsed` bilgilerini döndürür — ve tuvali buna karşılık gelen bir yazma
+kümesiyle düzenler, sonra kendi yerleşimini değerlendirmek için sonucun **ekran
+görüntüsünü** alır. Bir `workflow-layout` becerisi bunları bağımlılık katmanlı,
+çakışmasız bir otomatik yerleşimde birleştirir; bu yerleşimin baş kuralı *girişleri ve
+çıkışları her zaman açıkta bırakmaktır*, böylece doğrudan işe koyulabilirsiniz.
+
+| Araç | Etki |
+|---|---|
+| `panel_move_rail` | Bir alt grafiğin giriş / çıkış rayını taşı, böylece sınır bağlantıları kısa kalsın |
+| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Etiketli bir grup kutusu oluştur, taşı, yeniden adlandır/renklendir ya da sil (otomatik sarmalamak için `node_ids` geçin) |
+| `panel_screenshot` | Tuvali PNG olarak işleyip görsel olarak geri ver, böylece ajan yerleşimini doğrulayabilsin |
+
+### İş akışı sekmeleri
+
+| Araç | Etki |
+|---|---|
+| `panel_new_workflow` | YENİ bir sekmede yepyeni, boş bir iş akışı aç (mevcut olanı asla silmez) |
+| `panel_open_workflow` | Yol / dosya adına göre bir iş akışına geç |
+| `panel_rename_workflow` | Bir iş akışını yeniden adlandır |
+| `panel_close_workflow` | Bir sekmeyi kapat (zorlanmadıkça kaydedilmemiş değişikliklerde reddeder) |
+| `panel_save_workflow` | Programatik olarak kaydet / farklı kaydet — hiçbir iletişim kutusu açılmaz |
+
+### Bir iş akışını tek seferde yükleme
+
+| Araç | Etki |
+|---|---|
+| `panel_load_workflow` | Canlı grafiği tek çağrıda eksiksiz bir iş akışıyla değiştir — JSON'u sohbet üzerinden taşımadan, birlikte gelen bir kurulum paketinin yerel GPU iş akışını yüklemek için `pack:<name>` kullanmayı yeğleyin. Değiştirilen grafik bir geri alma noktası olur (çift Esc / `/revert`). |
+
+### Bilgi ve maliyet farkındalığı
+
+Ajan, birlikte gelen uzmanlığı keşfeder ve kredi harcamadan önce çalışma zamanı
+maliyetini denetler (her iki arka uçta da aynı araçlar — bkz.
+[Beceriler, Paketler ve Çalışma Zamanı Maliyeti](/docs/tools/skills-knowledge)):
+
+| Araç | Etki |
+|---|---|
+| `list_packs` (`action:"skill_list"` / `action:"skill_read"`) | Birlikte gelen model ailesi + iş akışı becerilerini keşfet ve oku |
+| `list_packs` (`action:"list"` / `action:"read_workflow"`) | Tek komutluk kurulum paketlerini (yerel GPU / ücretsiz) listele ve bir paketin grafiğini oku |
+| `list_packs` (`action:"list_templates"`) | Bağlı sunucunun resmî ComfyUI iş akışı şablonlarını listele |
+| `list_packs` (`action:"check_runtime"`) | Bir grafiği **local** (ücretsiz) ya da **api/mixed/unknown** (ücretli) olarak sınıflandır — ajan ücretli API kredisi harcamadan önce sorar |
+
+### Çalıştırma ve görüntüleme
+
+| Araç | Etki |
+|---|---|
+| `panel_run` | Açık iş akışını kuyruğa al (Queue Prompt'a basmakla aynı) |
+| `panel_canvas` | Görünümü sığdır, bir düğüme ortala, kaydır ya da yakınlaştır |
+
+### Özel düğümler (yerleşik ComfyUI Manager)
+
+| Araç | Etki |
+|---|---|
+| `panel_search_nodes` | Kullanıcının kendi Manager'ı üzerinden kurulabilir düğüm paketlerini ara |
+| `panel_install_node` | Bir paket kurulumunu kuyruğa al (kayıt defteri kimliği ya da git adresi) |
+| `panel_node_queue_status` | Manager'ın kurulum / güncelleme kuyruğunu denetle |
+| `panel_restart_comfyui` | Yeni düğümleri yüklemek için ComfyUI'yi yeniden başlat — panel kendiliğinden yeniden bağlanır ve ajan kaldığı yerden sürdürür |
+
+### MCP ve oturum
+
+| Araç | Etki |
+|---|---|
+| `panel_add_mcp` / `panel_remove_mcp` | Kullanıcının ajan MCP yapılandırmasında (Claude ya da Codex) bir MCP sunucusu bağla / kaldır |
+| `panel_request_secret` | Bir API token'ını güvenle topla — ajan değeri asla görmez |
+| `panel_reload` | Orkestratörü (yeni kod/araçlar) ya da panel arayüzünü yumuşak yeniden yükle, sonra sürdür |
+
+### Kullanıcıyla çalışma
+
+| Araç | Etki |
+|---|---|
+| `panel_ask` | Kullanıcıdan seçenekler arasından seçim yapmasını iste (soru kartı gösterir, seçim yapılana kadar bekler) |
+| `panel_set_todo` | Panelin alt tepsisinde canlı bir TODO kontrol listesi göster |
+| `panel_request_adult_consent` / `panel_disable_adult_mode` | 18+ NSFW onay kapısını aç/kapat |
+
+<Note>
+  Her araç isteğe bağlı bir `tab_id` kabul eder — her tarayıcı sekmesi kendi
+  bağlantısını tutar ve yönlendirme varsayılan olarak tek sekmeye ya da kullanıcının
+  en son yazdığı sekmeye gider.
+</Note>
+
+## Geri sarma ve geri alma
+
+Geçmiş mesajlar donmuş değildir. Herhangi bir mesajın üzerine gelin; **✎ düzenle**
+düğmesi bir geri alma penceresi açar: **kodu** geri alın (grafiği o turun anlık
+görüntüsüne döndürün), **konuşmayı** geri alın (oturumu o noktaya çatallayın) ya da
+**her ikisini** birden yapın, sonra oradan düzenlenmiş bir mesaj gönderin. Grafik geri
+almaları tur başına anlık görüntüleri kullanır, dolayısıyla bir turu geri almak grafiği
+tam olarak başladığı hâline döndürür.
+
+Yaygın durumları iki kısayol karşılar:
+
+- **`/revert`** — son turdaki grafik düzenlemelerini geri alır.
+- **Çift Esc** — hızlı bir son tur geri sarması: grafiği geri alır ve mesajı düzenleyip
+  yeniden göndermek üzere yazma alanına çağırır.
+
+<Note>
+  **Kod** (grafik) geri alma **her iki** sağlayıcıda da çalışır — tur başına anlık
+  görüntüler hâlinde orkestratörde yaşar. **Konuşma** geri alma (sohbeti geçmiş bir tura
+  çatallamak) şu anda **yalnızca Claude'da** vardır; ChatGPT/Codex arka ucu yalnızca
+  bütün dizileri sürdürebildiği için panel bu kapsamı onda kapatır. Bkz.
+  [yetenek matrisi](/docs/backends#capability-matrix).
+</Note>
+
+## Bekleyen mesaj tepsisi
+
+Ajan meşgulken yazın; mesajınız sohbetin içinde kaybolmaz — sohbet akışının dışında,
+indirme tepsisinin üzerine sabitlenmiş bir **Bekleyen** tepsisinde bekler. Bekleyen her
+mesajın **düzenle**, **şimdi gönder** ve **sil** düğmeleri ve ajanın bunları hangi
+sırayla boşaltacağını **yeniden sıralamak** için bir sürükleme tutamacı (≡, solda)
+vardır. **Şimdi gönder**, mevcut turu keserek onu anında yönlendirir. Bekleyen bir mesaj
+kuyruktan çıktığında sohbetin **en altında** belirir, böylece döküm tam olarak ajanın
+(Claude ya da ChatGPT) işlediği sırayla okunur.
+
+## Yıkıcı işlem onayı
+
+Geri alınamayan işlemler önce sorar. `panel_clear` (her düğümü siler) ve
+`panel_restart_comfyui` bir evet / hayır kartı açar ve yalnızca **evet** yanıtında iş
+görür — böylece ajan grafiğinizi sessizce yok edemez ya da ComfyUI'yi öylece yeniden
+başlatamaz.
+
+## Yeniden bağlanma dayanıklılığı
+
+Takılmış bir orkestratör artık paneli ortada bırakmıyor. Önceki bir orkestratör köprü
+bağlantı noktasını hâlâ tutuyorsa, **Bağlan**'a tıklamak başarısız olmak yerine o
+zombiyi geri alır — panel sizi sıkışmış bırakmak yerine yeniden bağlanır.
+
+## Yazma alanı ekleri
+
+Yazma alanına ek yapın, sürükleyip bırakın ya da yapıştırın. Yazma alanı artık
+görsellerin yanı sıra **video**, **iş akışı `.json`** ve **metin** dosyalarını da kabul
+ediyor; böylece ajana bir referans klibi, uyarlanacak bir iş akışını ya da bir not
+dosyasını doğrudan verebilirsiniz.
+
+## Ajan yanıtlarında zengin medya
+
+Bir çalıştırmanın medyası ajana geri verildiğinde çıktı yalnızca bir görsel bloğu
+değildir — ajanın üzerinde akıl yürütebileceği **meta verileri** de taşır: her çıktının
+yolu (alt klasöre göreli), dosya boyutu, piksel ölçüleri ve **varlık kümesi gruplaması**
+("bu çalıştırmanın N çıktısından K'si", kardeş dosya adlarıyla, ya da "tek çıktı"),
+ayrıca işleme süresi ve tamamlanma zamanı. Video storyboard'ları, yük bunları taşıdığında
+biçimi ve gerçek kare sayısını / fps değerini de ekler. Böylece ajan gerçekte kaydedilen
+sonucu doğru şekilde adlandırır ve boyuttan, ölçülerden ve bir çalıştırmanın kaç dosya
+ürettiğinden söz edebilir.
+
+## Kod bloklarını kopyalama ve satır kaydırma
+
+Görüntülenen kod bloklarında, üzerine gelince çıkan bir **Kopyala** düğmesi ve kalıcı,
+genel bir **satır kaydırma** anahtarı bulunur (varsayılan olarak kapalı — siz açana kadar
+uzun satırlar yatay olarak kayar). Satır içi kodun da kendi Kopyala düğmesi vardır.
+İkisi de panelin görünümüne uyacak biçimde biçimlendirilmiştir.
+
+## İşleme takılma uyarısı
+
+Orkestratör, ComfyUI kuyruğunuz üzerinde edilgen bir gözcü çalıştırır: düğümü/ilerlemesi
+ilerlemeyi bırakan bir işleme **takılmış** olarak işaretlenir ve ajana bildirilir (böylece
+ajan, sıkışmış bir işin arkasına körlemesine iş yığmayı bırakır). Eşik, **Ayarlar → Comfy
+MCP Agent → Genel** altındaki **İşleme takılma uyarısı (saniye)** ayarıdır (varsayılan
+180 sn, aralık 15–3600). Bağlan sırasında gönderilir ve **canlı** olarak iletilir — onu
+değiştirmek yeniden bağlanmadan uygulanır. Bkz.
+[Yapılandırma → `COMFYUI_MCP_STALL_S`](/docs/configuration#panel-orchestrator--the-bridge).
+
+## Arka plan sekmesi güvenilirliği
+
+Akış hâlindeki yanıtlar artık ComfyUI sekmesi **arka plandayken** de görüntüleniyor.
+Önceden yanıtın daktilo efekti `requestAnimationFrame` üzerinde çalışıyordu; tarayıcı
+bunu gizli bir sekmede duraklatır — bu yüzden uzun ve çok aşamalı bir çalıştırma
+sırasında başka sekmeye geçmek, balonu boş ve akış imleci takılı hâlde bırakıyordu; tur
+çoktan bitmiş olsa bile ajan "düşünürken takılmış" gibi görünüyordu. Yanıt artık sekme
+gizlendiğinde eşzamanlı olarak sonlandırılıyor ve bir `visibilitychange` işleyicisi,
+sekme gizlenirken bekleyen yanıtları boşaltıp geri dönüldüğünde daktilo efektini
+sürdürüyor. Ön plandaki animasyon değişmedi.
+
+## RunPod bulut denetimi
+
+Araç çubuğundaki bir **host rozeti** **🟢 Yerel · kendi makineniz** ya da **🔵 RunPod ·
+<pod> · GPU · $/sa** gösterir ve bir **RunPod denetim panelini** açar: canlı bir durum
+kartı (GPU / VRAM / çalışma süresi / $·sa / ComfyUI adresi / boşta otomatik durdurma geri
+sayımı), podlarınızı **ada göre** listeleyen bir açılır menü, Bağlan / Başlat / Durdur /
+**Yereli kullan** ve onay isteyen bir **Dağıt** düğmesi. API Anahtarları kartında
+`RUNPOD_API_KEY` değerini bir kez ayarlayın; RunPod konsoluna hiç dokunmadan bir bulut
+GPU'yu dağıtabilir, izleyebilir, yerel⇄pod arasında geçebilir ve durdurabilirsiniz —
+host rozeti bir sonraki işlemenin nerede çalışacağını her zaman size söyler. Bkz.
+[Bulut dağıtımı](/docs/cloud-deployment) ve blog yazısı
+[ComfyUI'yi kiralık bir bulut GPU'da çalıştırın](/docs/blog/runpod-comfyui).
+
+## CivitAI tarayıcısı
+
+Araç çubuğundaki **Civitai** düğmesi eksiksiz bir CivitAI tarayıcısı açar — arama,
+filtreler ve tam ekran görüntüleyiciyle görseller, videolar, checkpoint'ler, LoRA'lar ve
+iş akışları. Bir sonucu seçip **ajanla paylaşın**, **makinenize indirin** ya da **gömülü
+bir iş akışını** tuvale **kaydedin**. Hikâyesi:
+[ComfyUI içinde CivitAI](/docs/blog/civitai-in-comfyui).
+
+## Ayrıca bakın
+
+- [Mobil uygulama (beta)](/docs/mobile) — telefonunuzu panelle eşleştirin ve yoldayken ajanla sohbet edin
+- [Arka uçlar / sağlayıcılar](/docs/backends) — Claude'a karşı ChatGPT, seçici, yetenek paritesi
+- [Beceriler, Paketler ve Çalışma Zamanı Maliyeti](/docs/tools/skills-knowledge) — bilgi paritesi + maliyet koruması
+- [Köprü yapılandırması](/docs/configuration)
+- [Bulut dağıtımı](/docs/cloud-deployment) — paneli uzak bir ComfyUI poduna (RunPod vb.) karşı sürün
+- [Kendi barındırdığınız röle](/docs/self-hosted-relay) — köprü için kendi tünel altyapınızı çalıştırın
+- [Claude Code eklentisi](/docs/plugin) — model becerileri, eğik çizgi komutları, ajanlar
+- [GitHub'da comfyui-mcp](https://github.com/artokun/comfyui-mcp) · [GitHub'da comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)

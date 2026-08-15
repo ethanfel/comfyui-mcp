@@ -1,0 +1,146 @@
+---
+title: "التثبيت"
+description: "ثبّت ComfyUI واربط خادم MCP — محليًا أو عن بُعد أو عبر Comfy Cloud."
+icon: "download"
+---
+
+## 1. تثبيت ComfyUI
+
+<CardGroup cols={2}>
+  <Card title="ComfyUI Desktop" icon="desktop" href="https://www.comfy.org/download">
+    أسهل طريقة للحصول على تثبيت مُدار على macOS / Windows.
+  </Card>
+  <Card title="من المصدر" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
+    استنسخ المستودع وشغّله يدويًا — أو استخدم أداة [`install_comfyui`](/docs/tools/install-environment).
+  </Card>
+</CardGroup>
+
+## 2. إضافة خادم MCP
+
+يُنشر ComfyUI MCP على npm باسم `comfyui-mcp` ويعمل عبر `npx` — دون حاجة إلى تثبيت عام.
+
+<Tabs>
+  <Tab title="ComfyUI محلي">
+    يكتشف الخادم التثبيت المحلي ومنفذه تلقائيًا. أضِفه إلى `~/.claude/settings.json`:
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="ComfyUI بعيد">
+    وجّه الخادم إلى أي نسخة يمكن الوصول إليها عبر `--comfyui-url`. لا يلزم أي تثبيت محلي
+    للأدوات القائمة على HTTP (التوليد، وقائمة الانتظار، ومسارات سير العمل، والبحث عن
+    النماذج، وغيرها). وعندما لا يكون المضيف على العنوان المحلي (loopback)، يدخل الخادم في
+    **الوضع البعيد** ويتخطّى الاكتشاف التلقائي لـ `COMFYUI_PATH` حتى لا يبتلع تثبيت محلي
+    قديم عمليات الرفع بصمت.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp", "--comfyui-url", "https://my-comfy.example.com"]
+        }
+      }
+    }
+    ```
+
+    <Note>
+      تعمل معظم الأدوات بلا مشكلة مع ComfyUI بعيد — بما في ذلك تثبيت العقد المخصّصة، عبر
+      واجهة ComfyUI-Manager البرمجية على HTTP. أما ما يحتاج فعلًا إلى مسار تثبيت محلي فهو
+      تثبيت ComfyUI نفسه، والعمليات المعتمدة على comfy-cli، وقراءة السجلات، وحذف ملفات
+      النماذج؛ وهذه تُرجع خطأً واضحًا في الوضع البعيد. راجع [كيف يعمل](/docs/concepts).
+    </Note>
+  </Tab>
+  <Tab title="Comfy Cloud">
+    استهدف [Comfy Cloud](https://cloud.comfy.org) بضبط `COMFYUI_API_KEY`. عندها يدخل الخادم
+    في **وضع السحابة**: تُوجَّه عمليات HTTP الأساسية عبر `cloud.comfy.org` مع مصادقة
+    `X-API-Key`. أما الأدوات المرتبطة بـ WebSocket وأدوات نظام الملفات أو العمليات المحلية
+    فتُطلق خطأً واضحًا هو `CLOUD_UNSUPPORTED`.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "COMFYUI_API_KEY": "your-comfy-cloud-api-key"
+          }
+        }
+      }
+    }
+    ```
+
+    <Note>
+      يتخطّى وضع السحابة الاكتشاف التلقائي لـ `COMFYUI_PATH` المحلي ويستخدم مكتبة النماذج
+      الخاصة بالسحابة. الأدوات التي تحتاج إلى عملية محلية أو إلى نظام الملفات تُطلق
+      `CLOUD_UNSUPPORTED`؛ أما غيرها فيتراجع أداؤه بدل أن يُطلق خطأً — إذ يُرجع
+      `list_local_models` قائمة فارغة، ويبلّغ `apply_manifest` عن `skipped`/`failed` لكل
+      عنصر بدلًا من الفشل الكامل. راجع صفحة [الإعدادات](/docs/configuration#deployment-modes)
+      للاطلاع على مصفوفة تكافؤ الميزات الكاملة.
+    </Note>
+    <Note>
+      **السحابة وحدها؟** [Comfy Cloud MCP من Comfy-Org](https://docs.comfy.org/agent-tools) (نسخة تجريبية عامة) هو الخيار المعياري — راجع [محلي مقابل Comfy Cloud](/docs/local-vs-comfy-cloud). استخدم وضع السحابة في `comfyui-mcp` إن أردت خادم MCP واحدًا يغطي المحلي والبعيد والسحابي، أو إن كنت تحتاج دعم السحابة اليوم.
+    </Note>
+  </Tab>
+</Tabs>
+
+ثم شغّل `/mcp` في Claude Code للاتصال.
+
+## 3. تشغيل منسّق اللوحة
+
+مطلوب فقط من أجل **لوحة الشريط الجانبي**. تخطَّ هذه الخطوة إن كنت تشغّل ComfyUI من Claude
+Code أو من عميل MCP آخر — فذلك المسار يستخدم خادم MCP المضبوط أعلاه.
+
+اللوحة امتداد لـ ComfyUI يعمل في الواجهة الأمامية فقط: لا يمكنها بدء أي عملية على جهازك،
+لذا **تبدأ أنت المنسّق بنفسك** وتتصل به اللوحة.
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+هذا اختصار لـ `--panel-orchestrator`. فهو يستهدف تلقائيًا نسخة ComfyUI المفتوحة في متصفحك،
+ويقدّم الجسر على `ws://127.0.0.1:9180` (يمكن تجاوزه بـ `COMFYUI_MCP_BRIDGE_PORT`)، ويجب أن
+يظل قيد التشغيل ما دمت تستخدم اللوحة. ثم افتح تبويب **الوكيل**، واختر مزوّدًا، وانقر
+**اتصال**.
+
+هل تشغّل ComfyUI **بعيدًا** — على Pod سحابي أو جهاز آخر في شبكتك المحلية؟ شغّل الأمر نفسه
+على **جهازك أنت**، لا على الجهاز البعيد، ومرّر الرابط:
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+يبقى تسجيل دخولك لدى المزوّد ويبقى الوكيل محليَّين؛ ولا يُثبَّت شيء على المضيف البعيد. راجع
+[النشر السحابي](/docs/cloud-deployment) لتفاصيل النفق.
+
+## 4. (اختياري) رموز API
+
+تستخدم بعض الأدوات رموز API. اضبطها في كتلة `env` الخاصة بالخادم (راجع [الإعدادات](/docs/configuration)):
+
+- `CIVITAI_API_TOKEN` — تنزيلات CivitAI المحجوبة
+- `HUGGINGFACE_TOKEN` — حدود معدّل أعلى على HuggingFace
+- `GITHUB_TOKEN` — توليد المهارات / جلب بيانات العقد الوصفية
+- `COMFY_API_KEY` — عقد واجهة comfy.org البرمجية المستضافة
+
+## التطوير المحلي
+
+يستخدم المشروع `npm link` بحيث يشير `npx comfyui-mcp` إلى نسختك المبنيّة محليًا:
+
+```bash
+git clone https://github.com/artokun/comfyui-mcp
+cd comfyui-mcp
+npm install
+npm run build
+npm link
+```
+
+بعد تعديل الشيفرة: شغّل `npm run build`، ثم `/mcp` لإعادة الاتصال.

@@ -181,10 +181,14 @@ const CATEGORIES: Array<{
     tools: ["restart_comfyui"],
   },
   {
-    group: "Defaults, Stats & Skills",
+    group: "Defaults",
+    // Slug deliberately unchanged: it is the published URL. The GROUP outgrew its name when
+    // stats and skills moved elsewhere (stats onto get_history in 0.50.0 slice 16, skills to
+    // the Skills & Knowledge page), leaving a page titled for three subjects that documents
+    // one tool. Renaming the slug too would 404 the existing page for a cosmetic win.
     slug: "defaults-stats-skills",
     icon: "sliders",
-    description: "Generation defaults, ComfyUI frontend UI settings, and skill generation. (History-based suggestions and stats moved onto get_history in 0.50.0 slice 16.)",
+    description: "Generation defaults and ComfyUI frontend UI settings. Stats now live on get_system_stats and get_history; skills on the Skills & Knowledge page.",
     tools: [
       "get_defaults",
     ],
@@ -662,10 +666,27 @@ async function main() {
   // was only half the fix: the generator still wrote all 16 of them and then threw
   // on a malformed navigation.tabs, leaving exactly the partial-regeneration debris
   // the buffering was introduced to prevent.
-  let docsJson: { navigation?: { tabs?: unknown } } | undefined;
+  type LangEntry = { language?: string; default?: boolean; tabs?: unknown };
+  let docsJson:
+    | { navigation?: { tabs?: unknown; languages?: LangEntry[] } }
+    | undefined;
+  /**
+   * Where the English tabs live. Once docs.json is localized, `navigation.tabs` moves under
+   * `navigation.languages[<default>].tabs` — the Tool Reference is English-only and belongs to
+   * that entry, not to a translated one. Returning the holder rather than the array keeps the
+   * splice below writing through to the real object in both shapes.
+   */
+  const tabsHolder = (): { tabs?: unknown } | undefined => {
+    const nav = docsJson?.navigation;
+    if (!nav) return undefined;
+    if (Array.isArray(nav.languages)) {
+      return nav.languages.find((l) => l.default) ?? nav.languages[0];
+    }
+    return nav;
+  };
   if (existsSync(docsJsonPath)) {
     docsJson = JSON.parse(readFileSync(docsJsonPath, "utf-8"));
-    const tabsValue = docsJson!.navigation?.tabs;
+    const tabsValue = tabsHolder()?.tabs;
     if (docsJson!.navigation && !Array.isArray(tabsValue)) {
       throw new Error(
         "docs.json navigation.tabs is not an array — aborting so we don't corrupt the config.",
@@ -695,7 +716,9 @@ async function main() {
   // Splice the generated "Tools" tab into docs.json (preserve everything else).
   if (docsJson) {
     // Shape already validated above, before any page was written.
-    const tabs: Array<{ tab: string; groups?: unknown[] }> = docsJson.navigation?.tabs ?? [];
+    const holder = tabsHolder();
+    const tabs: Array<{ tab: string; groups?: unknown[] }> =
+      (holder?.tabs as Array<{ tab: string; groups?: unknown[] }>) ?? [];
     const toolsTab = {
       tab: "Tool Reference",
       groups: [{ group: "Tools", pages: navPages }],
@@ -703,7 +726,10 @@ async function main() {
     const idx = tabs.findIndex((t) => t.tab === "Tool Reference");
     if (idx >= 0) tabs[idx] = toolsTab;
     else tabs.push(toolsTab);
-    docsJson.navigation = { ...docsJson.navigation, tabs };
+    // Write back through the holder so the localized shape updates the default language's
+    // tabs in place, rather than resurrecting a top-level navigation.tabs beside them.
+    if (holder) holder.tabs = tabs;
+    else docsJson.navigation = { ...docsJson.navigation, tabs };
     // Write atomically (temp + rename) so a crash mid-write can't leave a
     // half-written docs.json.
     const tmp = `${docsJsonPath}.tmp`;

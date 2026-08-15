@@ -9,6 +9,9 @@
 // ready AND from the old #509 false-timeout error.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const resetClient = vi.fn();
 const resetObjectInfoCache = vi.fn();
@@ -18,6 +21,18 @@ const resetObjectInfoCache = vi.fn();
 const getSystemStats = vi.fn(async () => {
   throw new Error("ECONNRESET");
 });
+/** #848: a temp HOME for the one test that needs Desktop's installations.json. PASS-THROUGH
+ *  by default — the real homedir until a test sets this — so nothing else in this harness
+ *  changes behaviour, and nothing ever writes into the user's real Desktop config. */
+const homeRef = vi.hoisted(() => ({ value: "" }));
+vi.mock("node:os", async (orig) => {
+  const real = await orig<typeof import("node:os")>();
+  // vi.mock is HOISTED above ordinary declarations, so the factory cannot close over a
+  // plain `let` — it reads it in the temporal dead zone and throws during module init.
+  const home = () => homeRef.value || real.homedir();
+  return { ...real, homedir: home, default: { ...real, homedir: home } };
+});
+
 vi.mock("../../comfyui/client.js", () => ({
   getObjectInfo: vi.fn(),
   backfillObjectInfo: vi.fn(),
@@ -30,6 +45,7 @@ const { buildPanelToolDefs, __panelToolsTestHooks } = await import(
   "../../orchestrator/panel-tools.js"
 );
 import {
+  config,
   getBootLocalComfyUIBaseUrl,
   getComfyUIBaseUrl,
   setComfyuiTarget,
@@ -185,6 +201,57 @@ describe("panel_restart_comfyui recovery after an ACCEPTED reboot (coordinator p
     expect(String(out.note)).not.toMatch(/this restart did not change/i);
     expect(String(out.note)).toContain("If you were expecting different arguments");
     expect(String(out.note)).toMatch(/fully quit the ComfyUI Desktop app/i);
+  });
+
+  it("NAMES the saved Desktop argument that is not in force, on the PANEL path too (#848)", async () => {
+    // The panel tool has its own restart path; the service has the Manager-reboot one.
+    // Fixing one and not the other makes the answer depend on which route the user took,
+    // which is the shape of half the bugs in this cluster — so both are driven for real.
+    // The source-text version of this check passed with the call site's Desktop gate
+    // replaced by `false`.
+    const desktopHome = mkdtempSync(join(tmpdir(), "cmcp-panel-desktop-"));
+    homeRef.value = desktopHome;
+    const root = join(desktopHome, "ComfyUI-Installs", "ComfyUI");
+    const cfgDir = join(desktopHome, "AppData", "Roaming", "Comfy Desktop");
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(
+      join(cfgDir, "installations.json"),
+      JSON.stringify([
+        {
+          id: "inst-1",
+          name: "My Desktop Install",
+          installPath: root,
+          sourceId: "standalone",
+          launchArgs: "--disable-dynamic-vram",
+        },
+      ]),
+      "utf8",
+    );
+    const savedPath = config.comfyuiPath;
+    config.comfyuiPath = join(root, "ComfyUI");
+    try {
+      const argv = ["main.py", "--listen", "127.0.0.1", "--port", "8188"];
+      __panelToolsTestHooks.setLocalRestartPreflight(async () => ({
+        ok: true,
+        observedArgv: argv,
+        isDesktopApp: true,
+      }));
+      getSystemStats.mockImplementation(async () => ({ system: { argv: [...argv] } }));
+      const seq: ProbeSeq = ["down", "healthy"];
+      let i = 0;
+      __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+      const { ctx } = makeCtx({ reboot: { rebooting: true } });
+
+      const out = parse(await rebootHandler()({ force: false }, ctx));
+      expect(out.ready).toBe(true);
+      expect(String(out.note)).toContain("--disable-dynamic-vram");
+      expect(String(out.note)).toContain("do NOT contain");
+      expect(String(out.note)).toContain("My Desktop Install");
+    } finally {
+      config.comfyuiPath = savedPath;
+      rmSync(desktopHome, { recursive: true, force: true });
+      homeRef.value = "";
+    }
   });
 
   it("reports launch arguments CHANGED when the restart did apply them (#848)", async () => {

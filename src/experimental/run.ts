@@ -5,7 +5,7 @@ import { maybeStartAgentPoc } from "./agent-poc.js";
 // ---------------------------------------------------------------------------
 // Standalone runner for the experimental embedded-agent-panel POC.
 //
-// This is intentionally NOT imported by src/index.ts — the default MCP server
+// This is intentionally NOT imported by src/boot.ts — the default MCP server
 // (stdio / HTTP) never touches the POC. Run it explicitly, e.g.:
 //
 //   COMFYUI_MCP_AGENT_POC=1 ANTHROPIC_API_KEY=... npx tsx src/experimental/run.ts

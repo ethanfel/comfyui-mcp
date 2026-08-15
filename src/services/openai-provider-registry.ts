@@ -24,7 +24,10 @@
 // creating a cycle. Credential resolution lives in `services/code-provider-auth`
 // (which reads these env keys itself); backend construction lives in
 // `orchestrator/index.ts` (which owns OllamaBackend). This module carries only
-// the copy/identity that used to be duplicated.
+// the copy/identity that used to be duplicated. (`i18n` is itself a leaf — node
+// builtins only — so translating the ready lines below keeps that property.)
+
+import { processLocale, trFor } from "../i18n/index.js";
 
 /** The simple OpenAI-compatible API-key providers, by id. */
 export type OpenAiKeyProviderId = "glm" | "kimi" | "moonshot" | "minimax";
@@ -32,9 +35,20 @@ export type OpenAiKeyProviderId = "glm" | "kimi" | "moonshot" | "minimax";
 export interface OpenAiKeyProvider {
   /** Panel backend id (a member of orchestrator BackendId). */
   id: OpenAiKeyProviderId;
-  /** Credential-slot label shown in the panel's API Keys card. */
+  /**
+   * Credential-slot label shown in the panel's API Keys card. Deliberately NOT
+   * translated: every one of these is a product name ("GLM / Zhipu", "MiniMax"),
+   * and a user hunting for the slot that matches the key they just copied off a
+   * vendor's dashboard needs the vendor's own spelling.
+   */
   slotLabel: string;
-  /** Credential-slot help text shown in the panel's API Keys card. */
+  /**
+   * Credential-slot help text shown in the panel's API Keys card. Still English:
+   * it is baked into the module-level `CREDENTIAL_SLOTS` const in panel-secrets,
+   * evaluated once at import, so it has no reader to follow — translating the slot
+   * help means making that list a per-request accessor, which is a separate change
+   * from these banners.
+   */
   slotHelp: string;
   /**
    * The env var(s) that carry this provider's API key. `envKeys[0]` is the
@@ -53,8 +67,15 @@ export interface OpenAiKeyProvider {
   defaultModel: string;
   /** Label the connect-ack falls back to when the model probe returns no ids. */
   ackFallbackLabel: string;
-  /** Connect-ack "ready" line, given the resolved agent label. */
-  readyMessage: (agentLabel: string) => string;
+  /**
+   * Connect-ack "ready" line, given the resolved agent label.
+   *
+   * `locale` is the language of the panel tab the line is destined for — this is a
+   * `say` frame a PERSON reads, so it follows that reader, not this process. Omitting
+   * it (or passing "", which is how an unset panel language arrives) falls back to the
+   * process locale; `readyBannerText` always passes one through.
+   */
+  readyMessage: (agentLabel: string, locale?: string) => string;
   /** Connect-ack "degraded" line (model probe empty / construction failed). */
   degradedMessage: string;
   /**
@@ -80,8 +101,13 @@ export const OPENAI_KEY_PROVIDERS: OpenAiKeyProvider[] = [
     modelEnv: "COMFYUI_MCP_GLM_MODEL",
     defaultModel: process.env.COMFYUI_MCP_GLM_MODEL?.trim() || "glm-5.2",
     ackFallbackLabel: "GLM",
-    readyMessage: (agentLabel) =>
-      `🟢 comfyui-mcp agent ready — ${agentLabel} on your Z.AI GLM Coding Plan. Ask away.`,
+    readyMessage: (agentLabel, locale) =>
+      trFor(
+        locale || processLocale(),
+        "banner.ready.glm",
+        "🟢 comfyui-mcp agent ready — {label} on your Z.AI GLM Coding Plan. Ask away.",
+        { label: agentLabel },
+      ),
     degradedMessage:
       "⚠️ The background agent isn't responding — GLM Code API couldn't start. Set ZAI_API_KEY (Z.AI Coding Plan), then Disconnect → Connect to retry.",
     simpleKeyAuth: true,
@@ -94,8 +120,13 @@ export const OPENAI_KEY_PROVIDERS: OpenAiKeyProvider[] = [
     modelEnv: "COMFYUI_MCP_KIMI_MODEL",
     defaultModel: process.env.COMFYUI_MCP_KIMI_MODEL?.trim() || "kimi-for-coding",
     ackFallbackLabel: "Kimi",
-    readyMessage: (agentLabel) =>
-      `🟢 comfyui-mcp agent ready — ${agentLabel} on your Kimi Code subscription. Ask away.`,
+    readyMessage: (agentLabel, locale) =>
+      trFor(
+        locale || processLocale(),
+        "banner.ready.kimi",
+        "🟢 comfyui-mcp agent ready — {label} on your Kimi Code subscription. Ask away.",
+        { label: agentLabel },
+      ),
     degradedMessage:
       "⚠️ The background agent isn't responding — Kimi Code couldn't start. Run Kimi Code login (~/.kimi/credentials/kimi-code.json) or set KIMI_API_KEY, then Disconnect → Connect to retry.",
     // OAuth dual-auth — KimiBackend + resolveKimiCodeOAuth + bespoke readiness stay.
@@ -109,8 +140,13 @@ export const OPENAI_KEY_PROVIDERS: OpenAiKeyProvider[] = [
     modelEnv: "COMFYUI_MCP_MOONSHOT_MODEL",
     defaultModel: process.env.COMFYUI_MCP_MOONSHOT_MODEL?.trim() || "kimi-k3",
     ackFallbackLabel: "Kimi K3",
-    readyMessage: (agentLabel) =>
-      `🟢 comfyui-mcp agent ready — ${agentLabel} on your Moonshot platform (Kimi K3) API key. Ask away.`,
+    readyMessage: (agentLabel, locale) =>
+      trFor(
+        locale || processLocale(),
+        "banner.ready.moonshot",
+        "🟢 comfyui-mcp agent ready — {label} on your Moonshot platform (Kimi K3) API key. Ask away.",
+        { label: agentLabel },
+      ),
     degradedMessage:
       "⚠️ The background agent isn't responding — Moonshot (Kimi K3) couldn't start. Set MOONSHOT_API_KEY from platform.kimi.ai, then Disconnect → Connect to retry.",
     simpleKeyAuth: true,
@@ -123,8 +159,13 @@ export const OPENAI_KEY_PROVIDERS: OpenAiKeyProvider[] = [
     modelEnv: "COMFYUI_MCP_MINIMAX_MODEL",
     defaultModel: process.env.COMFYUI_MCP_MINIMAX_MODEL?.trim() || "MiniMax-M3",
     ackFallbackLabel: "MiniMax",
-    readyMessage: (agentLabel) =>
-      `🟢 comfyui-mcp agent ready — ${agentLabel} on your MiniMax platform API key. Ask away.`,
+    readyMessage: (agentLabel, locale) =>
+      trFor(
+        locale || processLocale(),
+        "banner.ready.minimax",
+        "🟢 comfyui-mcp agent ready — {label} on your MiniMax platform API key. Ask away.",
+        { label: agentLabel },
+      ),
     degradedMessage:
       "⚠️ The background agent isn't responding — MiniMax couldn't start. Set MINIMAX_API_KEY from platform.minimax.io, then Disconnect → Connect to retry.",
     simpleKeyAuth: true,

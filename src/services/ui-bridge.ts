@@ -17,7 +17,9 @@
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
+import { resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
+import { attachPanelRefusal, hasOwnField, readPanelRefusal } from "./panel-refusal.js";
 import { midCommandDisconnectMessage } from "./mid-command-remedy.js";
 import {
   describePanelUpdateRecovery,
@@ -145,11 +147,6 @@ interface Conn {
    *  (see makeUnknownCommandError) — the panel gained these bridge commands in
    *  0.11.4, so older builds reject graph_* / ui_* with a raw dispatch error. */
   panelVersion?: string;
-  /** The `vocabularyHash` of the tool vocabulary this panel build VENDORED, as sent
-   *  in its `hello`. Undefined when the panel did not advertise one — an older
-   *  build, which means UNVERIFIED, not disagreeing. Never inherited across a
-   *  hello: a reconnect may be a freshly updated build with a different copy. */
-  panelVocabularyHash?: string;
   /** True only when THIS hello actually CARRIED a `panel_version` (not inherited from
    *  a prior connection under the same tab id). `panelVersion` is deliberately
    *  inherited across a reconnect that omits the field (line ~849) so the reactive
@@ -187,6 +184,14 @@ interface Conn {
    * its required fresh-backend query yields to the browser, allowing a workflow
    * switch before it writes. Re-read per hello and fail closed if absent. */
   enforcesWorkflowStampAtWrite: boolean;
+  /** True when THIS hello advertises that the panel understands `agent_note` — a frame
+   *  delivered to the AGENT ONLY and never rendered as a chat bubble.
+   *
+   *  Capability-gated on purpose. An older panel silently DROPS an unknown frame type, so
+   *  switching unconditionally would make these notices vanish for anyone who has not
+   *  updated — a wall of text traded for nothing at all, which is the worse failure. When
+   *  this is false the caller falls back to a visible `say`. */
+  acceptsAgentNotes: boolean;
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
    *  here, every later call is gated proactively — rejected before it ever
@@ -232,6 +237,16 @@ interface Conn {
    *  connections, whose advertised loopback origin is NOT the orchestrator's host
    *  and must not be directly health-probed (#509). */
   local: boolean;
+  /** The panel language THIS tab resolved for itself (`locale` in its `hello`), already
+   *  narrowed to a locale we ship. Undefined when the panel sent none (an older build) or
+   *  sent one we do not ship — both mean UNKNOWN, and unknown renders English.
+   *
+   *  Why per TAB and not per process: a `say` frame is a chat bubble inside one specific
+   *  panel tab, and those strings NAME PANEL CONTROLS ("Settings → OpenRouter → 'Set API
+   *  key…'"). Rendered in the process locale — the language of whoever launched the server —
+   *  the instruction would point at a label that user cannot find on their own screen. So the
+   *  language must come from the destination tab. See {@link tabLocale}. */
+  locale?: Locale;
 }
 
 interface AuxiliaryConn {
@@ -258,6 +273,15 @@ export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
   graph_find_nodes: "0.4.6",
   graph_query: "0.7.0",
   graph_serialize: "0.8.2",
+  // #1006 — the panel serving its OWN /object_info first shipped in panel 0.13.0. An
+  // AUTHORITATIVE entry, because without one the command falls back to the bridge
+  // baseline and an older panel answers the raw dispatch error `Unknown command
+  // "graph_get_object_info"`, which reads like a broken ComfyUI rather than an old panel.
+  //
+  // Established from the release commit, not from tags: this repo does not tag its
+  // releases (`git tag --contains` finds nothing), so ancestry would have pointed at the
+  // first tag that happens to exist and named a version four releases too late.
+  graph_get_object_info: "0.13.0",
   // #608 forced-refresh executor shipped in panel 0.11.28. Older panels (e.g. the
   // 0.11.20 in #619) register no `refresh_nodes` handler and reply with the raw
   // dispatch error `Unknown command "refresh_nodes"`. Without this AUTHORITATIVE
@@ -823,6 +847,8 @@ export type FenceAdoptOutcome = boolean | { ok: true } | { ok: false; reason: st
 
 export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   "graph_serialize",
+  // Reads the tab's own /object_info and returns it. Touches nothing.
+  "graph_get_object_info",
   "graph_outline",
   "graph_get_errors",
   "graph_get_state",
@@ -886,6 +912,7 @@ export type GraphCmdEffect = "inert" | "targeted";
 export const GRAPH_CMD_EFFECT: Readonly<Record<string, GraphCmdEffect>> = {
   // ---- inert: reads -------------------------------------------------------
   graph_serialize: "inert",
+  graph_get_object_info: "inert",
   graph_outline: "inert",
   graph_get_errors: "inert",
   graph_get_state: "inert",
@@ -922,6 +949,11 @@ export const GRAPH_CMD_EFFECT: Readonly<Record<string, GraphCmdEffect>> = {
   graph_connect: "targeted",
   graph_disconnect: "targeted",
   graph_set_widget: "targeted",
+  // Removes ONE dynamic widget row (artokun/comfyui-mcp#938). "targeted" for the same
+  // reason set_widget is: it changes one node's content, and it awaits a fresh
+  // /object_info before writing — so it needs the fence that covers the await, not only
+  // the one at dispatch.
+  graph_remove_widget: "targeted",
   graph_set_node_property: "targeted",
   graph_move_node: "targeted",
   graph_resize_node: "targeted",
@@ -1498,7 +1530,21 @@ export class UiBridge {
    *  caller, instead of being discarded as a "late reply for a timed-out command"
    *  (#486). Timestamped so an abandoned mapping (timeout/disconnect/send-failure
    *  whose late reply never arrives) is TTL-pruned rather than kept forever. */
-  private askRidToId = new Map<string, { askId: string; ts: number; tabId: string }>();
+  private askRidToId = new Map<
+    string,
+    {
+      askId: string;
+      ts: number;
+      tabId: string;
+      /**
+       * This card's answer is a CREDENTIAL (#1352). It may be buffered in memory so a
+       * late-arriving value can still be applied, but it must never reach the durable
+       * late-answer journal: `panel_request_secret` exists precisely so the value lands
+       * nowhere it can be read back, and a journal is exactly such a place.
+       */
+      sensitive?: boolean;
+    }
+  >();
   /**
    * Notified the instant a LATE (post-reply-timeout) ask answer validates (#486).
    *
@@ -1638,8 +1684,220 @@ export class UiBridge {
   private readyPromise: Promise<boolean> | null = null;
   private readyResolve: ((ok: boolean) => void) | null = null;
 
-  /** Called for panel-initiated frames (no rid): user messages, hellos. */
-  onPanelMessage: ((event: PanelEvent) => void) | null = null;
+  /**
+   * Called for panel-initiated frames (no rid): user messages, hellos.
+   *
+   * #1411 — ASSIGNING THIS DRAINS WHATEVER ARRIVED BEFORE IT.
+   *
+   * The bridge binds its port and starts accepting frames several seconds before
+   * the orchestrator installs this handler (measured on the reporting machine:
+   * listening at T+0.0s, orchestrator ready at T+3.7s). Every frame in that window
+   * used to hit `this.onPanelMessage?.(…)` and vanish — accepted, stamped, echoed
+   * into the panel transcript, then dropped with no queue, no ack and no error. The
+   * user watches their own message appear and nothing happen, which reads as the
+   * agent ignoring them rather than as a fault.
+   *
+   * A panel reaches this window whenever the orchestrator restarts under an open
+   * sidebar: a self-restart on rebuild, a crash restart, a machine waking up.
+   */
+  private panelMessageHandler: ((event: PanelEvent) => void) | null = null;
+
+  get onPanelMessage(): ((event: PanelEvent) => void) | null {
+    return this.panelMessageHandler;
+  }
+
+  set onPanelMessage(fn: ((event: PanelEvent) => void) | null) {
+    this.panelMessageHandler = fn;
+    if (fn) this.drainPreHandlerFrames();
+  }
+
+  /** Frames that arrived before the handler existed, in ARRIVAL ORDER — so the
+   *  handler sees the sequence the panel actually sent (its `hello` before its
+   *  first message), not a reordering invented by the queue. */
+  private preHandlerFrames: PanelEvent[] = [];
+  /** How many were refused once the cap was hit. Reported, never silent. */
+  private preHandlerDropped = 0;
+  private draining = false;
+  private drainScheduled = false;
+  private pendingDrain: ReturnType<typeof setImmediate> | null = null;
+  /** Set by stop(): no further continuation may be scheduled after teardown. */
+  private drainStopped = false;
+
+  /**
+   * Bounds on the pre-handler queue — COUNT and BYTES (codex review, P1).
+   *
+   * The window is bounded by boot, so these are generous for the case they exist
+   * for. They are bounds rather than an unbounded buffer because nothing
+   * guarantees a handler is EVER installed, and because this is an INGRESS path
+   * that previously discarded: retaining 200 arbitrarily large frames would be new
+   * memory exposure, quieter than the bug being fixed. A frame count alone is not
+   * a resource bound.
+   *
+   * On overflow the EARLIEST frames are kept: the first of them is the `hello` that
+   * identifies the tab, and a message replayed without it is worth less than the
+   * message that was refused.
+   */
+  private static readonly MAX_PRE_HANDLER_FRAMES = 200;
+  private static readonly MAX_PRE_HANDLER_BYTES = 1_000_000;
+  private preHandlerBytes = 0;
+
+  /** Rough wire size of a held frame. Only ever computed inside the pre-handler
+   *  window, which both bounds cap, so this cannot become a hot-path cost. */
+  private static frameBytes(event: PanelEvent): number {
+    try {
+      return JSON.stringify(event)?.length ?? 0;
+    } catch {
+      return 0; // unserialisable: counted as free rather than refused
+    }
+  }
+
+  /** Deliver a panel-initiated frame, or hold it until there is somewhere to
+   *  deliver it (#1411). Never drops silently. */
+  private deliverPanelEvent(event: PanelEvent): void {
+    // A stopped bridge dispatches NOTHING. Past teardown there is nowhere for a
+    // frame to go: delivering it pretends a dead bridge is live, and holding it is
+    // a leak nothing will ever drain. This has to precede the live-delivery path —
+    // sitting after it, a frame arriving post-stop was handed straight to a handler
+    // that was still installed.
+    if (this.drainStopped) return;
+    const fn = this.panelMessageHandler;
+    // The queue is the ordering authority whenever ANYTHING is still waiting on it
+    // (codex rounds 1 and 3, both P1). Three conditions, one rule — deliver
+    // directly only when there is nothing ahead of this frame:
+    //   * a drain in flight: a frame produced BY a handler must land behind what is
+    //     still held, or A,B,C arrives as A,C,B;
+    //   * a scheduled continuation: a socket frame D arriving between the pass and
+    //     its setImmediate would otherwise overtake the C that is already queued;
+    //   * a non-empty queue at all: nothing may be delivered around held frames.
+    if (fn && !this.draining && !this.drainScheduled && this.preHandlerFrames.length === 0) {
+      fn(event);
+      return;
+    }
+    const bytes = UiBridge.frameBytes(event);
+    if (
+      this.preHandlerFrames.length >= UiBridge.MAX_PRE_HANDLER_FRAMES ||
+      this.preHandlerBytes + bytes > UiBridge.MAX_PRE_HANDLER_BYTES
+    ) {
+      this.preHandlerDropped += 1;
+      if (this.preHandlerDropped === 1) {
+        logger.warn(
+          `[ui-bridge] the panel-message handler is still not installed and the held-frame ` +
+            `budget is full (${this.preHandlerFrames.length} frames, ${this.preHandlerBytes} B) ` +
+            `— further frames are being REFUSED, not queued (#1411). Anything sent from here ` +
+            `until the orchestrator finishes starting is lost.`,
+        );
+      }
+      return;
+    }
+    this.preHandlerBytes += bytes;
+    this.preHandlerFrames.push(event);
+  }
+
+  /**
+   * Hand over everything held, in order, then report anything that was refused.
+   *
+   * A WORK LOOP, not a snapshot of the queue (codex review, P1). Two things can
+   * happen while a frame is being handled, and both are handled by re-reading the
+   * queue and the handler on every iteration rather than by capturing them once:
+   * a handler can cause another frame to arrive (it must go to the BACK), and a
+   * handler can swap itself out and back (its own drain is suppressed by
+   * `draining`, so this loop has to be the thing that finishes the job).
+   */
+  private drainPreHandlerFrames(): void {
+    if (this.draining) return; // a handler assigned FROM a handler must not re-enter
+    if (this.preHandlerFrames.length === 0 && this.preHandlerDropped === 0) return;
+    const held = this.preHandlerFrames.length;
+    this.draining = true;
+    let delivered = 0;
+    // A BUDGET, because the loop body can extend the queue it is draining (codex
+    // round 2, P1): a handler that feeds one frame back per frame it handles would
+    // otherwise keep this synchronous loop non-empty forever and wedge the event
+    // loop — worse than the bug being fixed. The budget is the number of frames
+    // held when the drain STARTED, which is exactly the pre-handler backlog this
+    // exists to deliver; anything produced while draining is new work and is
+    // rescheduled below rather than dropped.
+    let budget = held;
+    try {
+      for (;;) {
+        const handler = this.panelMessageHandler;
+        // Cleared mid-drain: keep the rest HELD rather than dropping them — there
+        // is nowhere to deliver them, which is the situation this queue exists for.
+        if (!handler || this.preHandlerFrames.length === 0) break;
+        if (budget <= 0) break; // yield the rest to the next tick
+        budget -= 1;
+        const event = this.preHandlerFrames.shift() as PanelEvent;
+        this.preHandlerBytes = Math.max(0, this.preHandlerBytes - UiBridge.frameBytes(event));
+        delivered += 1;
+        try {
+          handler(event);
+        } catch (err) {
+          // One bad frame must not strand the rest — including the user's message.
+          logger.warn(
+            `[ui-bridge] a held frame threw while being delivered: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+    // Anything still held — produced during this pass, or queued by a handler that
+    // swapped itself out and back — is delivered on a later tick. Never dropped,
+    // and never spun on: each pass does a bounded amount of synchronous work.
+    // The teardown race codex round 4 raised — a handler calling stop() mid-drain,
+    // leaving pendingDrain null at the moment stop() looks for it — is closed
+    // upstream of here rather than by a fourth condition on this line: stop() drops
+    // whatever is held, and deliverPanelEvent refuses anything after it, so by this
+    // point a stopped bridge has nothing left to schedule. A `!drainStopped` clause
+    // was tried and removed: mutation testing showed it could never change the
+    // outcome, and a guard that cannot fail reads as protection while providing
+    // none.
+    if (this.preHandlerFrames.length > 0 && this.panelMessageHandler && !this.drainScheduled) {
+      this.drainScheduled = true;
+      const pending = setImmediate(() => {
+        this.pendingDrain = null;
+        this.drainScheduled = false;
+        this.drainPreHandlerFrames();
+      });
+      // UNREF'd (codex round 3, P1; re-examined round 4): a handler that emits a frame per delivery keeps
+      // one continuation perpetually pending, and a referenced immediate would stop
+      // a short-lived CLI — or a test — from ever exiting. Held so stop() can cancel
+      // it: a bridge torn down inside the schedule-to-callback window must not run
+      // it afterwards.
+      //
+      // The cost of unref is that a process which would otherwise exit does not wait
+      // for this. That is acceptable HERE and nowhere else in the queue: the budget
+      // is the whole backlog, so everything that arrived before the handler is
+      // delivered in the FIRST, synchronous pass. A continuation therefore only ever
+      // carries frames a handler produced while being drained — work whose consumer
+      // is going away too. The alternative, a referenced immediate, hangs the process
+      // forever on a self-feeding handler, which is strictly worse.
+      pending.unref?.();
+      this.pendingDrain = pending;
+    }
+    if (delivered > 0) {
+      logger.info(
+        `[ui-bridge] delivered ${delivered} of ${held} panel frame(s) that arrived before the ` +
+          `handler was installed (#1411)`,
+      );
+    }
+    if (this.preHandlerDropped > 0) {
+      logger.warn(
+        `[ui-bridge] ${this.preHandlerDropped} panel frame(s) were REFUSED before the handler ` +
+          `was installed and are gone (#1411)`,
+      );
+      this.preHandlerDropped = 0;
+    }
+  }
+
+  /** Test seam: how many frames are held right now, and how many were refused. */
+  preHandlerBacklog(): { held: number; dropped: number; bytes: number } {
+    return {
+      held: this.preHandlerFrames.length,
+      dropped: this.preHandlerDropped,
+      bytes: this.preHandlerBytes,
+    };
+  }
 
   constructor(port = DEFAULT_BRIDGE_PORT, token: string | null = null, host = "127.0.0.1") {
     this.port = port;
@@ -1785,8 +2043,25 @@ export class UiBridge {
           return;
         }
         this.portInUse = true;
+        // #1524 — this used to promise "this session's MCP tools still work, but
+        // panel_* commands are unavailable until that session exits", describing
+        // a degraded-but-running process. That process does not exist:
+        // `startUiBridge` has exactly ONE caller, and on a false `whenReady()` it
+        // tries to reclaim the port and then `process.exit(1)`s. So the sentence
+        // described a mode the code cannot enter, and anyone diagnosing a
+        // portless orchestrator against it was reading a fiction.
+        // THREE rewrites of this sentence were false, each in a new way: it
+        // promised a degraded-but-running mode that cannot exist; then a takeover
+        // attempt that only happens on a TTY; then an interactive prompt that also
+        // requires a reclaimable pid, and an owner that need not be ours at all.
+        //
+        // Every error was the same mistake — narrating what the ORCHESTRATOR will
+        // do next, from a module that cannot see those conditions. So this now
+        // reports only what the bridge itself observed, and leaves the outcome to
+        // the code that decides it (which logs its own, accurate message).
         logger.warn(
-          `[ui-bridge] port ${this.port} still in use after ${UiBridge.MAX_BIND_ATTEMPTS} attempts — another comfyui-mcp session likely owns the panel. This session's MCP tools still work, but panel_* commands are unavailable until that session exits.`,
+          `[ui-bridge] could not bind port ${this.port} after ${UiBridge.MAX_BIND_ATTEMPTS} ` +
+            `attempts — it is held by another process. The panel bridge is NOT listening.`,
         );
         this.readyResolve?.(false);
         this.readyResolve = null;
@@ -1936,6 +2211,12 @@ export class UiBridge {
     // deleted during migration below; without carrying this, a graph-edit-triggered
     // migration + undercutting-version hello would reintroduce the false "too old" gate.
     let migratedProvenSupported: Set<string> | undefined;
+    // Same idea for the panel language: a WORKFLOW SWITCH re-hellos on this socket under a
+    // NEW tab id, so the retiring conn is not `existing` and same-socket inheritance cannot
+    // see it. Without this carry-over a panel that omitted `locale` on the switch hello would
+    // drop back to English mid-session — which is exactly the case the field's doc claims is
+    // preserved. Consumed once, with migratedProvenSupported.
+    let migratedLocale: Locale | undefined;
 
     sock.on("message", (buf: unknown) => {
       const raw = String(buf);
@@ -2064,6 +2345,9 @@ export class UiBridge {
           // Carry the retiring conn's proven-supported veto to the migrated id (#422)
           // — same socket/panel, so demonstrated capability must not be lost.
           migratedProvenSupported = this.conns.get(tabId)?.provenSupportedCmds;
+          // …and the panel language, for the same reason: same socket, same browser tab, same
+          // person reading the bubbles.
+          migratedLocale = this.conns.get(tabId)?.locale;
           this.conns.delete(tabId);
           // Move mirror subscribers to the migrated tab id so viewers keep this
           // tab's live feed across a same-socket re-hello. #570 P0a — this is OPTIMISTIC
@@ -2216,21 +2500,15 @@ export class UiBridge {
           panelVersionAdvertised:
             typeof (msg as { panel_version?: unknown }).panel_version === "string" &&
             !!(msg as { panel_version?: string }).panel_version,
-          // The vocabulary the panel VENDORED, so the skew that #683 exposed can be
-          // detected at the handshake instead of at call time as "unknown tool".
-          // Re-read from THIS hello and never inherited: a reconnect may be a freshly
-          // updated build carrying a different vendored copy, and inheriting would
-          // report the OLD build's agreement as if it were this one's.
-          panelVocabularyHash:
-            typeof (msg as { vocabulary_hash?: unknown }).vocabulary_hash === "string"
-              ? ((msg as { vocabulary_hash?: string }).vocabulary_hash || undefined)
-              : undefined,
           // #570 P0c — re-read from THIS hello, never inherited (a reconnect may be a newly
           // updated build). Strict === true so any non-true / absent value is non-enforcing.
           enforcesWorkflowStamp:
             (msg as { enforces_workflow_stamp?: unknown }).enforces_workflow_stamp === true,
           enforcesWorkflowStampAtWrite:
             (msg as { enforces_workflow_stamp_at_write?: unknown }).enforces_workflow_stamp_at_write === true,
+          // Re-read per hello like the stamps above: a reconnect can be a different build.
+          acceptsAgentNotes:
+            (msg as { accepts_agent_notes?: unknown }).accepts_agent_notes === true,
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
           // INHERITED across a reconnect (the panel code did not get older) so a command
@@ -2261,6 +2539,27 @@ export class UiBridge {
           serverOrigin: existing?.sock === sock ? (serverOrigin ?? existing?.serverOrigin) : serverOrigin,
           // Server-trusted provenance of THIS socket (not client-controlled).
           local,
+          // The panel's own resolved UI language, so `say` bubbles land in the language of
+          // the controls they name. Narrowed here rather than at the read sites: an unshipped
+          // or garbage value becomes undefined once, at the boundary, instead of every caller
+          // having to defend against it.
+          //
+          // PRESENCE decides inheritance, not resolvability. A hello that CARRIES the field is
+          // authoritative even when we cannot ship what it asked for: a user who just switched
+          // the panel to German must get English, not the Japanese they had a moment ago —
+          // otherwise every bubble names controls in a language no longer on their screen.
+          //
+          // Only an ABSENT field inherits, and only from this same socket (the `originUrl`
+          // rule above, same reason: wf: ids recur, so a DIFFERENT socket reusing this id is a
+          // different browser tab whose language we have not been told) — or from the conn
+          // this socket is migrating away from, since a workflow switch re-hellos under a NEW
+          // tab id. Cosmetic either way; nothing gates on it.
+          locale:
+            "locale" in msg
+              ? typeof msg.locale === "string"
+                ? (resolveLocale(msg.locale) ?? undefined)
+                : undefined
+              : ((existing?.sock === sock ? existing?.locale : undefined) ?? migratedLocale),
         });
         // CONSUME the migration carry-over exactly once: it belongs to THIS hello's
         // conn only. Leaving it set would let a LATER same-socket re-hello rebuild the
@@ -2268,6 +2567,7 @@ export class UiBridge {
         // Unknown-command reply cleared it — re-bypassing the undercut-version gate
         // (codex round-8 P1).
         migratedProvenSupported = undefined;
+        migratedLocale = undefined;
         if (incomingHeadless) {
           this.headlessSeen.add(tabId);
         } else {
@@ -2301,7 +2601,7 @@ export class UiBridge {
         // buffered items below — which belong to the PRIOR workflow — are NOT replayed into
         // the replacement (a wrong-conversation/media delivery). For a PROVEN reconnect it
         // drops nothing, so the replay/flush proceeds exactly as before, just after the ack.
-        this.onPanelMessage?.(msg as PanelEvent);
+        this.deliverPanelEvent(msg as PanelEvent);
         // Replay anything this tab's agent produced while the tab had no live connection
         // (its socket was re-helloed to another workflow). The panel swaps to this
         // workflow's thread synchronously, so they render + record into the RIGHT
@@ -2397,8 +2697,20 @@ export class UiBridge {
               // by a live poller; this is what makes an answer given after the
               // tool call died survive at all. Never let a sink fault break the
               // message loop.
+              //
+              // EXCEPT FOR A CREDENTIAL (#1352). The in-memory buffer above is bounded by
+              // a TTL and cleared when claimed; the journal is durable BY DESIGN, which is
+              // the one property a secret must not have. So a secret card's late answer is
+              // recoverable within this process and nowhere else — and if nothing claims
+              // it, it expires unread rather than being written down.
+              //
+              // The journal ALSO declines it on its own (`AskAnswers.tracks` accepts only
+              // panel_ask-prefixed ids), so this is the second of two barriers rather than
+              // the only one. It is still worth having here: that prefix rule is the
+              // JOURNAL's policy, expressed in another file for its own reasons, and a
+              // guarantee about credentials should not depend on it staying that way.
               try {
-                this.lateAskSink?.(entry.askId, msg.result, entry.tabId);
+                if (!entry.sensitive) this.lateAskSink?.(entry.askId, msg.result, entry.tabId);
               } catch (err) {
                 logger.warn(
                   `[ui-bridge] late ask-answer sink threw (the answer is still buffered): ${err instanceof Error ? err.message : String(err)}`,
@@ -2422,7 +2734,26 @@ export class UiBridge {
           served?.provenSupportedCmds.add(p.cmd);
           p.resolve(msg.result);
         } else {
-          p.reject(new Error(String(msg.error ?? "panel reported an error")));
+          // #1529 — carry the panel's STRUCTURED refusal onto the error.
+          //
+          // `msg.error` is arbitrary text, and the retry path needs one fact it
+          // cannot get from text: did the executor run? The panel states that in a
+          // field (panel 0.14.35), and dropping it here is why the first attempt at
+          // the retry had to match wording — which was reverted as a P0, because a
+          // genuine mid-write failure can contain the same sentence and the cost of
+          // being wrong is a re-applied mutation.
+          //
+          // Validated before it is attached, so only a complete pre-executor claim
+          // travels; anything else leaves the error exactly as it was.
+          const err = new Error(String(msg.error ?? "panel reported an error"));
+          // OWN property on the WIRE message too (review, P0). A polluted
+          // Object.prototype.refusal would otherwise give every ordinary panel
+          // error — including a genuine mid-write one carrying no refusal of its
+          // own — the authority to have a mutation re-issued.
+          const refusal = hasOwnField(msg, "refusal")
+            ? readPanelRefusal((msg as { refusal?: unknown }).refusal)
+            : null;
+          p.reject(refusal ? attachPanelRefusal(err, refusal) : err);
         }
         return;
       }
@@ -2504,7 +2835,7 @@ export class UiBridge {
           msg.title = this.conns.get(effectiveTab)?.title;
           if (msg.type === "user_message") this.setLastActiveTab(effectiveTab);
         }
-        this.onPanelMessage?.(msg as PanelEvent);
+        this.deliverPanelEvent(msg as PanelEvent);
       }
     });
 
@@ -2676,6 +3007,45 @@ export class UiBridge {
    * like the send gate, it intentionally describes the local panel protocol
    * needed to avoid an unfenced wrong-workflow write.
    */
+  /**
+   * Send operational status to the AGENT ONLY — never rendered in the user's chat.
+   *
+   * For the walls of text that are true, necessary and addressed to the wrong reader: a
+   * failed panel auto-sync and its lock-recovery procedure, for instance. The agent has
+   * to know; the person asking for an image does not, and printing one mid-conversation
+   * reads like the assistant lost its place.
+   *
+   * FALLS BACK TO A VISIBLE `say` when the panel does not advertise `accepts_agent_notes`.
+   * An older panel drops an unknown frame silently, so sending unconditionally would turn
+   * "too loud" into "gone" — and a notice nobody sees is worse than an ugly one. The
+   * fallback is the current behaviour exactly, so an un-updated panel is unaffected.
+   *
+   * Returns which channel was used, so a caller can log the difference rather than
+   * assume.
+   */
+  pushAgentNote(text: string, tabId?: string): "agent_note" | "say" {
+    // Resolve through resolveTarget — the SAME lookup push() will use (codex, P1).
+    // A direct conns.get() misses alias/migration mappings that resolveTarget follows,
+    // so a tab that re-helloed under a new id mid-operation would be judged incapable
+    // here and then delivered to perfectly capable panel: the wall of text reappears on
+    // exactly the build that can hide it. Reading it the same way removes the
+    // disagreement, and there is no await between this and the push, so run-to-
+    // completion guarantees the two see the same connection.
+    let conn: Conn | undefined;
+    if (tabId) {
+      try {
+        conn = this.resolveTarget(tabId);
+      } catch {
+        // Not routable. push() will buffer for replay on the next hello; the frame it
+        // buffers must be the SAFE one, because we cannot know what will pick it up.
+        conn = undefined;
+      }
+    }
+    const hidden = conn?.acceptsAgentNotes === true;
+    this.push({ type: hidden ? "agent_note" : "say", text }, tabId);
+    return hidden ? "agent_note" : "say";
+  }
+
   tabCanMutateGraph(tabId: string): boolean {
     // FAIL-CLOSED convenience for the readiness callers: an unreadable probe is
     // treated as "not ready", which is the right default when the question is
@@ -2708,12 +3078,43 @@ export class UiBridge {
     tooOld: boolean;
     version?: string;
     needed: string;
+    /**
+     * The panel has NEVER advertised a version on this tab (#1560).
+     *
+     * Distinct from `advertised === false`, which only means THIS connection's
+     * hello omitted it while a previous one supplied a value — the inherited case
+     * the tri-state guard above exists for, where staying silent is right.
+     *
+     * Never having one is different, and it is evidence rather than absence:
+     * `panel_version` has ridden the hello since panel v0.11.83 (measured — the
+     * commit is an ancestor of v0.11.83 and of no earlier tag), so a panel that
+     * has never sent one is BELOW 0.11.83.
+     *
+     * THAT IS ALL IT PROVES, and an earlier version of this said more (review, P1):
+     * "below 0.11.83" does NOT imply "below 0.11.45". Panels in 0.11.45–0.11.82
+     * publish the reply uuid perfectly well and simply predate version
+     * advertisement, so telling one of those to update would name a cause that is
+     * not theirs. The caller renders this as a possibility to CHECK, never as a
+     * finding.
+     *
+     * It is still worth saying, because the band that cannot speak for itself is
+     * where the #1043 deadlock lives: #1560's reporter was on 0.11.37 and got a
+     * bare "the panel did not answer" with nothing to act on.
+     */
+    neverAdvertised?: boolean;
   } {
     const needed = PANEL_MIN_VERSION_REPLY_UUID;
     let version: string | undefined;
     let advertised = false;
+    // Did the LOOKUP itself succeed? A throw leaves `version` undefined, which is
+    // indistinguishable from "the panel never sent one" unless it is tracked
+    // separately — and rendering an unreadable tab as "your panel is old" would
+    // accuse a CURRENT panel whose socket merely closed (review, P1). Absence of
+    // evidence, one level down.
+    let resolved = false;
     try {
       const t = this.resolveTarget(tabId);
+      resolved = true;
       version = t.panelVersion;
       // #1043 (codex review) — the version must come from THIS connection's own
       // hello. A re-hello that omits `panel_version` INHERITS the previous value,
@@ -2725,7 +3126,18 @@ export class UiBridge {
     } catch {
       version = undefined;
     }
-    if (!advertised) return { tooOld: false, needed };
+    // NEVER advertised is not the same as "not advertised on this connection"
+    // (#1560). The latter inherits a known value and must stay silent; the former
+    // is only possible below v0.11.83, which is itself below `needed`.
+    //
+    // `tooOld` stays FALSE for it on purpose: this is an inference from a missing
+    // field, not a version comparison, and the two must not be reported with the
+    // same confidence. The caller renders it as a hedge.
+    if (!advertised) {
+      return resolved && version === undefined
+        ? { tooOld: false, needed, neverAdvertised: true }
+        : { tooOld: false, needed };
+    }
     if (!version || !SEMVER_RE.test(version.trim())) return { tooOld: false, needed };
     return { tooOld: compareSemver(version, needed) < 0, version, needed };
   }
@@ -2937,6 +3349,28 @@ export class UiBridge {
       return this.resolveTarget(tabId).serverOrigin;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * The panel language to render a HUMAN-facing frame in for `tabId` — English when the
+   * tab never advertised one, advertised one we do not ship, or is not connected.
+   *
+   * Resolved through the SAME path as `push` (exact id → prefix → same-socket migration
+   * alias → scope address), so the language is the language of the tab that will actually
+   * RECEIVE the frame, not of whatever id the caller happened to hold. A `say` naming
+   * "Settings → OpenRouter" is useless in a language the panel around it is not in.
+   *
+   * NEVER THROWS, and that is the load-bearing part: these strings are emitted while
+   * reporting OTHER failures — a start failure, a lost render completion, a panel sync that
+   * did not happen — so a locale lookup that could throw would turn a report of one failure
+   * into two. English is always an acceptable answer; an exception never is.
+   */
+  tabLocale(tabId: string): Locale {
+    try {
+      return this.resolveTarget(tabId).locale ?? "en";
+    } catch {
+      return "en";
     }
   }
 
@@ -3214,10 +3648,16 @@ export class UiBridge {
           this.push(
             {
               type: "say",
-              text:
-                `⚠️ Too many question cards are open at once in this tab, so the oldest ones can no ` +
-                `longer accept an answer — clicking them will do nothing. Answer the most recent card, ` +
-                `or just type your choice in the chat and the agent will pick it up.`,
+              // The ⚠️ stays outside the translated span: it is the status marker the panel's
+              // own bubble styling and a skimming eye both key on, and it means the same thing
+              // in every language.
+              text: `⚠️ ${trFor(
+                this.tabLocale(tabId),
+                "say.too_many_question_cards",
+                "Too many question cards are open at once in this tab, so the oldest ones can no " +
+                  "longer accept an answer — clicking them will do nothing. Answer the most recent card, " +
+                  "or just type your choice in the chat and the agent will pick it up.",
+              )}`,
             },
             tabId,
           );
@@ -3950,11 +4390,101 @@ export class UiBridge {
               `boundary after asynchronous work (${observed}; ` +
                 `${needs("rechecks the fence after an await")}). ${recovery}`
           : `this workflow has no trusted identity for the panel to fence the command against`;
+        // #1519 — WHAT THIS REFUSAL MAY SAY ABOUT READS, which is less than it used
+        // to say, and in one state is nothing at all.
+        //
+        // The trailing sentence used to be unconditional, and in the state #1519
+        // reports it is FALSE. A panel that advertises the per-command fence refuses
+        // an UNSTAMPED command OUTRIGHT, reads included, because #718 closed exactly
+        // that fail-open hole ("An UNSTAMPED command is refused too … an advertised
+        // fence must not fail open" — comfyui-mcp-panel.js; the predicate is
+        // commandWorkflowMismatch, which counts a missing stamp as a mismatch, and
+        // activeWorkflowFenceApplies, which covers every graph_* read). So when this
+        // refusal fires for the no-trusted-stamp reason, graph_outline does NOT work
+        // either — it answers `workflow instance mismatch: this command carries no
+        // workflow-instance stamp`, which is the error #1519 was filed with. The
+        // reporter was told reads still worked, hit a refusal this sentence says
+        // cannot happen, and had to find the rebind themselves.
+        //
+        // THREE answers, because PRESENCE IS NOT AGREEMENT (review, P1 — and the
+        // first version of this fix got it wrong in exactly the way #1519 is about).
+        //
+        // That version asked "is there a trusted stamp?" and promised reads work
+        // whenever there was one. But a read does not succeed because a stamp
+        // EXISTS; it succeeds when the stamp still EQUALS the active canvas. The
+        // resolver answers with the workflow the turn was ISSUED FOR (#570/#884) —
+        // a value that is deliberately allowed to go stale, since declining a
+        // command aimed at the workflow the user has since left is the fence's
+        // whole purpose. So "trusted" and "current" are different questions, and
+        // the fix had merely MOVED the false promise from the no-stamp branch into
+        // the stale-stamp one. Measured on a real bridge before this was changed: a
+        // stale-stamped connection was told reads still work, and the very next
+        // graph_outline came back "workflow instance mismatch: this command was
+        // issued for workflow instance aaaa…, and the active canvas reports bbbb…".
+        //
+        //   no fence advertised   → reads EXECUTE. Nothing compares them; this is
+        //                           the old panel the two capability branches exist
+        //                           for, and the original sentence is true for it.
+        //   fence, no stamp       → reads are REFUSED, provably: a missing stamp is
+        //                           a mismatch by definition (commandWorkflowMismatch).
+        //   fence, stamp present  → UNKNOWN, and it must SAY unknown. Whether the
+        //                           read passes depends on stamp-vs-active equality,
+        //                           and this side cannot evaluate it: `Conn` carries
+        //                           no live canvas uuid, and workflowUuidFor() reads
+        //                           the SAME resolver the stamp came from, so
+        //                           comparing them would compare a value with itself
+        //                           and always agree. Only the panel can answer, and
+        //                           a pre-dispatch refusal may not take a round trip
+        //                           to ask. Asserting either outcome here would be
+        //                           the unmeasured claim this whole issue is about.
+        //
+        // It deliberately names no remedy. This gate is entered only for a MUTATION,
+        // and the orchestrator's #1331 handler MEASURES which of the two no-identity
+        // states this is before naming one — including saying, when it applies, that
+        // panel_set_workflow_target({mode:"current"}) will NOT clear it. A remedy
+        // guessed here would contradict the one that was checked.
+        const trustedStamp = typeof stamp === "string" && stamp.length > 0 ? stamp : "";
+        const readsVerdict: "execute" | "refused" | "unknown" = !conn.enforcesWorkflowStamp
+          ? "execute"
+          : trustedStamp
+            ? "unknown"
+            : "refused";
+        // The exempt probe is named in both fenced verdicts, as the thing to TRY and
+        // by its ROLE rather than by an outcome: `workflow_list` is fence-EXEMPT
+        // because it is the recovery probe (commandIsCanvasTargetless, panel #759),
+        // but in the #1331 state the repair it exists for finds no identity to adopt
+        // and does NOT clear the refusal — so "so a stale binding can be repaired"
+        // would read as a promise the appended #1331 verdict then contradicts. The
+        // exemption also first shipped in panel 0.11.83 while this branch is reachable
+        // from 0.11.35, so a build in between fences the probe too (the state
+        // panel-tools' `unreadable` remedy documents). Measured against the panel
+        // repo, not assumed: #1519's own reporter is on 0.13.0, whose release commit
+        // HAS the exemption. Naming a version here would need a table entry for a
+        // value this message cannot usually read anyway, so it says which builds
+        // differ instead of asserting one.
+        const PROBE =
+          `Try panel_list_workflows — the panel exempts that read from this fence (it is the ` +
+          `recovery probe), though a build predating the exemption fences it too. Non-graph ` +
+          `tools are unaffected.`;
+        const readsNote =
+          readsVerdict === "refused"
+            ? `GRAPH READS ARE REFUSED TOO, for this same missing stamp: this tab's panel ` +
+              `enforces the per-command fence and refuses an UNSTAMPED command rather than ` +
+              `fail open, so graph_outline / graph_query answer "workflow instance mismatch: ` +
+              `this command carries no workflow-instance stamp" as well. ${PROBE}`
+            : readsVerdict === "unknown"
+              ? `WHETHER GRAPH READS STILL WORK IS NOT KNOWN FROM HERE, and is not claimed: a ` +
+                `read carries this session's stamp (${trustedStamp}), and this tab's panel runs ` +
+                `it only while that stamp still names the ACTIVE canvas — a comparison only the ` +
+                `panel can make. If the workflow was switched or replaced after this session ` +
+                `bound to it, graph_outline / graph_query are refused with "workflow instance ` +
+                `mismatch" as well; if it was not, they work. ${PROBE}`
+              : `Reads and view-only commands still work (graph_outline, graph_query, ` +
+                `graph_get_state, graph_find_nodes, graph_list_subgraphs, graph_screenshot, ` +
+                `graph_canvas).`;
         const refusal = markDispatched(
           new Error(
-            `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Reads and ` +
-              `view-only commands still work (graph_outline, graph_query, graph_get_state, ` +
-              `graph_find_nodes, graph_list_subgraphs, graph_screenshot, graph_canvas).`,
+            `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. ${readsNote}`,
           ),
           false,
         );
@@ -4024,10 +4554,19 @@ export class UiBridge {
     const askId = (cmd as { ask_id?: unknown }).ask_id;
     if (typeof askId === "string" && askId) {
       this.pruneLateAsk();
+      // INFERRED FROM THE COMMAND, never from a caller-supplied flag (#1352). A flag is
+      // one forgotten argument away from journaling a credential, and the set of
+      // secret-collecting commands is closed and known here.
+      const sensitive = cmd.cmd === "request_secret";
       // Carry the ROUTED tab id with the mapping: the late-reply branch runs in a
       // scope that only knows the socket, and the journal needs the tab the card
       // was rendered on to address the answer.
-      this.askRidToId.set(rid, { askId, ts: Date.now(), tabId: ctx.tabId });
+      this.askRidToId.set(rid, {
+        askId,
+        ts: Date.now(),
+        tabId: ctx.tabId,
+        ...(sensitive ? { sensitive: true } : {}),
+      });
     }
     // Rewrite an old-panel "Unknown command" rejection into an actionable
     // update-your-panel message (see makeUnknownCommandError). Applied to the
@@ -4112,8 +4651,26 @@ export class UiBridge {
       // could supply its own workflow_uuid would just set it to the DESTINATION workflow after a
       // switch and sail past the panel fence. So ALWAYS overwrite with the trusted resolver value
       // (ctx.workflowUuid), and STRIP any caller-supplied value entirely when we have no trusted
-      // one — an identity-less tab / old panel ships unstamped (mutations are already refused by
-      // the requiresWorkflowStampEnforcement gate above; reads execute, reply still server-fenced).
+      // one — an identity-less tab / old panel ships unstamped. Mutations are already refused by
+      // the requiresWorkflowStampEnforcement gate above.
+      //
+      // #1519 — this used to add "reads execute, reply still server-fenced". THAT IS NOT TRUE of a
+      // current panel. Its fence refuses an UNSTAMPED command outright, reads included, because
+      // #718 closed exactly that fail-open hole ("An UNSTAMPED command is refused too … an
+      // advertised fence must not fail open" — comfyui-mcp-panel.js). So a read dispatched from a
+      // session with no trusted identity comes back as `workflow instance mismatch: this command
+      // carries no workflow-instance stamp`, which is what #1519 reports.
+      //
+      // The two halves therefore hold incompatible contracts, both deliberate: this side expects
+      // an unstamped read to run, that side refuses it. Which one gives is an OPEN DESIGN
+      // QUESTION on #1519 — weakening #718, adopting the active workflow automatically (removed
+      // from #1478 for cause: it can bind the session to a DIFFERENT workflow), or refusing here
+      // with a better message all trade different risks. Recorded rather than silently picked.
+      // What is settled is that the old sentence described behaviour that does not happen —
+      // and the USER-FACING half of the same claim is fixed: the write refusal above no longer
+      // promises that graph reads still work when this side has no stamp to give them (see
+      // `graphReadsRefusedToo`). Nothing about what is DISPATCHED changed here.
+      //
       // #694 hardening: mint the rid LAST so a caller-supplied cmd.rid can NEVER
       // override it — the rid is BRIDGE-OWNED (reply correlation in `pending`,
       // the onDispatchedRid observer, and the panel's retry_of dedupe token all
@@ -4460,6 +5017,25 @@ export class UiBridge {
   }
 
   async stop(): Promise<void> {
+    // Fence FIRST, then cancel: a drain in flight must not schedule a successor
+    // behind this call (codex round 4, P1).
+    this.drainStopped = true;
+    if (this.pendingDrain) {
+      clearImmediate(this.pendingDrain);
+      this.pendingDrain = null;
+      this.drainScheduled = false;
+    }
+    if (this.preHandlerFrames.length > 0) {
+      // Held frames die with the bridge. That is the honest end state — there is
+      // nowhere left to deliver them — but it is never silent, because "the frame
+      // vanished and nothing said so" is the whole of #1411.
+      logger.warn(
+        `[ui-bridge] stopping with ${this.preHandlerFrames.length} panel frame(s) still held ` +
+          `and undelivered (#1411)`,
+      );
+      this.preHandlerFrames = [];
+      this.preHandlerBytes = 0;
+    }
     for (const armed of this.tabGoneTimers.values()) clearTimeout(armed.timer);
     this.tabGoneTimers.clear();
     if (this.bindRetryTimer) {

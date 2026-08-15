@@ -1,0 +1,92 @@
+---
+title: "ComfyUI MCP"
+description: "El plano de control local-first y nativo para agentes de ComfyUI — un servidor MCP + plugin de Claude Code que genera imágenes, video y audio, crea y ejecuta flujos de trabajo, y gestiona modelos y nodos personalizados en lenguaje natural. En local, en remoto o en Comfy Cloud."
+icon: "house"
+---
+
+**ComfyUI MCP** es el **plano de control local-first y nativo para agentes** de
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) — un servidor
+[MCP](https://modelcontextprotocol.io) y plugin de Claude Code. Conecta tu asistente de IA a una
+instancia de ComfyUI en ejecución — **local**, **remota** o
+**[Comfy Cloud](https://cloud.comfy.org)** — para que puedas generar imágenes, video y audio,
+ejecutar y crear flujos de trabajo, gestionar modelos y nodos personalizados, y controlar el
+servidor, todo en lenguaje natural. No es un simple puente de prompt a imagen: es un agente
+completo que opera ComfyUI por ti.
+
+<Frame caption="El panel del agente controlando ComfyUI de principio a fin — leyendo lo que hay instalado en local, conectando el grafo, liberando VRAM y ejecutando el render">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="Inicio rápido" icon="rocket" href="/docs/es/quickstart">
+    Añade el servidor a Claude Code y genera tu primera imagen en unos 2 minutos.
+  </Card>
+  <Card title="Referencia de herramientas" icon="wrench" href="/docs/tools/image-generation">
+    37 herramientas, documentadas automáticamente a partir de sus esquemas en vivo.
+  </Card>
+  <Card title="Instalación" icon="download" href="/docs/es/installation">
+    Instala ComfyUI y conecta el servidor MCP (en local o en remoto).
+  </Card>
+  <Card title="Configuración" icon="gear" href="/docs/configuration">
+    Variables de entorno, transportes, tokens y cómo apuntar a un ComfyUI remoto.
+  </Card>
+</CardGroup>
+
+## Lo que puedes hacer
+
+<CardGroup cols={3}>
+  <Card title="Generar" icon="image">
+    Texto a imagen con `generate_image`, además de condicionamiento con ControlNet e IP-Adapter.
+  </Card>
+  <Card title="Crear flujos de trabajo" icon="pen-ruler">
+    Créalos a partir de plantillas, modifícalos, valídalos, visualízalos y conviértelos de ida y
+    vuelta a un DSL compacto.
+  </Card>
+  <Card title="Gestionar modelos" icon="box">
+    Busca en HuggingFace/CivitAI, y descarga, lista y elimina modelos.
+  </Card>
+  <Card title="Nodos personalizados" icon="puzzle">
+    Instala, actualiza, crea instantáneas y bisecciona packs de nodos mediante ComfyUI-Manager.
+  </Card>
+  <Card title="Instalar y mantener" icon="terminal">
+    Instala o actualiza ComfyUI, inspecciona el entorno, e inicia o detén el servidor.
+  </Card>
+  <Card title="En local, en remoto o en la nube" icon="globe">
+    Detecta automáticamente una instalación local, apunta a una remota con `--comfyui-url` o se
+    comunica con [Comfy Cloud](https://cloud.comfy.org) mediante `COMFYUI_API_KEY` — sin
+    necesidad de un ComfyUI local.
+  </Card>
+</CardGroup>
+
+<Note>
+  Funciona en **macOS**, **Linux** y **Windows**, y detecta automáticamente la instalación y el
+  puerto de un ComfyUI local. El código fuente y las incidencias están en
+  [GitHub](https://github.com/artokun/comfyui-mcp).
+</Note>
+
+## Alcance: local, remoto o Comfy Cloud
+
+`comfyui-mcp` es el MCP de la comunidad para ComfyUI **local** y **remoto** — ese es su objetivo
+principal (instalaciones en Mac/Linux/Windows, RunPod, VPS, LAN, etc.).
+
+Para los usuarios de **Comfy Cloud**, Comfy-Org ofrece [herramientas oficiales para agentes](https://docs.comfy.org/agent-tools) — Comfy Cloud MCP (beta pública) y el Comfy In-App Agent (alfa privada) — mantenidas por el equipo de Comfy y ejecutadas en Comfy Cloud. Si no tienes GPU o quieres cero configuración, usa eso ([comparativa lado a lado](/docs/local-vs-comfy-cloud)). `comfyui-mcp` también incluye un modo nube de la comunidad (`COMFYUI_API_KEY`), así que un solo MCP puede apuntar a las tres formas de despliegue desde una única configuración — elige la que encaje con tu forma de trabajar.
+
+---
+
+## Mantenedor
+
+Creado y mantenido por [**@artokun**](https://github.com/artokun) — colaborador habitual de
+[Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)
+(renderizador de grafos v2 / renderizado de subgrafos / widgets promovidos) y del
+[núcleo de Python de ComfyUI](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun).
+
+**Gente de Comfy-Org** (o cualquiera que esté contratando en el ecosistema de ComfyUI): [art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com).

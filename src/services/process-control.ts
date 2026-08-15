@@ -24,6 +24,7 @@ import {
   getComfyUIBaseUrl,
   getComfyuiTargetGeneration,
   isRemoteMode,
+  targetIsOnThisMachine,
 } from "../config.js";
 import { comfyuiFetch, describeTargetDrift } from "../comfyui/fetch.js";
 import { scrubLogLines } from "../comfyui/json-guard.js";
@@ -34,6 +35,10 @@ import {
 } from "./instance-witness.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  desktopSavedLaunchArgs,
+  describeSavedLaunchArgDrift,
+} from "./desktop-launch-args.js";
 import { findComfyuiPython } from "./env-capabilities.js";
 import {
   readLiveProcessEnv,
@@ -68,6 +73,7 @@ import {
 import {
   liveRootFromArgv,
   resolveEffectiveComfyUIBase,
+  resolveLiveServerRoot,
   markLocalComfyUILaunched,
   resetLocalComfyUILaunchState,
 } from "./workspace-env.js";
@@ -523,15 +529,28 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
     const base = norm.split("/").pop() ?? "";
     // Current and legacy Windows branding, including the electron-era install dir.
     if (base === "comfy desktop.exe" || base === "comfyui.exe") return true;
-    // macOS: the bundle's MAIN binary, which by convention is named after the bundle
-    // (`Comfy Desktop.app/Contents/MacOS/Comfy Desktop`). Accepting ANY binary under
-    // `Contents/MacOS/` was too loose: a venv shim or launcher script living inside
-    // the bundle would pass, and a shim re-execs nothing (coordinator gate). The
-    // backreference ties the two halves together so the binary must belong to the
-    // bundle naming it. Electron HELPERS are excluded structurally — they live in
-    // `Contents/Frameworks/<Helper>.app/Contents/MacOS/…`, so the first bundle in the
-    // path is not followed by `Contents/MacOS/`.
-    return /\/(comfy desktop|comfyui)\.app\/contents\/macos\/\1$/.test(norm);
+    // macOS: the bundle's MAIN binary. Accepting ANY binary under `Contents/MacOS/`
+    // would be too loose — a venv shim or launcher script living inside the bundle
+    // would pass, and a shim re-execs nothing (coordinator gate) — so BOTH halves are
+    // pinned to the trusted product names. Electron HELPERS are excluded structurally:
+    // they live in `Contents/Frameworks/<Helper>.app/Contents/MacOS/…`, so the first
+    // bundle in the path is not followed by `Contents/MacOS/`.
+    //
+    // #1341 — the two names are matched INDEPENDENTLY, not tied by a backreference.
+    // The convention that a bundle's binary is named after the bundle does not hold
+    // for current Desktop packaging: ComfyUI Desktop 1.0.38 ships bundle `ComfyUI.app`
+    // with main executable `Comfy Desktop`. The backreference rejected that real
+    // supervisor, the ancestry walk ran to PID 1, and a reporter with a healthy
+    // Desktop parent was told "no Desktop app is still supervising it — its parent
+    // process is gone" and refused a safe restart.
+    //
+    // This does NOT loosen the asymmetry documented above. Both halves are still
+    // drawn from the same two-name set, so nothing new becomes a supervisor; only the
+    // requirement that they be the SAME name is dropped, and that requirement was
+    // about Apple's naming convention rather than about trust.
+    return /\/(?:comfy desktop|comfyui)\.app\/contents\/macos\/(?:comfy desktop|comfyui)$/.test(
+      norm,
+    );
   };
 
   // THE KERNEL'S ANSWER FIRST, and ALONE when it exists (codex gate round 3).
@@ -563,11 +582,16 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
   //
   // The BINARY NAME is required here too, for the same reason as above: a launcher
   // script or venv shim inside the bundle would otherwise be read as the shell
-  // (coordinator gate). `\2` ties it to the bundle that names it, and the match must
-  // end at whitespace or end-of-line so the binary is the whole argv[0] rather than a
-  // prefix of some longer name.
+  // (coordinator gate). The match must end at whitespace or end-of-line so the binary
+  // is the whole argv[0] rather than a prefix of some longer name.
+  //
+  // #1341 — and the two names are independent here as well. This fallback carried the
+  // identical backreference, so fixing only the executable-path matcher above would
+  // have left macOS installs failing on exactly the path macOS actually takes: `ps`
+  // has no authenticated-executable column, so this IS the branch a Desktop-managed
+  // mac reaches.
   const line = (identity.commandLine ?? "").trim().replace(/\\/g, "/").toLowerCase();
-  return /^"?(\/[^\s"]*\/)?(comfy desktop|comfyui)\.app\/contents\/macos\/\2(\s|"|$)/.test(
+  return /^"?(\/[^\s"]*\/)?(?:comfy desktop|comfyui)\.app\/contents\/macos\/(?:comfy desktop|comfyui)(\s|"|$)/.test(
     line,
   );
 }
@@ -1073,6 +1097,14 @@ export function describeArgvDrift(
   before: string[] | undefined,
   after: string[] | undefined,
   isDesktop: boolean,
+  /**
+   * The saved-settings finding (#848), when one could be established. It ANSWERS the
+   * question the conditional remedy below can only ask, so it REPLACES that remedy rather
+   * than following it: printed together, the user reads "if you were expecting different
+   * arguments…" immediately before "your --disable-dynamic-vram is not in force", which
+   * hedges a fact we just established and then repeats the same remedy twice.
+   */
+  savedNote = "",
 ): string {
   if (!before?.length || !after?.length) return "";
   const unchanged =
@@ -1085,7 +1117,7 @@ export function describeArgvDrift(
     return (
       ` Its launch arguments CHANGED between the reading taken before this restart request and the one taken now: before ${before
         .map(quoteToken)
-        .join(" ")} / now ${after.map(quoteToken).join(" ")}.`
+        .join(" ")} / now ${after.map(quoteToken).join(" ")}.` + savedNote
     );
   }
   // WHAT EQUAL ARGV ESTABLISHES (codex gate, twice). Two readings matched. That is
@@ -1100,9 +1132,12 @@ export function describeArgvDrift(
   // What IS supportable is the present state — the arguments in force NOW are the
   // old ones — so the remedy hangs off that, conditioned on the user's own
   // expectation, which only they can check.
+  const observed = ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now.`;
+  // A read of the user's actual settings beats a guess about their expectations.
+  if (savedNote) return observed + savedNote;
   return (
-    ` Its launch arguments are UNCHANGED (${after.map(quoteToken).join(" ")}) — the same arguments were observed before this restart request and again now. ` +
-    "If you were expecting different arguments" +
+    observed +
+    " If you were expecting different arguments" +
     (isDesktop
       ? " (after editing ComfyUI Desktop's saved launch settings, say), they are not in effect here: fully quit the ComfyUI Desktop app and relaunch it so it spawns the server from those settings."
       : " (after editing the launch command on the host, say), they are not in effect here: stop ComfyUI and start it again from its own launcher so the new arguments are used.")
@@ -1519,6 +1554,176 @@ function resolveLiveProcessCwd(pid: number): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The live process's working directory, reconstructed from the OS process
+ * observation rather than from procfs (#535) — the Windows path, where
+ * `/proc/<pid>/cwd` does not exist.
+ *
+ * `resolveLiveServerRoot`'s observed-process tier walks up from the interpreter the
+ * OS reports for the server on our port and accepts the first ancestor under which
+ * `<ancestor>/<relDir>/main.py` exists AND the interpreter belongs to that install.
+ * That accepted ancestor IS the working directory the server must have had for its
+ * relative `main.py` to name this install — the same fact `/proc/<pid>/cwd` states
+ * directly.
+ *
+ * THE PID MUST MATCH. This value is used to decide a relaunch of a process we are
+ * about to KILL, and the observation is anchored on "whatever is listening on our
+ * port". If that is a different process than `pid` — a second ComfyUI, a proxy, a
+ * pid we resolved from a stale record — then its install is not the one being
+ * stopped, and anchoring the relaunch on it would restart the wrong tree after
+ * killing the right one. An unconfirmed observation is discarded, leaving the
+ * pre-existing refusal exactly as it was.
+ *
+ * Never throws: a failure here must degrade to the old refusal, never break a stop.
+ */
+function observedLiveCwd(
+  pid: number,
+  argv: string[],
+  expectedStartedAt: string | undefined,
+): string | undefined {
+  if (!pid) return undefined;
+  // The anchor is INFERRED, never observed: it is a directory from which this
+  // relative script WOULD name this install, which is not the same claim as
+  // "the directory the process was started in". A launcher that keeps
+  // `C:\launcher\main.py` symlinked to `C:\bundle\main.py` is started from
+  // `C:\launcher`, yet `C:\bundle` satisfies the inference (codex gate).
+  //
+  // For the panel base (#1133) that gap is harmless — both spellings name the same
+  // install root. Here it is not: this value becomes the relaunch's WORKING
+  // DIRECTORY, so any relative argument would resolve somewhere else after the
+  // restart. So only adopt it when the choice of cwd CANNOT change what an
+  // argument means: every token after the script must be a flag, an absolute path,
+  // or a plain non-path value. Anything that could be a relative path leaves the
+  // pre-existing refusal in place.
+  if (argvHasRelativePathArg(argv)) return undefined;
+  try {
+    const live = resolveLiveServerRoot(argv, undefined, { remote: false });
+    if (live.source !== "observed-process" || !live.anchorDir) return undefined;
+    if (live.observedPid !== pid) return undefined;
+    // …and bind it to the process INSTANCE, not to the pid NUMBER. This resolver
+    // re-queries the port owner at its own moment, after the identity bracket
+    // above has already closed; a pid recycled in that window would satisfy a
+    // numeric comparison while describing a different server. The codebase's rule
+    // is pid + creation time, and an unreadable stamp is "did not observe", never
+    // "observed the same" — so it fails closed to the old refusal (#535 codex gate).
+    const nowStartedAt = resolveProcessIdentity(pid)?.startedAt;
+    if (!expectedStartedAt || !nowStartedAt || nowStartedAt !== expectedStartedAt) {
+      return undefined;
+    }
+    return isAbsolute(live.anchorDir) ? live.anchorDir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Does any argument AFTER the launch script depend on the working directory?
+ *
+ * Conservative on purpose (#535): a token counts as a possible relative path
+ * unless it is a flag, an absolute path, or a plain value that cannot be one (a
+ * number, a `key=value` flag payload, a bare `true`/`false`). `--port 8188` is
+ * safe; `--output-directory out` is not, and neither is anything carrying a path
+ * separator without a root.
+ *
+ * The asymmetry is deliberate. A false positive costs a Windows user the same
+ * manual restart they have today; a false negative relaunches a server into a
+ * directory where its own arguments point somewhere else.
+ */
+function argvHasRelativePathArg(argv: string[]): boolean {
+  let sawSeparator = false;
+  let pendingPathFlag = false;
+  for (let i = 1; i < argv.length; i++) {
+    const raw = argv[i];
+    if (raw === undefined) continue;
+    // Everything after a bare `--` is positional, so nothing there is a flag and
+    // a leading dash no longer means what it did.
+    if (!sawSeparator && raw === "--") {
+      sawSeparator = true;
+      pendingPathFlag = false;
+      continue;
+    }
+    if (sawSeparator) {
+      if (!isAbsolutePath(raw)) return true; // a positional we cannot vouch for
+      continue;
+    }
+    // The token immediately after a path-valued flag is ITS VALUE, whatever it
+    // looks like — `--output-directory -` names a directory called `-`, and
+    // treating it as the next flag is how that slipped through (codex round 2).
+    // A token starting with `--` is the exception: no ComfyUI path flag takes a
+    // `--`-prefixed value, so that is the NEXT FLAG and the previous one was a
+    // boolean we misread.
+    // KEEP consuming while the flag can still take values. ComfyUI declares
+    // `--extra-model-paths-config` as `nargs='+'`, so `--extra-model-paths-config
+    // C:\one.yaml two.yaml` carries TWO paths and only the first was being checked
+    // (codex round 3) — `two.yaml` then fell to the positional check, which lets a
+    // separator-free name through. argparse ends the list at the next option.
+    if (pendingPathFlag && !raw.startsWith("--")) {
+      if (!isAbsolutePath(raw)) return true;
+      continue; // stay pending: there may be more values
+    }
+    pendingPathFlag = false;
+    if (raw.startsWith("-")) {
+      // `--flag=value` carries its value INSIDE the token.
+      const eq = raw.indexOf("=");
+      const name = eq >= 0 ? raw.slice(0, eq) : raw;
+      const attached = eq >= 0 ? raw.slice(eq + 1) : undefined;
+      if (!KNOWN_PATH_FLAG.test(name)) continue; // --port, --cache-none, …
+      if (attached === undefined) {
+        pendingPathFlag = true; // its value is the next token
+        continue;
+      }
+      if (attached && !isAbsolutePath(attached)) return true;
+      continue;
+    }
+    // Any other token: only a path-SHAPED one is a concern. A stray value that is
+    // not a path (`8188` after `--port`, `10` after `--cache-lru`) cannot be
+    // re-resolved into something else by a different cwd. A URL carries slashes
+    // without being a path — `--comfy-api-base https://api.comfy.org` is not
+    // something a working directory can move (codex round 3).
+    if (raw === "." || raw === ".." || (/[\\/]/.test(raw) && !isUrlLike(raw))) {
+      if (!isAbsolutePath(raw)) return true;
+    }
+  }
+  // A trailing path flag with no value left to take is malformed argv, not a
+  // relative path — there is nothing for a different cwd to re-resolve.
+  return false;
+}
+
+/**
+ * ComfyUI's flags whose value is a PATH, matched on the flag NAME rather than on
+ * what the value looks like (codex round 2).
+ *
+ * Judging the value was the wrong instinct and bypassable three ways: `auto`,
+ * `8188` and `-` are all perfectly legal directory names, so an allowlist of
+ * "values that cannot be paths" cannot exist. The flag name is the part whose
+ * vocabulary is knowable.
+ *
+ * ENUMERATED, not pattern-matched. A broad `/dir|path|cache|log|…/` substring
+ * test is over-broad in the direction that BREAKS the fix: `--cache-none` and
+ * `--log-stdout` are BOOLEAN flags that match it, so the next token gets eaten as
+ * their "value" and a perfectly ordinary launch is refused. `--cache-none` is in
+ * this issue's own original report, so the heuristic would have refused the very
+ * argv it exists to support.
+ *
+ * A path flag missing from this list degrades to the positional check below —
+ * blocked when the value is path-SHAPED, allowed when it is not. That residual
+ * (an unknown path flag carrying a relative value that looks like nothing,
+ * e.g. `--future-dir auto`, on a symlinked launcher) is narrower than the
+ * blanket refusal it replaces, and is stated rather than hidden.
+ */
+const KNOWN_PATH_FLAG =
+  /^--(base|input|output|temp|user|models|custom-nodes|front-end-root)-director(y|ies)$|^--(models-dir|extra-model-paths-config|tls-keyfile|tls-certfile|log-file)$/i;
+
+/** Absolute on either host convention — POSIX, Windows drive, or UNC. */
+function isAbsolutePath(p: string): boolean {
+  return isAbsolute(p) || /^[a-zA-Z]:[\\/]/.test(p) || /^\\\\/.test(p);
+}
+
+/** A URL, not a filesystem path — it carries slashes but no cwd can move it. */
+function isUrlLike(p: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p);
 }
 
 /**
@@ -2225,6 +2430,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
 
   let argv: string[] = [];
   let pid: number | null = null;
+  let ownerStartedAt: string | undefined;
   let bracketed = false;
   for (let attempt = 0; attempt < 2; attempt++) {
     const before = observeOwner();
@@ -2249,6 +2455,9 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
       }
       const after = observeOwner();
       pid = after?.pid ?? before?.pid ?? null;
+      // Keep the bracketed instance stamp: the observed-cwd fallback (#535) must
+      // bind to this PROCESS INSTANCE, not to a pid number it can re-observe later.
+      ownerStartedAt = after?.startedAt ?? before?.startedAt;
       if (pid == null) {
         try {
           pid = findPidByPort(port);
@@ -2360,7 +2569,17 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   const desktopExe = desktop ? findDesktopExePath(identifyingArgv) : undefined;
   // Capture the live process cwd NOW, while the pid is guaranteed alive — the
   // `/proc/<pid>/cwd` symlink is gone the instant a later stop kills it (#535).
-  const liveCwd = desktop ? undefined : resolveLiveProcessCwd(pid);
+  //
+  // On Windows there is no `/proc`, so this returned undefined and the relative-script
+  // anchor downstream could never fire — a `ComfyUI\main.py` launch was refused
+  // outright with "could not locate the ComfyUI install", which is the #535 recurrence
+  // that kept coming back. `observedLiveCwd` reconstructs the SAME fact from the OS
+  // process observation instead of from procfs: the directory the server's relative
+  // `main.py` must have been resolved against for it to name the install its own
+  // interpreter lives in.
+  const liveCwd = desktop
+    ? undefined
+    : (resolveLiveProcessCwd(pid) ?? observedLiveCwd(pid, argv, ownerStartedAt));
   // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
   // is guaranteed alive, so a relaunch can reproduce the launcher environment the
   // server was actually started with instead of substituting the orchestrator's.
@@ -3647,7 +3866,22 @@ async function restartViaManagerRebootDispatch(
   }
   const argvNote =
     targetStable && identityContinuous
-      ? describeArgvDrift(priorArgv, afterArgv, context.isDesktop === true)
+      ? describeArgvDrift(
+          priorArgv,
+          afterArgv,
+          context.isDesktop === true,
+          // #848: where the SAVED settings can be read, the finding REPLACES the
+          // conditional remedy inside that function — "if you were expecting different
+          // arguments" is a question, and this is the answer. Silent whenever the
+          // settings could not be established: a missing file is not evidence of
+          // agreement.
+          context.isDesktop === true
+            ? describeSavedLaunchArgDrift(
+                desktopSavedLaunchArgs(config.comfyuiPath ?? undefined),
+                afterArgv,
+              )
+            : "",
+        )
       : "";
 
   return {
@@ -4114,7 +4348,57 @@ export async function preflightLocalRestart(): Promise<{
   /** Whether the assessed instance is ComfyUI Desktop — selects the #848 remedy. */
   isDesktopApp?: boolean;
 }> {
-  if (isRemoteMode()) return { ok: true };
+  // Remote mode passes because there is no local process to assess — but that
+  // reasoning only holds when the target really is another machine, and the
+  // classification behind it does not establish that. `remoteUrlActive` is
+  // `forceRemote || !isLoopbackHost(host)`, so a ComfyUI on THIS host reached
+  // through its own LAN address is "remote" here, and this line waves the whole
+  // refuse-safe check through for an install we could have assessed.
+  //
+  // That is the #742 recurrence, reported on 0.51.18 — a Pinokio ComfyUI on the
+  // same machine addressed as `http://192.168.x.x:5000` with COMFYUI_PATH set to
+  // it. The preflight passed without looking, the Manager reboot stopped the
+  // server, and Pinokio does not relaunch on a plain restart, so it stayed down.
+  // The guard that exists precisely to refuse that stop never ran.
+  //
+  // An address bound to one of our own interfaces is assessable, so assess it.
+  // Forced remote is still honoured unconditionally: `--force-remote` is the
+  // user telling us the instance is elsewhere regardless of how it is addressed
+  // (a tunnel or port-forward makes the route say otherwise), and overriding an
+  // explicit statement of intent with an inference would be its own bug.
+  const remoteAddressedButOurs = isRemoteMode() && targetIsOnThisMachine();
+  if (isRemoteMode() && !remoteAddressedButOurs) return { ok: true };
+  const assessed = await assessLocalRestart();
+  // An address on one of our interfaces proves the ROUTE lands here, not that
+  // the instance does — a reverse proxy or port-forward bound to this machine's
+  // LAN address can front a ComfyUI that is genuinely elsewhere (review, P2).
+  // Such a setup used to restart through the Manager and now meets the guard,
+  // so a refusal must say which assumption produced it and how to correct it.
+  // Silently changing behaviour and leaving the reader to guess is the part
+  // that would actually cost them time.
+  if (remoteAddressedButOurs && assessed.ok === false) {
+    return {
+      ...assessed,
+      reason:
+        `${assessed.reason ?? "the relaunch could not be established"} ` +
+        `NOTE: this target was assessed as LOCAL because its address is bound ` +
+        `to one of this machine's own network interfaces. If this ComfyUI is ` +
+        `actually somewhere else and merely reached through a proxy or ` +
+        `port-forward on this host, set COMFYUI_MCP_FORCE_REMOTE=1 (or pass ` +
+        `--force-remote) and the restart goes back through ComfyUI-Manager ` +
+        `without needing a local process to account for.`,
+    };
+  }
+  return assessed;
+}
+
+/** The assessment itself — everything after the locality decision above. */
+async function assessLocalRestart(): Promise<{
+  ok: boolean;
+  reason?: string;
+  observedArgv?: string[];
+  isDesktopApp?: boolean;
+}> {
   const { info, diagnostic } = await acquireProcessInfo();
   // NOTHING COULD BE RESOLVED — and that is not a pass (coordinator gate).
   //

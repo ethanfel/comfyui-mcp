@@ -1,0 +1,195 @@
+---
+title: "疑難排解"
+description: "使用者實際會遇到的問題與解法：ComfyUI-Manager 版本世代不符（405）、以 git URL 安裝被靜默略過、遠端瀏覽器連不上面板、過期的 npx 快取，以及連接埠轉送的遠端主機被誤判為本機。"
+icon: "wrench"
+---
+
+這一頁的每一則都源自真實的問題回報。如果你遇到的狀況不在其中，
+請[開一個 issue](https://github.com/artokun/comfyui-mcp/issues) —— 它多半
+最後也會出現在這一頁上。
+
+## `install_custom_node` 在 `/v2/manager/queue/task` 上以 `405 Method Not Allowed` 失敗
+
+**原因：** ComfyUI-Manager 有兩個世代。`/v2/manager/*` API 屬於 **v4 系列**
+（pip 套件 `comfyui_manager` ≥ 4.x）；而**已發布的 Manager 3.x** —— 也就是
+ComfyUI-Manager 預設安裝的那一版 —— 用不同的路由提供同一組佇列。
+
+**解法：** 把 `comfyui-mcp` 更新到 **0.24.3** 以上 —— 它會針對每個目標自動偵測
+Manager 的世代，兩種方言都能溝通。Manager 完全不需要更動。
+
+**選用但建議 —— 升級到 Manager v4**，才能使用 3.x 無法遠端完成的功能（尤其是
+**任意 URL 的模型下載**，3.x 會用白名單擋下）：
+
+```bash
+# in your ComfyUI python environment
+pip install -U comfyui_manager
+# then remove/disable the old custom_nodes/ComfyUI-Manager clone and restart
+```
+
+[RunPod 映像檔](/docs/cloud-deployment)已經內建 Manager v4。
+
+**關於 `useCmCli: true`：** cm-cli 備援會以子行程執行 Manager 的 CLI，所以需要
+**本機檔案系統** —— 它無法用在遠端／`--tunnel` 目標上；而且當 `python` 不在 PATH
+上時，`COMFYUI_PYTHON` 必須指向 ComfyUI venv 的直譯器。對遠端目標來說，Manager
+的 HTTP 路徑（預設）才是正確的機制。
+
+## 以 git URL 安裝的自訂節點始終沒有出現
+
+用登錄庫 ID 安裝可以正常運作，但直接用 GitHub URL 安裝會回報成功，節點包卻從來
+沒有出現。
+
+**原因：** Manager 把任意 git URL 的安裝視為高風險，在安全等級不夠寬鬆時會
+**靜默略過**（卻仍然把佇列工作標記為「done」）。在 Manager 3.x 上還另外有一個
+專用的 `allow_git_url_install` 設定旗標。
+
+**解法：** 在 Manager 的 `config.ini`（位於你的 ComfyUI 使用者目錄下）中：
+
+```ini
+[default]
+security_level = weak          ; Manager v4: allows git-URL installs
+allow_git_url_install = True   ; Manager 3.x: additionally required
+```
+
+改完後重新啟動 ComfyUI。在 RunPod 映像檔上，從映像檔 `1.6` 起這已經是預設值
+（`COMFY_SECURITY_LEVEL` 環境變數會覆寫它；每次開機都會重新套用這個等級）。
+`1.4`／`1.5` 映像檔*本意*如此，但內建的 `COMFY_SECURITY_LEVEL=normal-` 環境變數
+覆寫了開機指令稿的預設值 —— 在那些映像檔上，請直接在 Pod 的環境變數中設定
+`COMFY_SECURITY_LEVEL=weak`。只在你自己掌控的機器上放寬這項設定 —— 它會拿掉
+Manager 的安裝防護。
+
+## RunPod：代理面板分頁是空的 —— 檔案都在，但全都是 0 位元組
+
+ComfyUI 有列出 `comfyui-mcp-panel`，但側邊欄分頁始終載入不出來；
+`ls -la /workspace/custom_nodes/comfyui-mcp-panel` 顯示每個檔案都是
+**0 位元組**。使用者自行安裝的節點也可能以同樣的方式變成空檔。
+
+**原因：** 網路磁碟區在某個時間點**空間用盡**了（常見於小容量磁碟區上首次開機時
+約 7 GB 的抽檢模型複製，或是一次大型模型下載）。發生 ENOSPC 時，`cp`／`git` 仍然
+會*建立*每個檔案，卻寫不進任何內容 —— 而磁碟區會持續保存，這些空殼便在每次重新
+部署後繼續留著。
+
+**解法：** 釋出或擴充磁碟區空間，然後重新啟動 Pod。從映像檔 `1.6` 起，開機指令稿
+會在磁碟區空間不足／已滿時發出警告，放不下時跳過抽檢模型的複製，並對 0 位元組的
+面板自動**自我修復**（從 GitHub 重新 clone，離線時則使用映像檔內建的種子副本）。
+它也會記錄 `WARN: custom nodes with 0-byte __init__.py`，列出其他損壞的節點 ——
+這些請透過 Manager 重新安裝。在 `<= 1.5` 的映像檔上，請刪除面板資料夾後重新啟動：
+`rm -rf /workspace/custom_nodes/comfyui-mcp-panel`。
+
+## 面板顯示「橋接（ws://127.0.0.1:9180）上沒有任何代理在監聽」
+
+你是在**與協調器所在機器不同的另一台機器的瀏覽器上**開啟 ComfyUI。橋接在設計上
+只接受 loopback，而瀏覽器裡的 `127.0.0.1` 指的是瀏覽器那台機器 —— 不是伺服器。
+
+**解法 —— 在「有瀏覽器」的那台機器上執行協調器**（這是受支援的拓撲：代理跑在
+*你自己的*機器上，並驅動遠端的 ComfyUI）：
+
+```bash
+npx -y comfyui-mcp@latest connect http://<comfyui-host>:8188
+```
+
+然後在面板中按「連線」。ComfyUI 那台機器上除了 ComfyUI 和面板自訂節點之外，不需要
+執行任何東西。如果 ComfyUI 走的是 **https**（RunPod 的 proxy），協調器會自動把橋接
+升級成安全的 `wss://` 通道 —— 指令完全一樣。
+
+**或者在伺服器端執行協調器（≥ 0.24.5）** —— 適合 24/7 常駐的無頭主機（例如一台
+獨立的 Ollama/OpenClaw 伺服器）：代理應該住在 ComfyUI 旁邊，而瀏覽器可以從區域
+網路上的任何地方連進來：
+
+```bash
+# on the SERVER — bind the bridge on the LAN, token-gated (mandatory)
+COMFYUI_MCP_BRIDGE_HOST=0.0.0.0 \
+COMFYUI_MCP_BRIDGE_TOKEN=<pick-a-long-secret> \
+npx -y comfyui-mcp@latest --panel-orchestrator
+```
+
+它會印出一段可以直接貼上的 `ws://<server-ip>:9180/?token=…` —— 把它填進任何一台
+機器上面板的**設定 → 進階 → 橋接網址**，然後按「連線」。非 loopback 的繫結
+**沒有權杖就拒絕啟動**，而且每一條連線都會在 WebSocket 升級時檢查（常數時間比對）。
+請把這個網址當成密碼看待：任何拿到它的人都能驅動這個代理。
+
+## 新版本已經發布，但我看到的還是舊行為
+
+`npx` 會非常積極地快取套件 —— `npx -y comfyui-mcp@latest` 可能會拿出 `~/.npm/_npx`
+裡幾週前的建置版本。
+
+```bash
+# clear it, then relaunch
+npx clear-npx-cache
+# or on Windows:
+#   Remove-Item -Recurse -Force "$env:LOCALAPPDATA\npm-cache\_npx"
+```
+
+也順便檢查面板自訂節點：如果它是舊安裝留下來的、位在**網路磁碟區**上
+（RunPod 的 `/workspace`），那份副本會蓋掉映像檔中會自動更新的那一份。請執行
+`git -C <panel-dir> fetch && git -C <panel-dir> reset --hard origin/main`，
+或從 ComfyUI-Manager 重新安裝 `comfyui-agent-panel`，然後重新啟動 ComfyUI 並強制
+重新整理瀏覽器分頁（Ctrl+Shift+R）。
+
+## 連接埠轉送的遠端 ComfyUI 被誤判為本機（dstack、SSH 通道）
+
+透過 `localhost:8188` 連得到的遠端 ComfyUI（dstack、`ssh -L`、kubectl
+port-forward）會讓 loopback 的判斷失準：comfyui-mcp 會以為這是本機安裝，於是在一個
+根本沒有 ComfyUI 的檔案系統上啟用僅限本機的工具。
+
+**解法（≥ 0.24.1）：** 傳入 `--force-remote`（或 `COMFYUI_MCP_FORCE_REMOTE=1`）：
+
+```bash
+npx -y comfyui-mcp@latest connect http://localhost:8188 --force-remote
+```
+
+遠端目標的生成歷史記錄放在 `~/.comfyui-mcp/instances/<host_port>/`
+（可用 `COMFYUI_MCP_DATA_DIR` 覆寫）。
+
+## Docker：容器在 HTTP 模式下立刻結束
+
+在沒有驗證的情況下繫結非 loopback 的主機**依設計就會直接失敗**（`0.0.0.0` 上開放的
+`/mcp` 端點會被暴露出去）。請傳入權杖，或明確選擇不做這項檢查：
+
+```bash
+docker run --rm -p 9100:9100 -e COMFYUI_MCP_HTTP_TOKEN=changeme comfyui-mcp \
+  --http --host 0.0.0.0 --port 9100
+# or (trusted networks only):
+#   ... --http --host 0.0.0.0 --port 9100 --allow-unauthenticated-non-loopback
+```
+
+stdio 模式（預設值，也是 MCP 用戶端使用的方式）完全不需要這些設定。
+
+## 代理從來不呼叫工具 —— 沒有錯誤，它就只是在講話
+
+它會描述你的工作流程而不是去讀取它，或是提議幫你寫一段指令稿。之所以沒有錯誤，是
+因為沒有任何東西失敗：可能是工具根本沒有送到你的用戶端，可能是你的用戶端擋下了這些
+呼叫，也可能是那項能力確實存在、只是它的名稱從來沒被提起。這三種情況從外面看起來
+一模一樣，解法卻完全相反，所以用猜的比動手確認更糟。
+
+向你的代理問兩個問題就能分辨它們 ——
+請看[當它什麼都不說時](/docs/using-tools#when-it-says-nothing)。請注意：用戶端側的
+權限封鎖根本不會到達這個伺服器，因此下面提到的任何記錄檔裡都不會出現它。
+
+## 本機模型：工具呼叫失敗，或模型「看不到」工具
+
+- **第一步：使用[我們的微調模型](/docs/local-llms#our-fine-tuned-local-models-free-recommended)** ——
+  `ollama pull artokun/gemma4-comfyui-mcp:e4b`（面板的 Ollama 預設模型）。
+  它是直接用 comfyui-mcp 的工具組訓練出來的 Gemma 4，開箱就消除了大部分
+  「選錯工具／參數格式錯誤」的失敗（約 2 GB VRAM 用 `:e2b`，約 8 GB 用
+  `:12b` —— 每一階在競技場上都勝過它對應的原版基礎模型；`:e4b` 仍然是最佳
+  平衡點）。
+- **gemma3 在 Ollama 中沒有原生的工具呼叫** —— 不支援；請改用上面的微調模型、
+  原版 `gemma4`（e4b 以上）、`qwen3` 或 `llama3.1+`。
+- 小模型請開啟[精簡工具模式](/docs/local-llms) —— 它**不是**預設值，所以啟動
+  伺服器時要加上 `--compact`（或 `COMFYUI_MCP_TOOL_MODE=compact`）。沒開的話，
+  完整的 schema 會撐爆小型的上下文視窗，模型就會開始亂編工具名稱。
+- 冷啟動載入模型時，第一個 token 可能要等 30 秒以上 —— 面板的監看機制已經把這件事
+  算進去了；但如果請求瞬間就失敗，通常代表那個模型標籤還沒拉下來
+  （`ollama pull <tag>`）。
+- **所有請求突然全部失敗／11434 連接埠拒絕連線** —— Ollama 應用程式／背景服務
+  沒有在執行。關掉系統匣裡的應用程式會一併把 API 殺掉，而在代理跑到一半時很容易
+  不小心這麼做（面板不會警告目前正在使用本機後端）。重新啟動該應用程式（或執行
+  `ollama serve`）再重新連線 —— 工作階段會接續，不需要重新啟動面板。
+
+## 記錄檔要去哪裡看
+
+- **協調器**：執行 `connect` / `--panel-orchestrator` 的那個終端機。
+- **ComfyUI 端**：`get_system_stats (action:"logs")` MCP 工具，或 RunPod 上 Pod 的記錄檔串流。
+- **面板 JS**：瀏覽器開發者工具的主控台（橋接用戶端會記錄連線／重新連線的狀態轉換）。
+- **一次呼叫看完健康狀況**：`get_system_stats (action:"health")` 工具會彙整
+  版本／GPU／VRAM／佇列／模型目錄／近期錯誤。

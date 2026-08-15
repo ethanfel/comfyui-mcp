@@ -1,5 +1,5 @@
 ---
-title: "Run ERNIE-Image Locally in ComfyUI (Apache-2.0, 2026)"
+title: "Run ERNIE-Image Locally in ComfyUI (Apache-2.0)"
 description: "Run Baidu's ERNIE-Image — the Apache-2.0, 8B text-to-image model with sharp multilingual EN/CN/JP text — locally in ComfyUI. Install, settings, VRAM."
 keywords:
   - ERNIE Image ComfyUI
@@ -10,6 +10,7 @@ keywords:
   - ERNIE vs Z-Image
   - Baidu ERNIE Image
   - open source AI image model
+verified: 2026-08-14
 ---
 
 _by [artokun](https://github.com/artokun) · June 16, 2026 · ernie · image · ComfyUI · model highlight_
@@ -72,6 +73,21 @@ axes that matter for production text work: a **permissive license** and **clean
 multilingual typography**. Each of those models gets its own post in this series —
 this one is ERNIE's spotlight for **commercial-safe, text-rich images**.
 
+## Licensing
+
+**ERNIE-Image is Apache 2.0** — commercial use, modification and redistribution, full
+stop. No revenue threshold, no seat count, no separate agreement. Both
+[baidu/ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) and
+[baidu/ERNIE-Image-Turbo](https://huggingface.co/baidu/ERNIE-Image-Turbo) declare
+`apache-2.0`, and the Comfy-Org repackage carries the same terms.
+
+This is the post's headline claim and it holds up. It is a real difference from
+[Ideogram 4](./ideogram-4-comfyui), whose weights are open but **non-commercial**.
+
+If you install the monolith `ernie` pack, note that its combo groups also load
+Z-Image-Turbo, which is separately Apache 2.0 — so the combined pipeline stays
+commercially usable.
+
 ## System & VRAM requirements
 
 The official non-quantized release targets a **24 GB** card. The pack sidesteps
@@ -109,11 +125,23 @@ with the same filenames as the third-party mirror.)
 
 If you grab the popular third-party installer, beware: **it's contaminated with
 Z-Image leftovers.** The upstream scripts are copy-pasted from a Z-Image pack —
-their headers literally say "Z-IMAGE-BASE" and they download Z-Image-only files
-(`z_image_turbo-*.gguf`, `Qwen3-4B-*.gguf`, `ae.safetensors`) that **ERNIE never
-uses**. Pull those by mistake and you waste disk and end up wiring the wrong VAE.
-**The comfyui-mcp `ernie` pack excludes them** — it installs only ERNIE's actual
-files (`ernie-image-turbo`, `ministral-3-3b`, `flux2-vae`, and the optional enhancer).
+their headers literally say "Z-IMAGE-BASE" and they download Z-Image files
+(`z_image_turbo-*.gguf`, `Qwen3-4B-*.gguf`, `ae.safetensors`) while wiring **none**
+of them. You pay the disk and can end up pointing at the wrong VAE.
+
+Which pack you want depends on whether you actually want the combos:
+
+| pack | pulls Z-Image models? | why |
+|---|---|---|
+| **`ernie-txt2img`** | **no** | pure ERNIE text-to-image — this is the "ERNIE-only" install |
+| **`ernie-img2img`** | **no** | pure ERNIE image-to-image |
+| `ernie` (monolith) | **yes**, deliberately | 10 of its 20 groups are ERNIE↔Z-Image combo pipelines, and they load those models |
+| `ernie-combo` | **yes**, deliberately | it *is* the combo pipeline |
+
+The difference from the third-party installer isn't the file list — it's that when a
+comfyui-mcp pack downloads `z_image_turbo-Q8_0.gguf`, a group in the graph loads it.
+Nothing lands unused. If you want ERNIE and nothing else, take `ernie-txt2img` rather
+than the monolith.
 
 ### The fast way — comfyui-mcp + the Panel
 
@@ -121,8 +149,8 @@ Untangling that installer by hand is exactly the busywork the
 [comfyui-mcp](https://github.com/artokun/comfyui-mcp) **`ernie` pack** removes. One
 declarative manifest installs the custom nodes (ComfyUI-GGUF, rgthree, KJNodes,
 essentials, RES4LYF, and friends) and pulls every model to the correct folder —
-ERNIE-only, no Z-Image cruft — and the same manifest drives both an MCP-native
-install and the generated double-click scripts:
+every file it downloads is one the graph loads — and the same manifest drives both an
+MCP-native install and the generated double-click scripts:
 
 ```bash
 # MCP-native (from a Claude Code session, with COMFYUI_PATH set)
@@ -231,8 +259,10 @@ A few notes that save grief:
   wired and steps ≥ 8 for Turbo.
 - **You wanted to EDIT a photo and it ignored you** → expected. ERNIE is txt2img;
   use Qwen-Image-Edit or Flux Kontext for grounded edits.
-- **Installer pulled Z-Image files too** → that's the contaminated upstream script;
-  use the `ernie` pack, which excludes them.
+- **Installer pulled Z-Image files the graph never loads** → that's the contaminated
+  upstream script. Use `ernie-txt2img` (or `ernie-img2img`) if you want ERNIE and
+  nothing else; the `ernie` monolith downloads Z-Image models on purpose, because its
+  combo groups load them.
 
 ## FAQ
 
@@ -267,8 +297,8 @@ designed for layout-sensitive, multilingual text rendering, not as an afterthoug
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
-2. Apply the **`ernie` pack** — nodes + ERNIE-only models land in the right folders, validated, with the Z-Image cruft stripped out.
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
+2. Apply the **`ernie` pack** — nodes + models land in the right folders, validated, and every file it downloads is one the graph loads. Want ERNIE and nothing else, without the combo pipelines? Use **`ernie-txt2img`**.
 3. Open the [Panel](../panel) and let the panel's agent write multilingual prompts and wire the graph for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one

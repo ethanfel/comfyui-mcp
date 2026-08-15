@@ -1,4 +1,6 @@
 import { parseComfyUIUrl } from "./comfyui-url.js";
+import { tr, processLocale } from "../i18n/index.js";
+import { padTo } from "../i18n/terminal-layout.js";
 
 export type TransportMode = "stdio" | "http";
 export type ToolMode = "full" | "compact";
@@ -179,6 +181,15 @@ export function parseCliArgs(
       } else {
         setupAgent = ""; // present but missing the agent → index.ts prints usage
       }
+    } else if (a === "--lang" || a.startsWith("--lang=")) {
+      // Recognised here ONLY so its value token cannot be mistaken for a positional. The
+      // value itself is read by processLocale() straight off argv, because the locale has to
+      // be known before this parser runs — `--help` is rendered in it, and so is the error
+      // this parser's own callers print. Skipping the case entirely (which is what happened
+      // when `--lang` was introduced) leaves a bare locale code loose in argv, in the same
+      // stream where `connect` and `setup` read their operands off the next token.
+      const [, ni] = valueOf(a, "--lang", i);
+      i = ni;
     } else if (a === "--dry-run") {
       setupDryRun = true;
     } else if (a === "--comfyui-url" || a.startsWith("--comfyui-url=")) {
@@ -257,11 +268,43 @@ export function validateConnectUrl(url: string): string | null {
     return null;
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    return (
-      `Invalid ComfyUI URL passed to \`connect\`: "${url}" (${reason}). ` +
-      `Pass a full http(s) URL, e.g. https://abcd-8188.proxy.runpod.net or http://127.0.0.1:8188.`
+    // Translated because this string IS the body of the fatal "cannot start" line the user
+    // reads in their terminal; translating the frame and leaving the reason English would
+    // produce a half-English sentence at the one moment the tool is refusing to run. The
+    // example URLs stay verbatim — they are things to copy, not things to read.
+    return tr(
+      "cli.connect_url_invalid",
+      'Invalid ComfyUI URL passed to `connect`: "{url}" ({reason}). ' +
+        "Pass a full http(s) URL, e.g. https://abcd-8188.proxy.runpod.net or http://127.0.0.1:8188.",
+      { url, reason },
     );
   }
+}
+
+/** Cell column where `--help` descriptions start, and where the trailing `env:` notes start. */
+const DESC_COL = 45;
+const ENV_COL = 65;
+
+/**
+ * One `--help` row: `left` is the flag/subcommand (never translated), `desc` the prose,
+ * `tail` an optional `env: …` note that keeps its own column.
+ *
+ * The gap used to be typed into the string literal, which is a layout that survives exactly
+ * as long as every description is English. This computes it from the DISPLAY WIDTH of
+ * whatever actually lands in the column, so a Korean description — two terminal cells per
+ * character — does not shove the `env:` notes off their column.
+ *
+ * The `3` minimum separator is not decoration: it is what keeps an entry whose description
+ * overruns its column readable, and it is what reproduces the previous hand-typed layout
+ * exactly (`--token` and `--tunnel` already sat three spaces from their `env:` note).
+ *
+ * Exported only so a test can hand it a Korean description. The whole screen renders English
+ * until a catalog exists, so nothing about the ASSEMBLED output can show whether the columns
+ * are computed in cells or in characters — the two agree for every string that exists today.
+ */
+export function helpRow(left: string, desc: string, tail?: string): string {
+  const body = tail ? padTo(desc, ENV_COL - DESC_COL, 3) + tail : desc;
+  return `  ${padTo(left, DESC_COL - 2)}${body}`.trimEnd();
 }
 
 /**
@@ -278,46 +321,98 @@ export function validateConnectUrl(url: string): string | null {
  * Deliberately carries NO tool COUNT. RFC #726 consolidates the surface to ~30
  * tools, so any number written here expires; the text describes the shapes
  * instead ("three meta-tools" is a property of the facade, not a census).
+ *
+ * TRANSLATED, PROSE ONLY. The left-hand column is flags and subcommands — what the user has
+ * to type, identical in every language — so only the descriptions go through `tr()`, and
+ * `helpRow` above owns the alignment that used to live in the string literals.
  */
 export function renderCliHelp(): string {
   const d = parseCliArgs([], {});
-  const def = (v: string | number | boolean) => `(default: ${String(v)})`;
+  // The whole parenthetical is one key, not the word "default" glued to a value. A lone
+  // adjective is the classic untranslatable unit — several of our languages inflect it by
+  // what follows — and the value itself is a machine token that must not be touched.
+  const def = (v: string | number | boolean) =>
+    tr("cli.help_default", "(default: {value})", { value: String(v) });
 
   return [
     "",
-    "comfyui-mcp — drive ComfyUI from an AI agent",
+    `comfyui-mcp — ${tr("cli.help_tagline", "drive ComfyUI from an AI agent")}`,
     "",
-    "USAGE",
-    "  comfyui-mcp [options]                      start the MCP server",
-    "  comfyui-mcp connect [<comfyui-url>]        run the panel orchestrator against a (possibly remote) ComfyUI",
-    "  comfyui-mcp setup <hermes|openclaw|copilot> [--compact|--full] [--comfyui-url <url>] [--dry-run]",
-    "                                             write the comfyui entry into that harness's config, then exit",
+    tr("cli.help_section_usage", "USAGE"),
+    helpRow("comfyui-mcp [options]", tr("cli.help_usage_server", "start the MCP server")),
+    helpRow(
+      "comfyui-mcp connect [<comfyui-url>]",
+      tr("cli.help_usage_connect", "run the panel orchestrator against a (possibly remote) ComfyUI"),
+    ),
+    helpRow("comfyui-mcp setup <hermes|openclaw|copilot> [--compact|--full] [--comfyui-url <url>] [--dry-run]", ""),
+    helpRow("", tr("cli.help_usage_setup", "write the comfyui entry into that harness's config, then exit")),
     "",
-    "TOOL SURFACE",
-    `  --compact                                  register only the three meta-tools ${def(d.toolMode === "compact")}`,
-    "                                             (list_tools / describe_tool / call_tool)",
-    "  --full                                     register the full direct tool surface",
-    "  --tool-mode <compact|full>                 same, as a value",
-    `                                             env: COMFYUI_MCP_TOOL_MODE      ${def(d.toolMode)}`,
+    tr("cli.help_section_tool_surface", "TOOL SURFACE"),
+    helpRow(
+      "--compact",
+      `${tr("cli.help_compact", "register only the three meta-tools")} ${def(d.toolMode === "compact")}`,
+    ),
+    // Not translated: three tool NAMES the user will type or read in a client.
+    helpRow("", "(list_tools / describe_tool / call_tool)"),
+    helpRow("--full", tr("cli.help_full", "register the full direct tool surface")),
+    helpRow("--tool-mode <compact|full>", tr("cli.help_same_as_value", "same, as a value")),
+    helpRow("", `env: COMFYUI_MCP_TOOL_MODE      ${def(d.toolMode)}`),
     "",
-    "TRANSPORT",
-    `  --stdio                                    stdio transport ${def(d.transport === "stdio")}`,
-    "  --http                                     streamable-HTTP transport",
-    "  --transport <stdio|http>                   same, as a value    env: MCP_TRANSPORT",
-    `  --host <host>                              HTTP bind host      env: MCP_HOST   ${def(d.host)}`,
-    `  --port <port>                              HTTP bind port      env: MCP_PORT   ${def(d.port)}`,
-    "  --token <token>                            require this shared secret on /mcp   env: COMFYUI_MCP_HTTP_TOKEN",
-    "  --tunnel                                   open a cloudflared quick tunnel (implies --http)   env: MCP_TUNNEL",
-    "  --allow-unauthenticated-non-loopback       allow an OPEN /mcp on a non-loopback host",
+    tr("cli.help_section_transport", "TRANSPORT"),
+    helpRow(
+      "--stdio",
+      `${tr("cli.help_stdio", "stdio transport")} ${def(d.transport === "stdio")}`,
+    ),
+    helpRow("--http", tr("cli.help_http", "streamable-HTTP transport")),
+    helpRow("--transport <stdio|http>", tr("cli.help_same_as_value", "same, as a value"), "env: MCP_TRANSPORT"),
+    helpRow("--host <host>", tr("cli.help_host", "HTTP bind host"), `env: MCP_HOST   ${def(d.host)}`),
+    helpRow("--port <port>", tr("cli.help_port", "HTTP bind port"), `env: MCP_PORT   ${def(d.port)}`),
+    helpRow(
+      "--token <token>",
+      tr("cli.help_token", "require this shared secret on /mcp"),
+      "env: COMFYUI_MCP_HTTP_TOKEN",
+    ),
+    helpRow(
+      "--tunnel",
+      tr("cli.help_tunnel", "open a cloudflared quick tunnel (implies --http)"),
+      "env: MCP_TUNNEL",
+    ),
+    helpRow(
+      "--allow-unauthenticated-non-loopback",
+      tr("cli.help_allow_unauth", "allow an OPEN /mcp on a non-loopback host"),
+    ),
     "",
-    "PANEL / COMFYUI",
-    "  --panel-orchestrator                       run the background orchestrator that drives the panel",
-    "  --comfyui-url <url>                        target a specific (incl. remote) ComfyUI   env: COMFYUI_URL",
-    "  --insecure-bridge                          allow an unauthenticated panel bridge",
+    tr("cli.help_section_panel", "PANEL / COMFYUI"),
+    helpRow(
+      "--panel-orchestrator",
+      tr("cli.help_panel_orchestrator", "run the background orchestrator that drives the panel"),
+    ),
+    helpRow(
+      "--comfyui-url <url>",
+      tr("cli.help_comfyui_url", "target a specific (incl. remote) ComfyUI"),
+      "env: COMFYUI_URL",
+    ),
+    helpRow("--insecure-bridge", tr("cli.help_insecure_bridge", "allow an unauthenticated panel bridge")),
     "",
-    "  -h, --help                                 show this and exit",
+    // `--lang` is parsed straight out of argv by processLocale(), not by parseCliArgs, so it
+    // is the one flag that would otherwise be undiscoverable from the tool it controls.
+    //
+    // ACTIVE, not "default", and that word is load-bearing. Every other value on this screen
+    // comes from `parseCliArgs([], {})` — a built-in default, deliberately blind to the
+    // environment. The language is the opposite: it is resolved FROM the environment through
+    // four variables and a fallback chain, so the only answer worth printing is the one the
+    // user is actually getting. Calling that a "default" would be false the moment they pass
+    // the flag this very row documents.
+    helpRow(
+      "--lang <code>",
+      tr("cli.help_lang", "language for this CLI's own output"),
+      `env: COMFYUI_MCP_LANG   ${tr("cli.help_active", "(active: {locale})", { locale: processLocale() })}`,
+    ),
+    helpRow("-h, --help", tr("cli.help_help", "show this and exit")),
     "",
-    "Full reference: https://github.com/artokun/comfyui-mcp#readme",
+    tr("cli.help_full_reference", "Full reference: {url}", {
+      url: "https://github.com/artokun/comfyui-mcp#readme",
+    }),
     "",
   ].join("\n");
 }

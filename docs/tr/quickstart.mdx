@@ -1,0 +1,66 @@
+---
+title: "Hızlı başlangıç"
+description: "Claude Code'a ComfyUI MCP ekleyin ve ilk görselinizi üretin."
+icon: "rocket"
+---
+
+<Steps>
+  <Step title="Çalışan bir ComfyUI örneğiniz olsun">
+    [ComfyUI Desktop](https://www.comfy.org/download) kurun ya da
+    [kaynaktan çalıştırın](https://github.com/comfyanonymous/ComfyUI), sonra başlatın. ComfyUI MCP,
+    yerel bir kurulumu ve portunu (8188 / 8000) otomatik olarak algılar. Uzak bir örneği
+    hedeflemek için [Yapılandırma](/docs/configuration) sayfasına bakın.
+  </Step>
+
+  <Step title="MCP sunucusunu Claude Code'a ekleyin">
+    Claude Code yapılandırmanıza (`~/.claude/settings.json`) ekleyin. `npx`, yayımlanan en son
+    paketi otomatik olarak getirir.
+
+    ```json ~/.claude/settings.json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "CIVITAI_API_TOKEN": ""
+          }
+        }
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="Yeniden bağlanın">
+    `comfyui` sunucusuna bağlanmak için Claude Code'da `/mcp` çalıştırın (ya da Claude Code'u
+    yeniden başlatın). ComfyUI MCP araçlarının kullanılabilir hale geldiğini görmelisiniz.
+  </Step>
+
+  <Step title="Bir şeyler üretin">
+    Asistanınızdan doğal dille isteyin:
+
+    > Sisli bir ormanda suluboya bir tilki görseli üret.
+
+    Perde arkasında bu, [`generate_image`](/docs/tools/image-generation) çağrısını yapar; bir
+    txt2img iş akışı kurar, bir checkpoint'i otomatik seçer, kuyruğa alır ve bir `prompt_id`
+    döndürür. Tamamlanan görsel, tamamlanma bildirimiyle gelir —
+    [`get_image (action:"view")`](/docs/tools/assets-images) ile görüntüleyin.
+  </Step>
+</Steps>
+
+## Sonraki adımlar
+
+<CardGroup cols={2}>
+  <Card title="Kurulum ayrıntıları" icon="download" href="/docs/tr/installation">
+    Yerel ve uzak kurulumlar ile geliştirme için `npm link`.
+  </Card>
+  <Card title="Yapılandırma" icon="gear" href="/docs/configuration">
+    Tüm ortam değişkenleri ve HTTP aktarımı.
+  </Card>
+  <Card title="Nasıl çalışır" icon="diagram-project" href="/docs/concepts">
+    Araçların ardındaki model — ve hangilerinin yerel kurulum gerektirdiği.
+  </Card>
+  <Card title="Araçlara göz atın" icon="wrench" href="/docs/tools/image-generation">
+    Şemadan üretilen eksiksiz referans.
+  </Card>
+</CardGroup>

@@ -25,6 +25,7 @@ import {
 } from "../../services/job-watcher.js";
 import { AssetRegistry } from "../../services/asset-registry.js";
 import type { WorkflowJSON } from "../../comfyui/types.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 const PROMPT_ID = "prompt-complete";
 const START = 1_705_505_423_000;
@@ -261,7 +262,7 @@ async function runWatchedCompletion(
   getHistoryMock.mockResolvedValue({ [promptId]: entry });
   JobWatcher.watch(promptId, sampleWorkflow());
   try {
-    await vi.waitFor(
+    await waitFor(
       () => {
         expect(JobWatcher.listActive()).not.toContain(promptId);
       },

@@ -9,7 +9,7 @@
  *
  * It is NOT the whole ToolSchema: `title`, `icons`, `outputSchema`, `execution` and
  * `_meta` are dropped, so a change to any of those is invisible here. Nor does it
- * see anything behind the CONFIGURED server — createConfiguredServer() (src/index.ts)
+ * see anything behind the CONFIGURED server — createConfiguredServer() (src/boot.ts)
  * chooses full versus compact registration, and this calls registerAllTools()
  * directly. Stated explicitly because "what a client sees" invites the reading that
  * anything a client could notice is covered, and it is not.

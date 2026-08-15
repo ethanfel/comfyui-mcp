@@ -52,9 +52,10 @@ ComfyUI MCP ships on npm as `comfyui-mcp` and runs via `npx` — no global insta
     ```
 
     <Note>
-      Local-only tools (installing ComfyUI/custom nodes, removing model files, reading logs)
-      need a local install path and will return a clear error in remote mode. See
-      [How it works](./concepts).
+      Most tools work fine against a remote ComfyUI — installing custom nodes included, via
+      the ComfyUI-Manager HTTP API. What genuinely needs a local install path is installing
+      ComfyUI itself, comfy-cli-backed operations, reading logs, and removing model files;
+      those return a clear error in remote mode. See [How it works](./concepts).
     </Note>
   </Tab>
   <Tab title="Comfy Cloud">
@@ -79,9 +80,11 @@ ComfyUI MCP ships on npm as `comfyui-mcp` and runs via `npx` — no global insta
 
     <Note>
       Cloud mode skips local `COMFYUI_PATH` auto-detection and uses the cloud's own model
-      library — `list_local_models`, `apply_manifest`, and other local-only tools throw
-      `CLOUD_UNSUPPORTED`. See the [Configuration](./configuration#deployment-modes) page
-      for the full feature-parity matrix.
+      library. Tools that reach for a local process or the filesystem throw
+      `CLOUD_UNSUPPORTED`; others degrade instead of throwing — `list_local_models` returns
+      an empty list, and `apply_manifest` reports per-item `skipped`/`failed` rather than
+      erroring outright. See the [Configuration](./configuration#deployment-modes) page for
+      the full feature-parity matrix.
     </Note>
     <Note>
       **Cloud-only?** [Comfy-Org's Comfy Cloud MCP](https://docs.comfy.org/agent-tools) (public beta) is the canonical choice — see [Local vs. Comfy Cloud](./local-vs-comfy-cloud). Use `comfyui-mcp`'s cloud-mode if you want a single MCP across local / remote / cloud, or you need cloud support today.
@@ -91,7 +94,34 @@ ComfyUI MCP ships on npm as `comfyui-mcp` and runs via `npx` — no global insta
 
 Then run `/mcp` in Claude Code to connect.
 
-## 3. (Optional) Tokens
+## 3. Starting the panel orchestrator
+
+Only needed for the **sidebar panel**. Skip this if you are driving ComfyUI from Claude
+Code or another MCP client — that path uses the MCP server configured above.
+
+The panel is a pure-frontend ComfyUI extension: it cannot start a process on your machine,
+so **you start the orchestrator yourself** and the panel connects to it.
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+That is sugar for `--panel-orchestrator`. It auto-targets the ComfyUI your browser is on,
+serves the bridge on `ws://127.0.0.1:9180` (override with `COMFYUI_MCP_BRIDGE_PORT`), and
+must keep running while you use the panel. Then open the **Agent** tab, pick a provider,
+and click **Connect**.
+
+Driving a **remote** ComfyUI — a cloud pod or another box on your LAN? Run the same command
+on **your own machine**, not the remote one, and pass the URL:
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+Your provider login and the agent stay local; nothing is installed on the remote host. See
+[Cloud deployment](./cloud-deployment) for the tunnel details.
+
+## 4. (Optional) Tokens
 
 Some tools use API tokens. Set them in the server's `env` block (see [Configuration](./configuration)):
 

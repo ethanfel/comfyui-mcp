@@ -1,6 +1,6 @@
 ---
 title: "Bring any LLM: free local models now drive ComfyUI"
-description: "The ComfyUI agent panel now runs on Ollama, LM Studio, llama.cpp, or any OpenAI-compatible endpoint — no account, no API key, fully offline. How a 6-tool compact router makes ~200 tool schemas survivable for a 4B model, the reliability work small models actually needed (loop-breakers, empty-final recovery, never-silent turns), and the VRAM pause that lets one GPU run both the diffusion model and the LLM driving it."
+description: "The ComfyUI agent panel now runs on Ollama, LM Studio, llama.cpp, or any OpenAI-compatible endpoint — no account, no API key, fully offline. How a 6-tool compact router makes the full tool catalog survivable for a 4B model, the reliability work small models actually needed (loop-breakers, empty-final recovery, never-silent turns), and the VRAM pause that lets one GPU run both the diffusion model and the LLM driving it."
 keywords:
   - ComfyUI local LLM
   - ComfyUI Ollama agent
@@ -37,17 +37,18 @@ This post is about what it actually took. Frontier models come with an agent
 harness that does the hard parts. A local model is a bare HTTP daemon that
 streams tokens — everything else, we had to build.
 
-## The problem: ~200 tool schemas vs. a 4B model
+## The problem: a full tool catalog vs. a 4B model
 
-The headless `comfyui` MCP server exposes roughly **200 tools** — queue,
-models, custom nodes, workflows, generation, the lot — and the panel adds
-around **40 `panel_*` live-canvas tools** on top. A frontier model swallows
-that catalog without blinking. A 4B model drowns in it: the schemas alone eat
-the context window, and tool selection accuracy collapses long before the
-model gets to *your* request.
+The headless `comfyui` MCP server exposes **37 tools** — queue, models, custom
+nodes, workflows, generation, the lot — and the panel adds **92**
+`panel_*` live-canvas tools on top. Those are consolidated tools, so each one
+carries a wide `action` surface and a correspondingly large schema. A frontier
+model swallows the catalog without blinking. A 4B model drowns in it: the schemas
+alone eat the context window, and tool-selection accuracy collapses long before
+the model gets to *your* request.
 
 The fix is the **compact tool router**. Run the MCP server with
-`COMFYUI_MCP_TOOL_MODE=compact` (or `--compact`) and the ~200-tool surface
+`COMFYUI_MCP_TOOL_MODE=compact` (or `--compact`) and the whole catalog
 collapses into **three meta-tools**:
 
 - `list_tools` — search the catalog by keyword

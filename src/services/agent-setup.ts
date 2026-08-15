@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseDocument, Document } from "yaml";
+import { tr } from "../i18n/index.js";
 
 /**
  * First-class setup for non-Claude MCP harnesses (issue #97):
@@ -122,27 +123,51 @@ function mergeJson(existing: string, entry: Record<string, unknown>, file: strin
   return `${JSON.stringify(root, null, 2)}\n`;
 }
 
+/**
+ * Post-install instructions, printed to the terminal by `comfyui-mcp setup <agent>`.
+ *
+ * Translated (unlike almost everything else this package emits) because a person reads these
+ * and then does them by hand — see the scope note in src/i18n/index.ts. What stays verbatim
+ * in every language is everything the user has to TYPE or will SEE spelled that way in
+ * another program: the `/reload-mcp` and `/mcp show` slash commands, the `mcp_comfyui_*`
+ * tool names, the `--full` / `--compact` flags, and the model names.
+ */
 function nextSteps(agent: AgentName, compact: boolean): string[] {
   const compactNote = compact
-    ? "Compact tool mode is ON: the model gets list_tools/describe_tool/call_tool instead of ~200 schemas (rerun with --full for the complete surface)."
-    : "Full tool mode: ~200 tool schemas — right for frontier models (rerun with --compact for small/local models).";
+    ? tr(
+        "cli.setup_note_compact",
+        "Compact tool mode is ON: the model gets list_tools/describe_tool/call_tool instead of ~200 schemas (rerun with --full for the complete surface).",
+      )
+    : tr(
+        "cli.setup_note_full",
+        "Full tool mode: ~200 tool schemas — right for frontier models (rerun with --compact for small/local models).",
+      );
+  // One key, three call sites: both local-model harnesses print the same sentence, and a
+  // translator seeing it twice would be asked the same question twice.
+  const localModelsNote = tr(
+    "cli.setup_note_local_models",
+    "Local models: gemma4 (e4b or larger), qwen3, llama3.1+ have native tool calling; gemma3 does not.",
+  );
   switch (agent) {
     case "hermes":
       return [
-        "In a running Hermes session type /reload-mcp (or restart Hermes).",
-        "Tools appear as mcp_comfyui_list_tools / _describe_tool / _call_tool.",
-        "Local models: gemma4 (e4b or larger), qwen3, llama3.1+ have native tool calling; gemma3 does not.",
+        tr("cli.setup_hermes_reload", "In a running Hermes session type /reload-mcp (or restart Hermes)."),
+        tr(
+          "cli.setup_hermes_tool_names",
+          "Tools appear as mcp_comfyui_list_tools / _describe_tool / _call_tool.",
+        ),
+        localModelsNote,
         compactNote,
       ];
     case "openclaw":
       return [
-        "Restart the OpenClaw gateway to pick up the new server.",
-        "Local models: gemma4 (e4b or larger), qwen3, llama3.1+ have native tool calling; gemma3 does not.",
+        tr("cli.setup_openclaw_restart", "Restart the OpenClaw gateway to pick up the new server."),
+        localModelsNote,
         compactNote,
       ];
     case "copilot":
       return [
-        "Run `copilot` and check the server with /mcp show.",
+        tr("cli.setup_copilot_check", "Run `copilot` and check the server with /mcp show."),
         compactNote,
       ];
   }

@@ -1,5 +1,5 @@
 ---
-title: "How to Run Ideogram 4 Locally in ComfyUI (2026 Guide)"
+title: "How to Run Ideogram 4 Locally in ComfyUI"
 description: "Run Ideogram 4 — the 9.3B open-weight text-to-image model — locally in ComfyUI. Install, VRAM tips, JSON area prompting, and flawless readable text."
 keywords:
   - Ideogram 4 ComfyUI
@@ -82,6 +82,21 @@ Where rivals win: photoreal portraits (Ideogram trails), raw speed and low VRAM
 (Z-Image), permissive licensing (ERNIE, Z-Image), and editability — Ideogram's
 output is flat pixels, not layers. Each of those models gets its own post in this
 series; Ideogram 4 earns the spotlight for **information-carrying images**.
+
+## Licensing
+
+**Ideogram 4 is open-weight but NOT open-source, and commercial use is not permitted
+without a separate license.** The model card declares
+`ideogram-non-commercial-model-agreement` — read that name literally.
+
+You can download the weights, run them locally, and experiment freely. You cannot
+ship the output in a commercial product, sell generations, or host it behind a paid
+service on these terms. Ideogram sells commercial licensing separately.
+
+This is the sharpest licensing difference in the model-highlight series. If your work
+is commercial and you want comparable text and layout quality, look at
+[ERNIE-Image](./ernie-image-comfyui) (Apache 2.0) or
+[Z-Image](./z-image-comfyui) (Apache 2.0) instead — both permit it outright.
 
 ## System & VRAM requirements
 
@@ -248,7 +263,7 @@ model's core design goal, not an afterthought.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`ideogram` pack** — nodes + ~50 GB of models land in the right folders, validated.
 3. Open the [Panel](../panel) and let the panel's agent build area-prompts and wire the graph for you.
 

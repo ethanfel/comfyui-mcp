@@ -78,3 +78,4 @@ orch.err.log
 
 # Local Discord watchdog/notifier toolkit (token read from ~/.claude.json at runtime; not committed)
 /.discord/
+codex-kp-smoke-orch.log

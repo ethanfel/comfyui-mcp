@@ -1,5 +1,5 @@
 ---
-title: "Train a FLUX LoRA in the Cloud on RunPod (2026 Guide)"
+title: "Train a FLUX LoRA in the Cloud on RunPod"
 description: "Train a FLUX.1-dev character LoRA on a RunPod cloud GPU — no 24GB card required. Upload your dataset by SSH and get a ComfyUI-ready .safetensors file."
 keywords:
   - train LoRA cloud GPU
@@ -111,9 +111,13 @@ If you already know the P1 flow, you already know this one.
 The mechanics of getting bits to and from the pod:
 
 - **Dataset up.** The SSH transport resolves the pod's SSH endpoint — RunPod
-  exposes container port 22 as a public `ip:port` — and **rsyncs your staged
-  dataset up** to the training root. rsync means a re-send only moves what
-  changed.
+  exposes container port 22 as a public `ip:port` — and **uploads your staged
+  dataset** to the training root as `tar -czf - | ssh … tar -xzf -`. No rsync
+  binary is needed on either side, which is the point: Windows rigs have `tar`
+  and `ssh` but usually no `rsync`. It borrows rsync's *semantics* — the remote
+  directory is removed and recreated so a re-staged dataset can't inherit files
+  you deleted locally — but not its **delta transfer**. Every send is the whole
+  dataset, so stage what you need and expect a re-send to cost full upload time.
 - **Training runs over SSH**, streaming the same step/loss ticks P1 parses, so
   the progress you watch is real training progress (a step count is only trusted
   when it arrives with a loss reading — dataset-scan progress bars never do).
@@ -133,7 +137,7 @@ The honest notes, because rented GPUs come with real trade-offs:
   owner process is **provably dead**. A run keyed on its final save, not on
   intermediate checkpoints — checkpoints prove a run *reached* a step, not that
   it *finished*.
-- **Your dataset leaves your machine.** It goes up to the pod over rsync/ssh.
+- **Your dataset leaves your machine.** It goes up to the pod over ssh.
   That's inherent to renting someone else's GPU; if that's a dealbreaker for a
   given dataset, [train it locally](./lora-trainer-p1) instead.
 
@@ -146,7 +150,7 @@ The honest notes, because rented GPUs come with real trade-offs:
    (FLUX.1-dev is gated; the pod downloads it on the first run).
 3. Ask: *"train a character LoRA from these photos on a RunPod pod."* The agent
    runs `train_doctor` against the pod, bootstraps ai-toolkit if needed, walks
-   you through dataset and trigger-word choices, rsyncs the dataset up, launches
+   you through dataset and trigger-word choices, uploads the dataset, launches
    the run, and streams progress until your `.safetensors` is sitting in
    `models/loras/`.
 

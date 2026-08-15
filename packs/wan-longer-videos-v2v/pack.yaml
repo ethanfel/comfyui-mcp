@@ -8,8 +8,8 @@ description: >-
   generated segments. Uses GGUF quantized A14B I2V (High/Low Noise) UNets +
   umt5-xxl text encoder and Lightning 4-step LoRAs for fast sampling.
   Single-purpose graph sliced from the wan-longer-videos monolith (one pipeline,
-  no group toggles). Q8_0 quant by default (see notes for lower-VRAM tiers).
-vram: "24GB+ (Q8_0); 12-24GB with Q5_K_S, <12GB with Q4_K_S"
+  no group toggles). Q4_K_S quant by default (see notes for higher-quality tiers).
+vram: "<12GB (Q4_K_S); 12-24GB with Q5_K_S, 24GB+ with Q8_0"
 workflow: workflow.json
 skill: wan-t2v-video
 # WAN 2.2 A14B GGUF video generation is VRAM-hungry; reserving VRAM avoids OOM
@@ -26,9 +26,11 @@ notes:
     custom_nodes/ and models/).
   - Sliced + un-bypassed from the monolith's "WAN 2.2 LONGER VIDEO BASE TO VIDEO".
   - Load a source video via the VHS_LoadVideo node before queueing.
-  - GGUF VRAM tiers — for less VRAM, replace the unet/Wan2.2-*-Q8_0.gguf models
-    with the -Q5_K_S (12-24GB) or -Q4_K_S (<12GB) variants from the same
-    Aitrepreneur/FLX repo and re-point the UnetLoaderGGUF nodes in workflow.json.
+  - GGUF VRAM tiers — this pack installs the -Q4_K_S variants (8.2GB per UNet,
+    the <12GB tier). For more headroom/quality, replace the
+    unet/Wan2.2-*-Q4_K_S.gguf models with the -Q5_K_S (12-24GB) or -Q8_0 (24GB+)
+    variants from the same Aitrepreneur/FLX repo and re-point the
+    UnetLoaderGGUF nodes in workflow.json.
   - "Torch not compiled with CUDA fix: if generation errors with \"Torch not
     compiled with CUDA enabled\", a CPU-only torch was installed. Reinstall the
     CUDA build into the ComfyUI python (portable build):

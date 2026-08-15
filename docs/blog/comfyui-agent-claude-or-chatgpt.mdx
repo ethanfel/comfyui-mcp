@@ -40,18 +40,22 @@ Claude path.
 ## One picker, no keys
 
 Sign in once for the provider you want — `claude` (or `claude setup-token`) for
-Claude, `codex login` for ChatGPT — open the **Agent** tab, pick a provider, and
-click **Connect**. The panel starts that provider's background orchestrator
-(`npx -y comfyui-mcp@latest connect`) on your subscription and links to its
-loopback bridge. Nothing is ever started without your click; **Disconnect** stops
-it.
+Claude, `codex login` for ChatGPT — then start the orchestrator yourself with
+`npx -y comfyui-mcp@latest connect` and leave it running. In ComfyUI, open the
+**Agent** tab, pick a provider, and click **Connect**. The panel is a pure frontend
+extension: it attaches to the orchestrator's loopback bridge, it never spawns a
+process. **Disconnect** detaches.
 
-Each backend runs its **own** orchestrator on its **own** loopback bridge port
-(Claude defaults to `ws://127.0.0.1:9180`), which is why the panel can present a
-provider chooser instead of asking you to think about ports. Switching providers
-starts a fresh chat — conversations aren't shared across Claude and ChatGPT — and
-the panel posts a system note so you're never surprised. The bridge is
-loopback-only; nothing is reachable from your LAN.
+**One orchestrator serves every provider**, on one loopback bridge port —
+`ws://127.0.0.1:9180` by default, overridable with `COMFYUI_MCP_BRIDGE_PORT`. There
+is no port per backend. The panel picks the provider **per tab**, over the
+`hello`/`set_backend` handshake on that single connection, which is why it can offer
+a provider chooser instead of asking you to think about ports — and why you can have
+Claude in one ComfyUI tab and ChatGPT in another against the same running process.
+
+Switching providers starts a fresh chat — conversations aren't shared across Claude
+and ChatGPT — and the panel posts a system note so you're never surprised. The bridge
+is loopback-only; nothing is reachable from your LAN.
 
 ## How full parity actually works
 

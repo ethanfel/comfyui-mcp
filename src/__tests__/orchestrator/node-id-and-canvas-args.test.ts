@@ -89,17 +89,37 @@ describe("#845(4): an id the tools printed is accepted back", () => {
     expect(sent[0].node_id).toBe(42);
   });
 
-  // A subgraph-qualified id is a REAL shape in newer ComfyUI. Coercing "5:12" to
-  // 5 would target the WRONG node — worse than refusing. Supporting it is a
-  // deliberate wire-contract change, not something to fall out of a parse.
-  it("refuses a subgraph-qualified id rather than truncating it", async () => {
+  // A subgraph-qualified id is a REAL shape in newer ComfyUI. #845 REFUSED it,
+  // because coercing "5:12" to 5 would target the WRONG node and refusing was the
+  // safe half of that trade. #1425 is the deliberate wire-contract change #845 said
+  // this would take: unpacking a subgraph leaves genuine ROOT nodes with these ids,
+  // the readers hand them out, and refusing left 18 of 21 nodes uneditable.
+  //
+  // The half that must NOT change is the one this test was really protecting: it is
+  // still never allowed to become 5.
+  it("accepts a subgraph-qualified id and forwards it VERBATIM", async () => {
     const res = await callTool("panel_select_nodes", { node_ids: ["5:12"] });
-    expect(res.isError).toBe(true);
-    expect(sent).toHaveLength(0);
+    expect(res.isError).toBeFalsy();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].node_ids).toEqual(["5:12"]);
+    // The trap #845 named, asserted directly rather than implied.
+    expect(sent[0].node_ids).not.toContain(5);
+  });
+
+  it("accepts a DEEP qualified id — nesting has no depth limit", async () => {
+    const res = await callTool("panel_select_nodes", { node_ids: ["120:113:78"] });
+    expect(res.isError).toBeFalsy();
+    expect(sent[0].node_ids).toEqual(["120:113:78"]);
+  });
+
+  it("still normalizes plain ids alongside qualified ones in the same call", async () => {
+    const res = await callTool("panel_select_nodes", { node_ids: ["4", "263:78", 7] });
+    expect(res.isError).toBeFalsy();
+    expect(sent[0].node_ids).toEqual([4, "263:78", 7]);
   });
 
   it("refuses other non-integer strings", async () => {
-    for (const bad of ["42px", "4.5", "", "abc"]) {
+    for (const bad of ["42px", "4.5", "", "abc", "1:", ":1", "1::2", "1:-2"]) {
       sent = [];
       const res = await callTool("panel_select_nodes", { node_ids: [bad] });
       expect(res.isError, bad).toBe(true);

@@ -49,3 +49,25 @@ const isolatedHome = mkdtempSync(join(tmpdir(), "comfyui-mcp-test-home-"));
 // `setupFiles` ordering guarantees.
 process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;
+
+// The suite's LANGUAGE, isolated for the same reason and by the same means.
+//
+// `processLocale()` reads `--lang`, then COMFYUI_MCP_LANG, then the POSIX chain
+// (LC_ALL / LC_MESSAGES / LANG). That was inert while no catalog existed: every
+// string rendered its English fallback whatever the machine said. The moment
+// locales/ shipped it became a hidden input to hundreds of assertions — a
+// developer with LANG=ja_JP.UTF-8 gets four failures in files that have nothing
+// to do with i18n (the ready banner's model label, the console landing page,
+// the 401 fragment), and CI stays green only because runners are en/C. That is
+// the worst shape of test dependency: invisible to the people it passes for.
+//
+// Pinned to English rather than cleared, because CLEARING is not enough on
+// Windows — os/ICU still answer, and an empty POSIX chain simply falls through
+// to the "en" default by a different route on each platform. A test that wants
+// another language sets it explicitly (see cli.test.ts's `pinLocale`) and calls
+// `__resetI18nForTest()`, which is the only way the memoised process locale is
+// re-read anyway.
+process.env.COMFYUI_MCP_LANG = "en";
+process.env.LC_ALL = "en_US.UTF-8";
+process.env.LC_MESSAGES = "en_US.UTF-8";
+process.env.LANG = "en_US.UTF-8";

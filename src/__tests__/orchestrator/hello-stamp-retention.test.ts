@@ -27,7 +27,7 @@
 
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { workflowIdentityParts } from "../../orchestrator/session-store.js";
+import { carryWorkflowCommandStamp, workflowIdentityParts } from "../../orchestrator/session-store.js";
 
 const indexSrc = (): string =>
   readFileSync(new URL("../../orchestrator/index.ts", import.meta.url), "utf8");
@@ -74,11 +74,20 @@ describe("an untrusted hello RETAINS the tab's command stamp (#689)", () => {
     });
   });
 
-  it("SOURCE: the migration path's own delete is untouched — only the untrusted-hello eraser goes", () => {
+  it("the migration path still RETIRES the previous tab id's stamp", () => {
     // #436's `delete(migratedFrom)` retires the PREVIOUS tab id's stamp on a
     // proven workflow change. That is a different decision (a tab id going away)
     // and must survive this fix; deleting it here would be an unrelated
     // behavioural change smuggled in on the same line of reasoning.
-    expect(indexSrc()).toContain("tabCommandWorkflowUuid.delete(migratedFrom);");
+    //
+    // This used to assert the literal `delete(migratedFrom)` appeared in index.ts.
+    // #1331 moved that statement into `carryWorkflowCommandStamp` — which now also
+    // carries the VALUE onto the new id first, the half that had been lost since #884.
+    // The retirement is unchanged, so the claim is unchanged; it is asserted on the
+    // BEHAVIOUR now, which is what it was always about and which a relocation cannot
+    // silently break.
+    const stamps = new Map([["tmp:old", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]]);
+    carryWorkflowCommandStamp(stamps, "tmp:old", "wf:new");
+    expect(stamps.has("tmp:old"), "the retired id must not resolve").toBe(false);
   });
 });

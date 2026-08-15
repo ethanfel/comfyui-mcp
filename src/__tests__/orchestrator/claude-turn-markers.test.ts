@@ -19,6 +19,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent } from "../../orchestrator/agent-backend.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 // Keep the durable turn registry (#886) hermetic per test file — the backend
 // writes it on every submission, and the fixed INIT session id would otherwise
@@ -145,10 +146,10 @@ describe("Claude backend turn markers (#728 r4)", () => {
     }
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     await backend.interrupt(); // A interrupted mid-flight; no result arrives
     releaseTurnB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
 
     // B's valid stream event WHILE A's result is still missing.
     hoisted.queue.push(assistantMsg("B working"));
@@ -188,11 +189,11 @@ describe("Claude backend turn markers (#728 r4)", () => {
     }
     const { events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.push(assistantMsg("reply A"));
     hoisted.queue.push(RESULT_SUCCESS);
     releaseTurnB(); // the result opens the panel's gate → B is submitted
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.push(assistantMsg("reply B"));
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
@@ -223,16 +224,16 @@ describe("Claude backend turn markers (#728 r4)", () => {
     }
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     await backend.interrupt(); // A interrupted mid-flight; its result NEVER comes
     releaseTurnB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
 
     // B's result-only terminal (EMPTY turn) arrives FIRST — classified by B's
     // OWN flags (ok:false + the synthetic empty-turn error, NOT A's interrupt
     // blessing) and stamped with B's marker, so the panel completes B's gate.
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: false, turn: 2 });
     const errors = errorsOf(events);
     expect(errors).toHaveLength(1);
@@ -275,29 +276,29 @@ describe("Claude backend turn markers (#728 r4)", () => {
     }
     const { backend, events, done } = await startBackend(threeTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
 
     // A is interrupted (its result will never come); B's success terminal
     // parks A and classifies/stamps B (the permanent-loss path).
     await backend.interrupt();
     releaseB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.push(RESULT_SUCCESS); // B's terminal → skip/park A
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ turn: 2 });
 
     // C is interrupted; C's interrupted terminal must pop/stamp C's OWN trace —
     // NOT the parked A.
     releaseC();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(3));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(3));
     await backend.interrupt(); // marks the newest unresolved trace — C
     hoisted.queue.push(RESULT_INTERRUPTED); // C's landing
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(2));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(2));
     expect(resultsOf(events)[1]).toMatchObject({ ok: true, turn: 3 });
 
     // A's OWN late landing still pops its parked trace — exactly once.
     hoisted.queue.push(RESULT_INTERRUPTED); // A's landing
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(3));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(3));
     expect(resultsOf(events)[2]).toMatchObject({ ok: true, turn: 1 });
 
     // A SECOND landing with no unconsumed candidate is anomalous → fail closed
@@ -332,19 +333,19 @@ describe("Claude backend turn markers (#728 r4)", () => {
     }
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
 
     // A is interrupted; C's trace is then created while A is STILL unsettled,
     // and C is marked interrupted too (the SDK is still settling A).
     await backend.interrupt(); // marks A (newest at the time)
     releaseC();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     await backend.interrupt(); // marks C
 
     // A's legitimate interrupted result arrives FIRST (processing order) →
     // pops/stamps A, NOT C.
     hoisted.queue.push(RESULT_INTERRUPTED);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: true, turn: 1 });
 
     // C's own landing then pops C.
@@ -374,16 +375,16 @@ describe("Claude backend turn markers (#728 r4)", () => {
     }
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     await backend.interrupt(); // marks A; A's terminal will never arrive
     releaseB();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
 
     // B's GENUINE error lands first: A is written off (parked), B is popped —
     // classified by B's OWN flags (a genuine failure, NO blessing) and stamped
     // with B's marker, so the panel completes B's gate.
     hoisted.queue.push(RESULT_INTERRUPTED); // error_during_execution — B's genuine error
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: false, turn: 2 });
     expect(errorsOf(events)).toHaveLength(0); // a genuine error result carries no synthetic error
 

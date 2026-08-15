@@ -1,11 +1,18 @@
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { waitFor } from "../helpers/wait-for.js";
 
 const mockConfig = vi.hoisted(() => ({
   resolvedPort: 8188,
   comfyuiPath: "/fake/ComfyUI" as string | undefined,
 }));
+
+// #742: the two classifications the preflight now distinguishes. `remote` is
+// how the target is ADDRESSED; `onThisMachine` is where the instance actually
+// runs. They disagree for a local install reached by its own LAN address, and
+// that disagreement is the bug.
+const mockLocality = vi.hoisted(() => ({ remote: false, onThisMachine: true }));
 
 const mockExecSync = vi.hoisted(() => vi.fn());
 const mockSpawn = vi.hoisted(() => vi.fn());
@@ -18,7 +25,8 @@ vi.mock("../../config.js", () => ({
   getComfyUIAuthHeaders: () => ({}),
   // #848 instance fence — a stable target here; the retarget case has its own test.
   getComfyuiTargetGeneration: () => 0,
-  isRemoteMode: () => false,
+  isRemoteMode: () => mockLocality.remote,
+  targetIsOnThisMachine: () => mockLocality.onThisMachine,
 }));
 
 vi.mock("node:child_process", () => ({
@@ -175,6 +183,10 @@ beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
+  // #742: back to an ordinary loopback-addressed local target. Without this a
+  // test that flips these leaks its classification into every test after it.
+  mockLocality.remote = false;
+  mockLocality.onThisMachine = true;
   process.env = { ...ORIGINAL_ENV };
   delete process.env.COMFYUI_ALWAYS_RESTART;
   delete process.env.COMFYUI_RESTART_MAX_ATTEMPTS;
@@ -937,6 +949,96 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     killSpy.mockRestore();
   });
 
+  // ── #742 recurrence: the guard was UNREACHABLE, not missing ────────────────
+  //
+  // Reported on 0.51.18. A Pinokio ComfyUI on the same host, addressed as
+  // `http://192.168.x.x:5000`, classified as remote — so `preflightLocalRestart`
+  // returned ok:true from its first line and the refuse-safe check above never
+  // ran. The Manager reboot stopped the server and Pinokio did not relaunch it.
+  //
+  // The refusal that should have fired is the very test above this one; it was
+  // passing the whole time. So these assert REACHABILITY, and the sharpest
+  // observable is whether the assessment was entered at all: on the early-return
+  // path nothing is probed, so `getSystemStats` is never called.
+  describe("a LOCAL install addressed REMOTELY still gets assessed (#742)", () => {
+    it("remote + NOT this machine: passes without probing anything (unchanged)", async () => {
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = false;
+      mockPinokioShapedInstall(); // would REFUSE if it were ever assessed
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(true);
+      // The early return is correct for a genuinely remote target: there is no
+      // local process to look at, so nothing should be probed.
+      expect(mockGetSystemStats).not.toHaveBeenCalled();
+    });
+
+    it("remote + IS this machine: assesses, and REFUSES the Pinokio shape", async () => {
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = true;
+      mockPinokioShapedInstall();
+
+      const preflight = await preflightLocalRestart();
+
+      // Identical to the loopback-addressed case above — which is the point.
+      // How the instance is ADDRESSED must not decide whether we check that it
+      // can come back.
+      expect(preflight.ok).toBe(false);
+      expect(preflight.reason).toMatch(/could not build a relaunch command/i);
+      expect(mockGetSystemStats).toHaveBeenCalled();
+    });
+
+    it("a refusal reached this way NAMES the assumption and the escape hatch", async () => {
+      // An address on one of our interfaces proves the ROUTE lands here, not
+      // that the instance does: a reverse proxy or port-forward bound to this
+      // machine's LAN address can front a ComfyUI that is genuinely elsewhere.
+      // Such a setup used to restart through the Manager and now meets the
+      // guard, so the refusal has to say which assumption produced it — a
+      // silent behaviour change is the part that would actually cost time.
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = true;
+      mockPinokioShapedInstall();
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(false);
+      expect(preflight.reason).toMatch(/could not build a relaunch command/i);
+      expect(preflight.reason).toMatch(/own network interfaces/i);
+      expect(preflight.reason).toMatch(/COMFYUI_MCP_FORCE_REMOTE=1|--force-remote/);
+    });
+
+    it("a LOOPBACK-addressed refusal does NOT carry that note", async () => {
+      // The note explains a decision only this new path makes. On the ordinary
+      // local path it would be noise pointing at an irrelevant setting.
+      mockLocality.remote = false;
+      mockLocality.onThisMachine = true;
+      mockPinokioShapedInstall();
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(false);
+      expect(preflight.reason).not.toMatch(/own network interfaces/i);
+      expect(preflight.reason).not.toMatch(/FORCE_REMOTE/i);
+    });
+
+    it("remote + IS this machine + resolvable install: assesses and PASSES", async () => {
+      // The guard must not become a blanket refusal for everyone who addresses a
+      // local ComfyUI by LAN IP. A normal install still restarts.
+      mockLocality.remote = true;
+      mockLocality.onThisMachine = true;
+      mockLivePortNoKill();
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+      });
+
+      const preflight = await preflightLocalRestart();
+
+      expect(preflight.ok).toBe(true);
+      expect(mockGetSystemStats).toHaveBeenCalled();
+    });
+  });
+
   it("preflightLocalRestart passes a resolvable local install", async () => {
     mockLivePortNoKill();
     mockGetSystemStats.mockResolvedValue({
@@ -1039,7 +1141,7 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
 
     const pending = restartComfyUI();
-    await vi.waitFor(() => expect(children.length).toBe(1), {
+    await waitFor(() => expect(children.length).toBe(1), {
       timeout: 10000,
       interval: 20,
     });

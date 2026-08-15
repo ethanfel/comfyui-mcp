@@ -58,7 +58,7 @@ ships in the [mobile app](./mobile).
    (`RUNPOD_IDLE_STOP_MINUTES`, default 15; only counts while you're actually
    rendering on the pod) is the cost backstop if you forget.
 
-**Dead-man switch (v0.46+).** Idle auto-stop lives in the comfyui-mcp process —
+**Dead-man switch (v0.47+).** Idle auto-stop lives in the comfyui-mcp process —
 if that process dies (crash, closed laptop), the backstop used to die with it
 and the pod billed forever. Pods **created through the connector** now carry a
 pod-side watchdog: while comfyui-mcp minds the pod it heartbeats every few
@@ -102,10 +102,8 @@ uses the plain `ws://127.0.0.1:9180` loopback bridge. Either way the agent — a
 your Claude/ChatGPT login — runs only on **your** machine; nothing is installed on
 the pod.
 
-To finish, in the pod's ComfyUI open the **Agent Panel** sidebar and:
-
-1. Turn on **Settings → General → "Use external/local orchestrator (advanced)"**.
-2. Click **Connect**.
+To finish, with `connect` still running on your own machine, open the pod's ComfyUI in
+your browser, open the **Agent Panel** sidebar, and click **Connect**.
 
 Now drive the graph in natural language.
 

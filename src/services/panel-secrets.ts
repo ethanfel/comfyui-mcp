@@ -48,6 +48,7 @@ import {
   MANAGED_SECRET_KEYS_ENV,
 } from "../env-file.js";
 import { logger } from "../utils/logger.js";
+import { downloadsAtRiskOfRespawn } from "./download-jobs.js";
 import { runningUnderTestRunner } from "./test-isolation-guard.js";
 import { OPENAI_KEY_PROVIDERS, providerModelHint } from "./openai-provider-registry.js";
 
@@ -162,6 +163,8 @@ const emitter = new EventEmitter();
 // 7). Suspend for the duration, then emit ONCE for the state actually left.
 let emitSuspendDepth = 0;
 let suspendedComfyuiChange = false;
+/** What the last suspended operation's single emit cost. Read once, then cleared. */
+let lastSuspendedAtRisk: AtRiskDownloads = [];
 let suspendedAgentChange = false;
 
 /**
@@ -189,13 +192,52 @@ function emitGuarded(event: "change" | "agentChange", payload?: Partial<ComfyuiS
   }
 }
 
-function emitComfyuiChange(payload: Partial<ComfyuiSecretChange>): void {
+/** Downloads in flight at the moment a credential save is about to respawn the tool
+ *  session (#1378). Best-effort: a records store this process cannot read must never break
+ *  a credential save, and an unreadable store is reported as "none" rather than throwing. */
+function snapshotAtRiskDownloads(): AtRiskDownloads {
+  try {
+    return downloadsAtRiskOfRespawn();
+  } catch (err) {
+    logger.debug("[secrets] could not enumerate in-flight downloads for the respawn warning", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+/**
+ * Emit, and report what the emit COST (#1378).
+ *
+ * The snapshot lives here, at the one point where a respawn is actually triggered, rather
+ * than at each call site. Three defects came out of having it anywhere else:
+ *
+ *  - a call site that emits without snapshotting reports nothing at risk (the revoke path,
+ *    which had the emit and not the snapshot for a full release);
+ *  - a call site that snapshots without emitting warns about a loss that never happened —
+ *    a rollback under `withSuspendedEmissions` removes a key, emits nothing because
+ *    nothing changed, and still told the user their downloads would not resume;
+ *  - and the ordering, which must be snapshot-then-emit because the emit is synchronous
+ *    and a listener replaces its tool session inside it, was restated at every site and
+ *    therefore could be got wrong at any of them.
+ *
+ * Suspended: nothing is emitted, so nothing is at risk YET. The outer
+ * `withSuspendedEmissions` makes exactly one real emit at the end, and that one returns
+ * the snapshot for the whole operation.
+ */
+function emitComfyuiChange(payload: Partial<ComfyuiSecretChange>): AtRiskDownloads {
   if (emitSuspendDepth > 0) {
     suspendedComfyuiChange = true;
-    return;
+    return [];
   }
+  const atRisk = snapshotAtRiskDownloads();
   emitGuarded("change", payload);
+  return atRisk;
 }
+
+/** In-flight downloads a respawn is about to orphan. Empty is a finding; it is never
+ *  absent, so no caller has to tell "none" from "not reported". */
+export type AtRiskDownloads = { id: string; filename: string; bytes: number }[];
 
 function emitAgentChange(): void {
   if (emitSuspendDepth > 0) {
@@ -237,7 +279,11 @@ function withSuspendedEmissions<T>(
     // already guarded; `decide` is guarded here for the same reason.
     try {
       const plan = decide(result, suppressed);
-      if (plan.comfyui) emitComfyuiChange(plan.comfyui);
+      // The ONE real emit for the whole suspended operation, so its snapshot is the
+      // operation's at-risk list. Stashed rather than returned because `finally` cannot
+      // change what the block returns — the caller reads it back with
+      // `takeSuspendedAtRisk()` after the fact.
+      if (plan.comfyui) lastSuspendedAtRisk = emitComfyuiChange(plan.comfyui);
       if (plan.agent) emitAgentChange();
     } catch (err) {
       logger.warn(
@@ -246,6 +292,14 @@ function withSuspendedEmissions<T>(
       );
     }
   }
+}
+
+/** The at-risk list from the last suspended operation's single emit, cleared on read so a
+ *  later operation cannot inherit it. */
+function takeSuspendedAtRisk(): AtRiskDownloads {
+  const at = lastSuspendedAtRisk;
+  lastSuspendedAtRisk = [];
+  return at;
 }
 
 /** Payload for a comfyui tool-secret change. `requested` is true ONLY when the
@@ -312,6 +366,13 @@ export function onComfyuiSecretsChanged(cb: (change: ComfyuiSecretChange) => voi
  * from this instead of asserting a respawn that may never fire (#826).
  */
 export interface SecretSaveReceipt {
+  /**
+   * Downloads that were in flight when this save was about to respawn the tool session
+   * (#1378). Captured BEFORE the (synchronous) respawn emit, so an already-applied
+   * replacement can still report what it cost — afterwards the list is empty and the
+   * warning would describe nothing.
+   */
+  atRiskDownloads?: AtRiskDownloads;
   /** The env var written. Never the value. */
   key: string;
   /** The canonical file it was written to (contains no secret). */
@@ -448,12 +509,102 @@ export function shadowedNote(receipt: SecretSaveReceipt): string | null {
  */
 export function receiptDisclosures(receipt: SecretSaveReceipt): string[] {
   return [
+    atRiskNote(receipt.atRiskDownloads ?? [], receipt.respawn),
     storeDamageNote(receipt),
     strayCopyNote(receipt),
     commentLossNote(receipt),
     durabilityNote(receipt),
     shadowedNote(receipt),
   ].filter((n): n is string => n !== null);
+}
+
+/**
+ * What the respawn this change triggers is about to cost, or has already cost (#1378).
+ *
+ * Lives beside the other disclosures rather than in one caller's renderer, because the
+ * caller that had it was the agent-facing one and the Settings endpoint — which saves
+ * through the same path and orphans the same transfers — rendered nothing at all (codex).
+ *
+ * THE RESPAWN'S TIMING DECIDES THE SENTENCE, and "not reported" is its own case. A save
+ * that collects no respawn report has not established that no respawn happened; saying
+ * "will not resume" invites the user to act on a transfer that may be dead already, and
+ * saying "already lost" claims an event nobody observed.
+ */
+export function atRiskNote(
+  atRisk: AtRiskDownloads | readonly { filename: string; bytes: number }[],
+  // `undefined` is a THIRD answer: no report was collected on this path, which is not
+  // `null` ("a listener reported doing nothing"). The wording distinguishes them.
+  respawn: SecretSaveReceipt["respawn"] | undefined,
+): string | null {
+  if (!atRisk.length) return null;
+  const listed = atRiskDownloadSummary(atRisk);
+  // Why this is unrecoverable, stated once: the auth header is part of each download's
+  // cache identity, so the bytes on disk can no longer be found under the new one.
+  const consequence =
+    `The new credentials change each download's cache identity, so those transfers will ` +
+    `NOT resume: re-issuing them starts from 0% even though the partial files remain on ` +
+    `disk (#1378).`;
+  if (respawn?.applied) {
+    return (
+      `🛑 The tool session was replaced immediately, and ${listed} were in flight. ${consequence} ` +
+      `Nothing can recover them under the new identity — that is the cost already paid, not a ` +
+      `warning you can act on.`
+    );
+  }
+  if (respawn?.scheduled) {
+    return (
+      `⚠️ ${listed} are in flight and the tool session is queued to be rebuilt at the end of ` +
+      `this turn. ${consequence} If that matters, let them finish before the rebuild.`
+    );
+  }
+  return (
+    `⚠️ ${listed} were in flight when this credential change fired its tool-session rebuild. ` +
+    `Whether that rebuild has already happened was not reported here, so this is not a claim ` +
+    `either way about transfers you may still be able to save. ${consequence}`
+  );
+}
+
+/**
+ * #1567 — what a DEFERRED respawn is orphaning, said at the moment it fires.
+ *
+ * `atRiskNote` above is for the save. It is built from a snapshot taken before the emit,
+ * which is correct for an `applied` respawn — the emit IS the damage — and structurally
+ * incapable of covering a `scheduled` one, where the damage happens arbitrarily later. A
+ * reporter saved a token with nothing in flight (so the save-time check correctly warned
+ * about nothing), started nine downloads over the next two turns, and lost all ~48GB when
+ * the queued respawn landed, with no warning at any point.
+ *
+ * ## Why this does NOT reuse `atRiskNote`'s consequence
+ *
+ * That sentence says the transfers will not resume and re-issuing restarts from 0%,
+ * because the new credential changes each download's cache identity. True when the
+ * credential changes MID-TRANSFER. It is wrong for the case this note exists for, and the
+ * reporter proved it: their downloads began AFTER the save, so identity never moved and
+ * re-issuing resumed from the `.partial` files at 4%/1%/2%. ~11GB was recoverable — but
+ * only because they checked the partials rather than believing the prediction.
+ *
+ * So this states what is observable here (these are being killed now, the partials are on
+ * disk) and is explicit that resumability depends on something this code cannot see: which
+ * side of the credential change each transfer started on. Claiming either outcome would be
+ * asserting the thing that actually varies.
+ */
+export function orphanedByDeferredRespawnNote(
+  orphaned: AtRiskDownloads | readonly { filename: string; bytes: number }[],
+): string | null {
+  if (!orphaned.length) return null;
+  return (
+    `🛑 The queued tool-session rebuild is happening NOW, and ${atRiskDownloadSummary(orphaned)} ` +
+    `were still transferring. They belong to the session being replaced, so they are being ` +
+    `killed — this is the rebuild that was queued when a comfyui credential was saved earlier ` +
+    `(#1567).\n\n` +
+    `The partial files are still on disk, so re-issuing each download is worth doing: it can ` +
+    `RESUME from them rather than starting over. A transfer that was already running when the ` +
+    `credential changed has a different cache identity and definitely restarts from 0%; one ` +
+    `started after that save keeps its identity and usually resumes — but resumption also needs ` +
+    `the server to still offer the same validator and honour a range request, so it is not ` +
+    `guaranteed either way. Read the progress each re-issue reports instead of assuming.\n\n` +
+    `Re-issue them now if they are still wanted; nothing else will pick them up.`
+  );
 }
 
 /** A pre-write snapshot the write could not delete: a readable copy of the store
@@ -486,8 +637,41 @@ export function strayCopyNote(receipt: SecretSaveReceipt): string | null {
  * beside the save's, so the two cannot drift into disagreeing about what a store
  * write owes its caller.
  */
+/**
+ * The one description of what a respawn is about to cost, shared by both paths (#1378).
+ *
+ * Save and revoke reach the same emit and lose the same transfers, so they say it the same
+ * way — two hand-rolled summaries would drift, and the revoke half was missing entirely
+ * until codex pointed at it.
+ */
+export function atRiskDownloadSummary(atRisk: AtRiskDownloads | readonly { filename: string; bytes: number }[]): string {
+  const gb = atRisk.reduce((n, d) => n + d.bytes, 0) / 1024 ** 3;
+  const names = atRisk
+    .map((d) => d.filename)
+    .slice(0, 3)
+    .join(", ");
+  return `${atRisk.length} download(s) (${names}${atRisk.length > 3 ? ", …" : ""}), about ${gb.toFixed(2)} GB fetched`;
+}
+
 export function removeDisclosures(outcome: SecretRemoveOutcome, path: string): string[] {
   const out: string[] = [];
+  if (outcome.atRiskDownloads.length) {
+    // WHAT THE REVOKE COST (#1378, #1409). Removing the credential a gated transfer is
+    // authenticated with respawns the tool session, which changes each download's cache
+    // identity — the `.partial` at 96% becomes unreachable and re-issuing starts from zero.
+    //
+    // Unlike the save path, this one collects no respawn reports, so whether the rebuild
+    // has ALREADY happened is not established here. The sentence says so rather than
+    // picking one: "already lost" would be a claim we did not check, and "will be lost"
+    // invites the user to act on a transfer that may be dead already.
+    out.push(
+      `⚠️ ${atRiskDownloadSummary(outcome.atRiskDownloads)} — these were in flight when the ` +
+        `credential was removed. Whether the tool session has been rebuilt yet is not reported ` +
+        `on this path, but a rebuild changes each download's cache identity, so those transfers ` +
+        `do NOT resume: re-issuing starts from 0% even though the partial files remain on disk ` +
+        `(#1378).`,
+    );
+  }
   if (outcome.lostKeys.length) {
     out.push(
       `🛑 The store no longer carries ${outcome.lostKeys.join(", ")} — ` +
@@ -1605,8 +1789,20 @@ export function setEnvSecret(
   // has landed by the time this returns — the receipt describes observed work,
   // not an intention. No listener → `respawn: null`, never a fabricated zero.
   const reports: SecretRespawnReport[] = [];
+  // #1378 — SNAPSHOT BEFORE THE EMIT, because the emit is where the damage happens.
+  //
+  // `emitComfyuiChange` is synchronous and a listener may replace its tool session inside
+  // it, so by the time the receipt is rendered those downloads are already orphaned. My
+  // first version enumerated them afterwards and told the user "let them finish and save
+  // the credential afterwards" about transfers that had been dead for a tick — advice that
+  // was not merely useless but wrong about what had happened.
+  //
+  // Taken before, the list is what WAS in flight, which is the right thing to report in
+  // both cases: still running for a queued respawn, already lost for an applied one. The
+  // receipt words those differently.
+  let atRiskDownloads: AtRiskDownloads = [];
   if (isAllowedComfyuiSecretKey(trimmed))
-    emitComfyuiChange({
+    atRiskDownloads = emitComfyuiChange({
       requested: opts.requested === true,
       // The verdict rides along, so a listener cannot make a louder claim than
       // the receipt does. `persisted` is already settled at this point.
@@ -1616,6 +1812,7 @@ export function setEnvSecret(
     });
   if (isAllowedAgentSecretKey(trimmed)) emitAgentChange(); // flip provider readiness live
   return {
+    atRiskDownloads,
     key: trimmed,
     path: envFilePath(),
     persisted,
@@ -1653,6 +1850,17 @@ export interface SecretRemoveOutcome {
   /** Something changed: a store line removed, the in-process copy dropped, or a
    *  legacy JSON entry purged. */
   changed: boolean;
+  /**
+   * Downloads that were in flight when this revoke was about to respawn the tool session
+   * (#1378, #1409). Same field and same capture point as `SecretSaveReceipt` — a revoke
+   * reaches the same synchronous emit, and removing the credential a gated transfer is
+   * authenticated with is at least as likely to cost one as replacing it.
+   *
+   * Empty when nothing changed (no emit, so nothing was at risk) and when the key is not
+   * a ComfyUI one — never absent, so a caller need not distinguish "none" from "not
+   * reported".
+   */
+  atRiskDownloads: AtRiskDownloads;
   /** OTHER credential keys the store held before and no longer holds. Names
    *  only. Non-empty means the revoke happened AND cost something else. */
   lostKeys: string[];
@@ -1764,12 +1972,25 @@ export function removeEnvSecret(key: string): SecretRemoveOutcome {
     logger.warn(`[panel-secrets] ${resurrectionRisk}`);
   }
   const changed = removed || purgedJson || envDeleted;
+  // #1378 — REVOKE ORPHANS DOWNLOADS TOO (codex P1, filed separately as #1409).
+  //
+  // The fix landed on the SET path only, and revoke reaches the same emit two functions
+  // later. A listener replacing its tool session inside that synchronous emit kills an
+  // in-flight transfer whether the credential was written or removed — and removing the
+  // credential a gated download is authenticated with is, if anything, the likelier way to
+  // lose one. Snapshot before the emit for the same reason as above: afterwards the
+  // transfers are already gone and the list is empty, which reads as "nothing was at risk".
+  let atRiskDownloads: AtRiskDownloads = [];
   if (changed) {
-    if (isAllowedComfyuiSecretKey(key)) emitComfyuiChange({}); // comfyui-only restart (#269)
+    // comfyui-only restart (#269). The emit reports what it cost — see emitComfyuiChange:
+    // under suspended emissions (a rollback) it emits nothing and costs nothing, which is
+    // why this is not a snapshot taken beside the call.
+    if (isAllowedComfyuiSecretKey(key)) atRiskDownloads = emitComfyuiChange({});
     if (isAllowedAgentSecretKey(key)) emitAgentChange();
   }
   return {
     changed,
+    atRiskDownloads,
     lostKeys: outcome.lostKeys,
     lostCommentLines: outcome.lostCommentLines,
     ...(outcome.lossCheck === "unknown"
@@ -2036,6 +2257,31 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
     ...(process.env.COMFYUI_MCP_ENV_FILE
       ? { COMFYUI_MCP_ENV_FILE: process.env.COMFYUI_MCP_ENV_FILE }
       : {}),
+    // #873 — THE OPERATOR'S TOOL-SURFACE POLICY, forwarded HERE because this is the one
+    // function BOTH comfyui spawn lanes share.
+    //
+    // I first put this in comfyuiBaseEnv(), which only the Codex/Gemini lane spreads. The
+    // Claude lane — the DEFAULT backend — builds its own literal and calls this function
+    // directly, so it kept spawning a child with all 37 tools while the panel surface was
+    // correctly withheld and logged as withheld. An operator setting PRESET=readonly got
+    // a server that reported itself restricted and still offered restart_comfyui,
+    // install_custom_node and download_model.
+    //
+    // That is the same defect I had just written a commit message about — fixing one of
+    // two registration paths and testing only the one I fixed — committed again, in the
+    // same change, one file over. Two call sites is the bug; the choke point is the fix.
+    // The child's env is CONSTRUCTED rather than inherited (a spread cannot remove a
+    // revoked credential, see below), so an unforwarded variable simply does not exist
+    // over there.
+    ...(process.env.COMFYUI_MCP_TOOL_PRESET
+      ? { COMFYUI_MCP_TOOL_PRESET: process.env.COMFYUI_MCP_TOOL_PRESET }
+      : {}),
+    ...(process.env.COMFYUI_MCP_TOOL_ALLOW
+      ? { COMFYUI_MCP_TOOL_ALLOW: process.env.COMFYUI_MCP_TOOL_ALLOW }
+      : {}),
+    ...(process.env.COMFYUI_MCP_TOOL_DENY
+      ? { COMFYUI_MCP_TOOL_DENY: process.env.COMFYUI_MCP_TOOL_DENY }
+      : {}),
     // KEY NAMES only — never values.
     ...(managed.length ? { [MANAGED_SECRET_KEYS_ENV]: managed.join(",") } : {}),
     ...secrets,
@@ -2131,6 +2377,14 @@ export function maskSecret(v: string): string {
 export interface SlotSaveOutcome {
   slot: string;
   receipts: SecretSaveReceipt[];
+  /**
+   * Downloads in flight when this slot save's single respawn emit fired (#1378).
+   *
+   * The slot fan-out suspends per-alias emits and makes ONE at the end, so this is that
+   * emit's own snapshot — not a per-alias guess, and empty when the operation rolled back
+   * and emitted nothing.
+   */
+  atRiskDownloads: AtRiskDownloads;
   /** Every alias landed, proven by read-back. */
   confirmed: boolean;
   /** The slot was left exactly as it was before this call (no alias carries the
@@ -2249,6 +2503,8 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
           strandedKeys: [],
           unverifiedKeys: [],
           lostKeys: lostKeysOf(receipts),
+          // Filled in after the suspended emit below — it has not happened yet here.
+          atRiskDownloads: [],
         };
       }
       if (!failed) {
@@ -2260,6 +2516,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
           strandedKeys: [],
           unverifiedKeys: [],
           lostKeys: [],
+          atRiskDownloads: [],
         };
       }
       // Restore every alias this call actually changed, and PROVE each restore
@@ -2291,6 +2548,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
         strandedKeys,
         unverifiedKeys,
         lostKeys: [...new Set([...lostKeysOf(receipts), ...restoreLostKeys])],
+        atRiskDownloads: [],
         ...(restoreWarnings.length ? { restoreWarnings } : {}),
       };
     },
@@ -2311,6 +2569,11 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
       };
     },
   );
+  // WHAT THE SINGLE EMIT COST (#1378). The fan-out suspends per-alias emits and makes one
+  // at the end, inside `withSuspendedEmissions`' finally — which cannot change what the
+  // block returns, so the snapshot is read back here. A rolled-back save emits nothing and
+  // this is empty, which is the point: it must not warn about a loss that did not happen.
+  outcome.atRiskDownloads = takeSuspendedAtRisk();
   if (thrown) {
     // The rethrow is a refusal — correct, because the value the caller supplied
     // is not in place. But the ROLLBACK on the way out is a store write, and
@@ -2478,6 +2741,7 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
   const resurrectionRisks: string[] = [];
   let durabilityGap: string | undefined;
   const failures: string[] = [];
+  const atRisk = new Map<string, AtRiskDownloads[number]>();
   let firstError: unknown = null;
   for (const key of slot.envKeys) {
     let out: SecretRemoveOutcome;
@@ -2501,6 +2765,17 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
     lostCommentLines += out.lostCommentLines;
     if (out.uncertainty) uncertainties.push(out.uncertainty);
     if (out.durabilityGap && !durabilityGap) durabilityGap = out.durabilityGap;
+    // Aggregated, and deduped by filename (#1378). The fan-out is SERIAL, so the FIRST
+    // alias whose removal emits is the one that catches the transfers still running; by
+    // the second the session is already replaced and its snapshot is empty. Keeping the
+    // largest byte count means the report never understates what was in flight.
+    for (const d of out.atRiskDownloads) {
+      // Keyed on the job id, NOT the displayed filename (codex P2): two credential-shaped
+      // names both redact to "(redacted).safetensors", and keying on that reported one
+      // download and the larger byte count where there were two and a total.
+      const seen = atRisk.get(d.id);
+      if (!seen || d.bytes > seen.bytes) atRisk.set(d.id, d);
+    }
   }
   // Nothing was removed and something failed: nothing happened, so REFUSING is
   // correct and the caller's "it is still there" is true. Anything else is a
@@ -2508,6 +2783,7 @@ export function clearPanelSecret(slotId: string): SecretRemoveOutcome {
   if (!changed && firstError !== null) throw firstError;
   return {
     changed,
+    atRiskDownloads: [...atRisk.values()],
     ...(failures.length
       ? {
           incomplete:

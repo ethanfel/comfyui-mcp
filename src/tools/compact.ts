@@ -1,3 +1,4 @@
+import { DEFERRED_PANEL_TOOLS_NOTE } from "../deferred-panel-tools.js";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -38,19 +39,100 @@ function searchCorpus(tool: CatalogedTool): string {
   const params = Object.entries(tool.schema ?? {})
     .map(([key, schema]) => `${key} ${(schema as { description?: string }).description ?? ""}`)
     .join(" ");
-  return `${tool.name} ${tool.description} ${params}`.toLowerCase();
+  return normalizeForSearch(`${tool.name} ${tool.description} ${params}`);
+}
+
+/**
+ * #1525 — fold the separators that only exist because tool names are identifiers.
+ *
+ * `list_tools search:"download model"` returned ONLY `runpod`, which reads as a
+ * broken index. It was doing exactly what it was told: matching the literal
+ * phrase. `download_model` is spelled with an UNDERSCORE, so the phrase never
+ * occurred in it, while runpod's prose happens to contain "download model" as
+ * ordinary English — so the one tool the caller obviously wanted was the one tool
+ * excluded, and the only tool returned was the coincidence.
+ *
+ * Underscores and hyphens become spaces on BOTH sides, so a caller may type a
+ * tool's name the way they say it.
+ *
+ * DOTS AND SLASHES ARE LEFT ALONE, deliberately. Folding them bought nothing —
+ * no tool name contains one — while costing literal queries their meaning: `v1.2`
+ * would split into `v1` + `2` and `foo/bar` into `foo` + `bar`, each fragment
+ * then matching anywhere, so a precise version or path search would return
+ * unrelated tools (codex). The separators worth folding are exactly the ones that
+ * exist because names are identifiers.
+ */
+function normalizeForSearch(text: string): string {
+  return text.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Every term must appear, in any order and anywhere in the corpus.
+ *
+ * Wider than the phrase match it replaces: a single term behaves identically, and
+ * a multi-word query no longer demands the words be adjacent in that order.
+ *
+ * NOTE that the name tier below IS narrowing, and I claimed otherwise (codex).
+ * `search:"download model"` used to return `runpod` and now does not. That is a
+ * deliberate ranking policy, not preservation, and calling it "strictly wider"
+ * was simply wrong. The footer says so when it happens, so a caller can see that
+ * results were chosen by name rather than drawn from everything that matched.
+ */
+function matchesSearch(corpus: string, terms: readonly string[]): boolean {
+  return terms.every((term) => corpus.includes(term));
 }
 
 export function buildManifest(
   catalog: ToolCatalog,
   opts: { category?: string; search?: string } = {},
 ): string {
-  const search = opts.search?.toLowerCase();
+  // #1525 — split into TERMS rather than matching the raw phrase.
+  //
+  // A whitespace-only search is treated as no search. That is a CHANGE, not a
+  // preservation (codex): it used to be a literal `includes("   ")`, which
+  // matched nothing and returned "No tools matched". Showing the catalog is the
+  // better answer, but it is a different one.
+  const terms = opts.search ? normalizeForSearch(opts.search).split(" ").filter(Boolean) : [];
+  // #1525 — NAME MATCHES WIN, when there are any.
+  //
+  // Matching every term across name + description + parameter docs is what makes
+  // `download_model` findable at all, but on the real 37-tool surface it is barely
+  // a filter: "install node" hit 19 tools, because "install" and "node" are
+  // ordinary words in a dozen descriptions. The reporter's complaint was not only
+  // that their tool was missing — it was that the filtered view "is misleading and
+  // forces a full-catalog workaround". A result set of 19 does that too.
+  //
+  // So: if any tool's NAME carries every term, the answer is those tools. Nobody
+  // typing "download model" wants the nine tools that merely mention downloading
+  // models. When no name matches — "checkpoint", "liveness" — this tier is inert
+  // and the corpus search answers, which is the case that made the corpus search
+  // worth having.
+  //
+  // NOT "exactly as before" there either (codex): the corpus search is now
+  // term-based, so it finds strictly more than the old phrase match. `run memory`
+  // matches `clear_vram` — terms far apart, in neither order — where the phrase
+  // search found nothing.
+  //
+  // Scoped to the CATEGORY when one is given. Computing it over the whole catalog
+  // meant `{category:"models", search:"install node"}` found `install_custom_node`
+  // in a different category, then displayed nothing at all from `models` — a name
+  // tier suppressing the corpus results inside the very category the caller asked
+  // to browse. Within a category the question is "which of THESE", so the tier is
+  // answered from the same set the loop will show.
+  const inScope = [...catalog.tools.values()].filter(
+    (t) => !opts.category || t.category === opts.category,
+  );
+  const nameMatches = terms.length
+    ? inScope.filter((t) => matchesSearch(normalizeForSearch(t.name), terms))
+    : [];
+  const byName = new Set(nameMatches.map((t) => t.name));
   const lines: string[] = [];
   let shown = 0;
   for (const [category, tools] of catalog.byCategory()) {
     if (opts.category && category !== opts.category) continue;
-    const matching = search ? tools.filter((t) => searchCorpus(t).includes(search)) : tools;
+    const matching = terms.length
+      ? tools.filter((t) => (byName.size ? byName.has(t.name) : matchesSearch(searchCorpus(t), terms)))
+      : tools;
     if (matching.length === 0) continue;
     lines.push("", `## ${category} (${matching.length})`);
     for (const t of matching) {
@@ -62,13 +144,36 @@ export function buildManifest(
     const cats = [...catalog.byCategory().keys()].join(", ");
     return `No tools matched (category=${opts.category ?? "any"}, search=${opts.search ?? "none"}). Categories: ${cats}`;
   }
+  // `terms.length`, not raw `opts.search` (codex). A whitespace-only search
+  // filters nothing, and stamping "(filtered)" on a complete catalog tells the
+  // caller something untrue about what they are looking at — while the source
+  // comment two lines away claimed such a search was treated as no search at all.
+  // The behaviour was right; only this line disagreed with it.
+  const filtered = Boolean(opts.category) || terms.length > 0;
   const header =
     `comfyui-mcp tool catalog — ${shown} of ${catalog.tools.size} tools` +
-    (opts.category || opts.search ? " (filtered)" : "") +
+    (filtered ? " (filtered)" : "") +
     ". Workflow: pick a tool → describe_tool {\"name\": ...} for its parameters → call_tool {\"name\": ..., \"args\": {...}}.";
+  // #1525 — DISCLOSE the name tier when it did the selecting (codex). Results
+  // chosen by name are not "everything that matched", and a caller who cannot
+  // tell the difference will read a short list as the whole answer. Counted
+  // rather than asserted: this is how many tools the corpus search WOULD have
+  // returned and this view is not showing.
+  const suppressed = byName.size
+    ? inScope.filter((t) => !byName.has(t.name) && matchesSearch(searchCorpus(t), terms)).length
+    : 0;
+  // WORDING, not the count (codex). The count is right: `suppressed` is exactly
+  // what the corpus search would have returned and this view is withholding. But
+  // saying those tools match "in their description or parameters" claims WHERE
+  // they matched, and the corpus includes the name — `download_asset` described
+  // as "handles model files" takes one term from each, so the claim is false for
+  // it while the count is still correct. The note now says only what it knows.
+  const tierNote = suppressed
+    ? ` Showing tools whose NAME matches; ${suppressed} other tool(s) also match this search — search a distinctive word from one to see them.`
+    : "";
   const footer =
-    (opts.category || opts.search) && shown < catalog.tools.size
-      ? `\n\nThis is a FILTERED view (${catalog.tools.size - shown} tools hidden). If nothing here fits the task, call list_tools again with a broader search or no filter.`
+    filtered && shown < catalog.tools.size
+      ? `\n\nThis is a FILTERED view (${catalog.tools.size - shown} tools hidden).${tierNote} If nothing here fits the task, call list_tools again with a broader search or no filter.`
       : "";
   return header + lines.join("\n") + footer;
 }
@@ -392,7 +497,22 @@ function panelNamespaceMessage(catalog: ToolCatalog, name: string): string {
     "see what else your client holds, so check the tool list your client gave you. " +
     `If it offers ${name}, or a panel router such as panel_call_tool, go that way — call_tool ` +
     "dispatches only within this server's own catalog and can never reach the panel surface. " +
-    "If it offers nothing under `panel_`, there is no live-canvas route from here: read the " +
+    // #1353 — SEARCHING ONLY THE DIRECT DECLARATIONS PRODUCES A FALSE NEGATIVE.
+    //
+    // On a code-mode client (the Codex backend) the panel tools are DEFERRED: they
+    // live in the `ALL_TOOLS` catalog under an `mcp__panel__` prefix, so a scan for a
+    // bare `panel_` prefix among direct declarations finds nothing while the panel MCP
+    // endpoint is answering tools/list with 91 tools. A reporter followed the sentence
+    // below literally and declared the live-canvas tools missing, repeatedly, with no
+    // transport error anywhere — the failure was entirely this instruction.
+    //
+    // So the absence test has to name both the prefix and the deferred catalog before
+    // it is allowed to conclude anything.
+    // Shared with the INJECTED steering (#1398): two surfaces phrasing this in their
+    // own words is how one ends up a version behind the other.
+    `BEFORE concluding they are absent: ${DEFERRED_PANEL_TOOLS_NOTE} Only when BOTH the ` +
+    "direct declarations and the deferred catalog have nothing matching `panel_` is there " +
+    "no live-canvas route from here: read the " +
     "workflow from disk instead (get_workflow, whose list/get/analyze/query actions read saved files), " +
     "or ask the user to make the request from the Agent tab in the ComfyUI sidebar, on a backend " +
     "that has ComfyUI tools (the pi backend has no MCP client and so has none)."

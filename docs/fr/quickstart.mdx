@@ -1,0 +1,66 @@
+---
+title: "Démarrage rapide"
+description: "Ajoutez ComfyUI MCP à Claude Code et générez votre première image."
+icon: "rocket"
+---
+
+<Steps>
+  <Step title="Disposer d'une instance ComfyUI en cours d'exécution">
+    Installez [ComfyUI Desktop](https://www.comfy.org/download) ou lancez-le
+    [depuis les sources](https://github.com/comfyanonymous/ComfyUI), puis démarrez-le. ComfyUI MCP
+    détecte automatiquement une installation locale et son port (8188 / 8000). Pour cibler une
+    instance distante, voir [Configuration](/docs/configuration).
+  </Step>
+
+  <Step title="Ajouter le serveur MCP à Claude Code">
+    Ajoutez-le à votre configuration Claude Code (`~/.claude/settings.json`). `npx` récupère
+    automatiquement le dernier paquet publié.
+
+    ```json ~/.claude/settings.json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "CIVITAI_API_TOKEN": ""
+          }
+        }
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="Se reconnecter">
+    Exécutez `/mcp` dans Claude Code (ou redémarrez-le) pour vous connecter au serveur `comfyui`.
+    Les outils ComfyUI MCP deviennent alors disponibles.
+  </Step>
+
+  <Step title="Générer quelque chose">
+    Demandez-le à votre assistant en langage naturel :
+
+    > Génère une image d'un renard à l'aquarelle dans une forêt brumeuse.
+
+    En coulisses, cela appelle [`generate_image`](/docs/tools/image-generation), qui construit un
+    workflow txt2img, sélectionne automatiquement un checkpoint, le met en file d'attente et
+    renvoie un `prompt_id`. L'image terminée arrive via la notification de fin — affichez-la avec
+    [`get_image (action:"view")`](/docs/tools/assets-images).
+  </Step>
+</Steps>
+
+## Étapes suivantes
+
+<CardGroup cols={2}>
+  <Card title="Détails d'installation" icon="download" href="/docs/fr/installation">
+    Configurations locales ou distantes, et `npm link` pour le développement.
+  </Card>
+  <Card title="Configuration" icon="gear" href="/docs/configuration">
+    Toutes les variables d'environnement et le transport HTTP.
+  </Card>
+  <Card title="Comment ça fonctionne" icon="diagram-project" href="/docs/concepts">
+    Le modèle derrière les outils — et ceux qui exigent une installation locale.
+  </Card>
+  <Card title="Parcourir les outils" icon="wrench" href="/docs/tools/image-generation">
+    La référence complète, générée à partir des schémas.
+  </Card>
+</CardGroup>

@@ -1,0 +1,228 @@
+---
+title: "Dépannage"
+description: "Solutions aux problèmes que les utilisateurs rencontrent vraiment : incompatibilités de génération de ComfyUI-Manager (erreurs 405), installations depuis une URL git silencieusement ignorées, panneau injoignable depuis un navigateur distant, caches npx obsolètes et ComfyUI distants en redirection de port pris pour des installations locales."
+icon: "wrench"
+---
+
+Chaque entrée de cette page est née d'un vrai rapport de bug. Si le vôtre n'y figure
+pas, [ouvrez une issue](https://github.com/artokun/comfyui-mcp/issues) — il finira
+probablement par s'y retrouver.
+
+## `install_custom_node` échoue avec `405 Method Not Allowed` sur `/v2/manager/queue/task`
+
+**Cause :** deux générations de ComfyUI-Manager coexistent. L'API `/v2/manager/*`
+relève de la **lignée v4** (paquet pip `comfyui_manager` ≥ 4.x) ; la **version
+publiée Manager 3.x** — celle que ComfyUI-Manager installe par défaut — expose la
+même file d'attente sur d'autres routes.
+
+**Solution :** passez à `comfyui-mcp` ≥ **0.24.3** — il détecte automatiquement la
+génération de Manager pour chaque cible et parle les deux dialectes. Aucune
+modification de Manager n'est nécessaire.
+
+**Facultatif mais recommandé — passez à Manager v4** pour les fonctionnalités que
+3.x ne sait pas faire à distance (notamment les **téléchargements de modèles depuis
+une URL arbitraire**, que 3.x restreint par liste blanche) :
+
+```bash
+# in your ComfyUI python environment
+pip install -U comfyui_manager
+# then remove/disable the old custom_nodes/ComfyUI-Manager clone and restart
+```
+
+L'[image RunPod](/docs/cloud-deployment) embarque déjà Manager v4.
+
+**À propos de `useCmCli: true` :** le repli cm-cli exécute le CLI de Manager dans un
+sous-processus, il lui faut donc le **système de fichiers local** — il ne peut pas
+fonctionner sur une cible distante ou `--tunnel`, et il exige que `COMFYUI_PYTHON`
+pointe vers l'interpréteur du venv de votre ComfyUI quand `python` n'est pas dans le
+PATH. Pour les cibles distantes, le chemin HTTP de Manager (le comportement par
+défaut) est le bon mécanisme.
+
+## Un nœud personnalisé installé depuis une URL git n'apparaît jamais
+
+L'installation par identifiant de registre fonctionne, mais l'installation depuis une
+URL GitHub brute est signalée comme réussie et le pack n'apparaît jamais.
+
+**Cause :** Manager considère les installations depuis une URL git arbitraire comme à
+haut risque et les **ignore silencieusement** en dessous d'un niveau de sécurité
+permissif (tout en marquant la tâche de la file d'attente comme « terminée »). Sur
+Manager 3.x s'ajoute un drapeau de configuration dédié, `allow_git_url_install`.
+
+**Solution :** dans le `config.ini` de Manager (sous votre répertoire utilisateur
+ComfyUI) :
+
+```ini
+[default]
+security_level = weak          ; Manager v4: allows git-URL installs
+allow_git_url_install = True   ; Manager 3.x: additionally required
+```
+
+Redémarrez ensuite ComfyUI. Sur l'image RunPod, c'est le comportement par défaut
+depuis l'image `1.6` (la variable d'environnement `COMFY_SECURITY_LEVEL` a la
+priorité ; le niveau est réappliqué à chaque démarrage). Les images `1.4`/`1.5` en
+avaient l'*intention*, mais une variable d'environnement
+`COMFY_SECURITY_LEVEL=normal-` intégrée à l'image écrasait la valeur par défaut du
+script de démarrage — sur ces images, définissez `COMFY_SECURITY_LEVEL=weak` dans
+l'environnement du pod. N'assouplissez ce réglage que sur une machine que vous
+contrôlez — il supprime les garde-fous d'installation de Manager.
+
+## RunPod : l'onglet du panneau agent est vide — ses fichiers existent mais font tous 0 octet
+
+ComfyUI liste bien `comfyui-mcp-panel`, mais l'onglet de la barre latérale ne se
+charge jamais ; `ls -la /workspace/custom_nodes/comfyui-mcp-panel` affiche chaque
+fichier à **0 octet**. Les nœuds installés par l'utilisateur peuvent être vides de la
+même façon.
+
+**Cause :** le volume réseau s'est retrouvé **à court d'espace** à un moment donné
+(souvent la copie du modèle de spotcheck d'environ 7 Go au premier démarrage sur un
+petit volume, ou le téléchargement d'un gros modèle). En cas d'ENOSPC, `cp`/`git`
+*créent* quand même chaque fichier mais n'y écrivent rien — et comme le volume
+persiste, ces coquilles vides survivent à chaque redéploiement.
+
+**Solution :** libérez ou agrandissez le volume, puis redémarrez le pod. Depuis
+l'image `1.6`, le script de démarrage avertit lorsque le volume est presque plein ou
+plein, saute la copie du modèle de spotcheck quand elle ne tiendrait pas, et **répare
+automatiquement** un panneau à 0 octet (re-clonage depuis GitHub, ou depuis la graine
+de l'image en cas de fonctionnement hors ligne). Il journalise également
+`WARN: custom nodes with 0-byte __init__.py` en nommant les autres nœuds cassés —
+réinstallez ceux-ci via Manager. Sur les images `<= 1.5`, supprimez le dossier du
+panneau et redémarrez : `rm -rf /workspace/custom_nodes/comfyui-mcp-panel`.
+
+## Le panneau affiche « Aucun agent n'écoute sur le pont (ws://127.0.0.1:9180) »
+
+Vous ouvrez ComfyUI **dans un navigateur situé sur une autre machine** que celle où
+tourne l'orchestrateur. Le pont est volontairement limité au loopback, et
+`127.0.0.1` dans votre navigateur désigne la machine du navigateur — pas celle du
+serveur.
+
+**Solution — exécutez l'orchestrateur sur la machine QUI A le navigateur** (c'est la
+topologie prise en charge : l'agent tourne sur *votre* machine et pilote le ComfyUI
+distant) :
+
+```bash
+npx -y comfyui-mcp@latest connect http://<comfyui-host>:8188
+```
+
+Cliquez ensuite sur Connecter dans le panneau. Rien d'autre n'a besoin de tourner sur
+la machine ComfyUI que ComfyUI et le nœud personnalisé du panneau. Pour un ComfyUI en
+**https** (proxy RunPod), l'orchestrateur bascule automatiquement le pont vers un
+tunnel `wss://` sécurisé — même commande.
+
+**Ou exécutez l'orchestrateur côté serveur (≥ 0.24.5)** — pour une machine sans écran
+fonctionnant 24 h/24 (par exemple un serveur Ollama/OpenClaw autonome), où l'agent
+doit résider à côté de ComfyUI et où les navigateurs se connectent depuis n'importe
+où sur le LAN :
+
+```bash
+# on the SERVER — bind the bridge on the LAN, token-gated (mandatory)
+COMFYUI_MCP_BRIDGE_HOST=0.0.0.0 \
+COMFYUI_MCP_BRIDGE_TOKEN=<pick-a-long-secret> \
+npx -y comfyui-mcp@latest --panel-orchestrator
+```
+
+Il affiche un `ws://<server-ip>:9180/?token=…` prêt à coller — mettez-le dans
+**Réglages → Avancé → URL du pont** du panneau, sur n'importe quelle machine, puis
+cliquez sur Connecter. Une liaison non-loopback **refuse de démarrer sans jeton**, et
+chaque connexion est vérifiée lors de la négociation WebSocket (en temps constant).
+Traitez cette URL comme un mot de passe : quiconque la détient peut piloter l'agent.
+
+## Une nouvelle version est sortie mais j'observe toujours l'ancien comportement
+
+`npx` met les paquets en cache de façon agressive — `npx -y comfyui-mcp@latest` peut
+servir un build vieux de plusieurs semaines depuis `~/.npm/_npx`.
+
+```bash
+# clear it, then relaunch
+npx clear-npx-cache
+# or on Windows:
+#   Remove-Item -Recurse -Force "$env:LOCALAPPDATA\npm-cache\_npx"
+```
+
+Vérifiez aussi le nœud personnalisé du panneau : s'il se trouve sur un **volume
+réseau** (`/workspace` sur RunPod) à la suite d'une installation plus ancienne, cette
+copie masque celle de l'image, qui se met à jour toute seule.
+`git -C <panel-dir> fetch && git -C <panel-dir> reset --hard origin/main`,
+ou réinstallez `comfyui-agent-panel` depuis ComfyUI-Manager, puis redémarrez ComfyUI
+et forcez le rechargement de l'onglet du navigateur (Ctrl+Maj+R).
+
+## Un ComfyUI distant en redirection de port est pris pour un ComfyUI local (dstack, tunnels SSH)
+
+Un ComfyUI distant accessible sur `localhost:8188` (dstack, `ssh -L`, kubectl
+port-forward) fait échouer l'heuristique de loopback : comfyui-mcp suppose une
+installation locale et active des outils réservés au local contre un système de
+fichiers où ComfyUI ne se trouve pas.
+
+**Solution (≥ 0.24.1) :** passez `--force-remote` (ou `COMFYUI_MCP_FORCE_REMOTE=1`) :
+
+```bash
+npx -y comfyui-mcp@latest connect http://localhost:8188 --force-remote
+```
+
+L'historique de génération des cibles distantes est stocké dans
+`~/.comfyui-mcp/instances/<host_port>/` (modifiable via `COMFYUI_MCP_DATA_DIR`).
+
+## Docker : le conteneur se termine immédiatement en mode HTTP
+
+Se lier à un hôte non-loopback sans authentification **échoue délibérément** (un
+endpoint `/mcp` ouvert sur `0.0.0.0` serait exposé). Fournissez un jeton, ou
+désactivez explicitement le garde-fou :
+
+```bash
+docker run --rm -p 9100:9100 -e COMFYUI_MCP_HTTP_TOKEN=changeme comfyui-mcp \
+  --http --host 0.0.0.0 --port 9100
+# or (trusted networks only):
+#   ... --http --host 0.0.0.0 --port 9100 --allow-unauthenticated-non-loopback
+```
+
+Le mode stdio (celui par défaut, qu'utilisent les clients MCP) n'a besoin de rien de
+tout cela.
+
+## L'agent n'appelle jamais d'outil — aucune erreur, il se contente de parler
+
+Il décrit votre workflow au lieu de le lire, ou propose d'écrire un script. Il n'y a
+pas d'erreur parce que rien n'a échoué : soit les outils ne sont jamais parvenus
+jusqu'à votre client, soit votre client bloque les appels, soit la capacité existe
+sous un nom qui n'a jamais été évoqué. Vues de l'extérieur, ces trois situations sont
+identiques et appellent des solutions opposées : deviner est donc pire que vérifier.
+
+Deux questions posées à votre agent permettent de les distinguer —
+voir [Quand il ne dit rien](/docs/using-tools#when-it-says-nothing). Notez qu'un
+blocage d'autorisation côté client n'atteint jamais ce serveur : aucun des logs
+ci-dessous ne le fera apparaître.
+
+## Modèles locaux : les appels d'outils échouent ou le modèle « ne voit pas » les outils
+
+- **Premier réflexe : utilisez [notre modèle fine-tuné](/docs/local-llms#our-fine-tuned-local-models-free-recommended)** —
+  `ollama pull artokun/gemma4-comfyui-mcp:e4b` (le modèle Ollama par défaut du
+  panneau). C'est un Gemma 4 entraîné sur la suite d'outils comfyui-mcp elle-même,
+  ce qui élimine d'emblée la plupart des échecs de type « mauvais outil / arguments
+  malformés » (`:e2b` pour environ 2 Go de VRAM, `:12b` pour environ 8 Go — chaque
+  palier surpasse son modèle de base d'origine dans l'arène ; `:e4b` reste le
+  meilleur compromis).
+- **gemma3 ne prend pas en charge l'appel d'outils natif dans Ollama** — non pris en
+  charge ; utilisez notre fine-tune ci-dessus, `gemma4` d'origine (e4b et au-delà),
+  `qwen3` ou `llama3.1+`.
+- Activez le [mode outils compact](/docs/local-llms) pour les petits modèles — ce
+  **n'est pas** le comportement par défaut, démarrez donc le serveur avec
+  `--compact` (ou `COMFYUI_MCP_TOOL_MODE=compact`). Sans cela, la surface complète
+  des schémas déborde d'un petit contexte et le modèle se met à inventer des noms
+  d'outils.
+- Le chargement à froid d'un modèle peut prendre plus de 30 s avant le premier
+  token — le watchdog du panneau en tient compte, mais une requête qui meurt
+  instantanément signifie généralement que le tag du modèle n'a pas été récupéré
+  (`ollama pull <tag>`).
+- **Toutes les requêtes échouent soudainement / connexion refusée sur 11434** —
+  l'application ou le démon Ollama ne tourne pas. Quitter l'application de la barre
+  d'état tue l'API avec elle, ce qui arrive facilement par accident pendant qu'un
+  agent travaille (le panneau n'avertit pas qu'un backend local est utilisé).
+  Relancez l'application (ou `ollama serve`) et reconnectez-vous — les sessions
+  reprennent ; aucun redémarrage du panneau n'est nécessaire.
+
+## Où chercher les logs
+
+- **Orchestrateur** : le terminal qui exécute `connect` / `--panel-orchestrator`.
+- **Côté ComfyUI** : l'outil MCP `get_system_stats (action:"logs")`, ou le flux de logs du pod sur RunPod.
+- **JS du panneau** : la console des devtools du navigateur (le client du pont
+  journalise les transitions de connexion/reconnexion).
+- **L'état de santé en un seul appel** : l'outil `get_system_stats (action:"health")`
+  agrège version/GPU/VRAM/file d'attente/répertoires de modèles/erreurs récentes.

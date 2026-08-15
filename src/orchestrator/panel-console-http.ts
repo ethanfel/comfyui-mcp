@@ -17,6 +17,7 @@ import {
   envFilePath as envStorePath,
   listPanelSecretsMasked,
   receiptDisclosures,
+  atRiskNote,
   removeDisclosures,
   revokeIsClean,
   slotRevokeState,
@@ -26,6 +27,7 @@ import {
   CREDENTIAL_SLOTS,
 } from "../services/panel-secrets.js";
 import { OPENAI_KEY_PROVIDER_IDS } from "../services/openai-provider-registry.js";
+import { processLocale, resolveLocale, trFor, type Locale } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
 
 // The simple api-key providers (glm/kimi/moonshot) are spliced in from the
@@ -76,6 +78,135 @@ function sendFramedHtml(res: ServerResponse, status: number, html: string): void
     "Content-Security-Policy": FRAME_ANCESTORS,
   });
   res.end(html);
+}
+
+// ─── i18n for the two served pages ────────────────────────────────────────────
+//
+// These documents are read in a BROWSER, and the reader's language is not this
+// process's: the panel's own language setting lives in ComfyUI's client settings and
+// never reaches the orchestrator. `Accept-Language` is the closest thing to that
+// reader's own choice that a request carries, so it decides; a browser that asks for
+// nothing we ship falls back to the process locale, which honours an explicit `--lang`.
+
+/** The language for a page served from here. */
+function pageLocale(req: IncomingMessage): Locale {
+  const header = String(req.headers["accept-language"] ?? "");
+  // Ranked by q-value rather than trusting header order: descending order is a browser
+  // convention, not a requirement, and `q=0` is an explicit REJECTION of a language —
+  // picking it because it appeared first would be exactly backwards. Sort is stable, so
+  // equal weights keep the order the browser sent.
+  const ranked = header
+    .split(",")
+    .map((part) => {
+      const [tag, ...params] = part.split(";");
+      // The parameter NAME is case-insensitive per RFC 9110, so `Q=0` is the same
+      // rejection as `q=0`; matching only lowercase would read it as top preference.
+      const q = params.map((p) => p.trim().toLowerCase()).find((p) => p.startsWith("q="));
+      const weight = q ? Number.parseFloat(q.slice(2)) : 1;
+      // An UNPARSEABLE weight defaults to 1 (accept), never 0: proxies and older clients
+      // do emit `q=` and `q=high`, and 0 is reserved for a language the reader explicitly
+      // rejected. Treating a typo as a rejection silently deletes their language.
+      return { tag: tag.trim(), weight: Number.isFinite(weight) ? weight : 1 };
+    })
+    .filter((r) => r.tag && r.tag !== "*" && r.weight > 0)
+    .sort((a, b) => b.weight - a.weight);
+  for (const { tag } of ranked) {
+    const hit = resolveLocale(tag);
+    if (hit) return hit;
+  }
+  return processLocale();
+}
+
+/** The right-to-left languages we ship — the same pair the panel mirrors its layout for.
+ *  Keep in step with `LOCALES` in src/i18n/index.ts when a language is added. */
+const RTL_LOCALES: ReadonlySet<string> = new Set(["ar", "fa"]);
+
+/**
+ * The language the page will ACTUALLY render in, which is not always the one negotiated.
+ *
+ * `lang`/`dir` describe the bytes on the page, not the reader's wishes. Until a catalog
+ * for the negotiated locale is installed, those bytes are English — and stamping
+ * `lang="fa" dir="rtl"` onto English prose is worse than saying nothing: it mirrors the
+ * entire layout and tells a screen reader to pronounce English as Persian. So probe one
+ * long sentence from the page: if the catalog answers with something other than the
+ * English source, the page is genuinely translated and gets its real language; if it
+ * hands the fallback straight back, the page is English and says so. The day a catalog
+ * lands this starts reporting the real locale with no second change.
+ */
+function renderedLocale(negotiated: Locale, probeKey: string, probeFallback: string): Locale {
+  if (negotiated === "en") return "en";
+  return trFor(negotiated, probeKey, probeFallback) === probeFallback ? "en" : negotiated;
+}
+
+/** `<html>` attributes: the real language, plus `dir="rtl"` for Arabic and Persian so the
+ *  browser mirrors the page instead of laying RTL text out left-to-right. */
+function htmlAttrs(locale: Locale): string {
+  return `lang="${locale}"${RTL_LOCALES.has(locale) ? ` dir="rtl"` : ""}`;
+}
+
+/**
+ * Resolve a translation, but REJECT one that dropped a `{slot}`.
+ *
+ * A placeholder is not decoration — it carries the ComfyUI URL, the `~/.claude.json`
+ * path, the masked key. A catalog entry written without one renders a page missing the
+ * very fact it exists to state, with a 200 and nothing in the log. Falling back to the
+ * English source is the honest failure: a sentence the reader may not speak still beats
+ * a sentence with the answer cut out of it.
+ */
+function trSlots(locale: Locale, key: string, fallback: string, slots: string[]): string {
+  const out = trFor(locale, key, fallback);
+  return slots.every((s) => out.includes(`{${s}}`)) ? out : fallback;
+}
+
+/**
+ * Translate one fragment of page prose into text that is SAFE to interpolate as markup.
+ *
+ * A catalog is data, not a template: whatever it returns is HTML-escaped before it
+ * reaches the document, so a stray `<` in a translation cannot open a tag. Inline markup
+ * therefore stays in the source here — the translatable text carries `{slot}`
+ * placeholders and `markup` maps each one to a literal element, substituted AFTER
+ * escaping so the tags stay byte-identical whatever the translation says (and so a
+ * translator is free to move them, which word order in other languages requires).
+ * Anything a caller interpolates INTO a `markup` value must be escaped by that caller.
+ */
+function trHtml(
+  locale: Locale,
+  key: string,
+  fallback: string,
+  markup: Record<string, string> = {},
+): string {
+  let out = escapeHtml(trSlots(locale, key, fallback, Object.keys(markup)));
+  for (const [slot, html] of Object.entries(markup)) out = out.split(`{${slot}}`).join(html);
+  return out;
+}
+
+/** A page builder's locale-bound translator, so neither document repeats the binding. */
+function pageT(locale: Locale) {
+  return (key: string, fallback: string, markup?: Record<string, string>) =>
+    trHtml(locale, key, fallback, markup);
+}
+
+/**
+ * A `<code>` element holding a left-to-right technical string (a URL, a path).
+ *
+ * On an RTL page the bidi algorithm reorders these against the surrounding text — two
+ * URLs in one sentence swap visually and the reader cannot tell which is which — so an
+ * RTL document pins them with `dir="ltr"`. LTR pages emit the bare tag they always did.
+ */
+function ltrCode(locale: Locale, inner: string): string {
+  return RTL_LOCALES.has(locale) ? `<code dir="ltr">${inner}</code>` : `<code>${inner}</code>`;
+}
+
+/**
+ * Serialize a value for embedding in an inline `<script>`.
+ *
+ * `JSON.stringify` does not escape `<`, so a value containing `</script>` would close the
+ * element early and the remainder would render as page text. The `<` escape is the
+ * same character to a JS parser and inert to the HTML one. Now that catalog strings flow
+ * into these blocks, that is the difference between a bad translation and a broken page.
+ */
+function scriptJson(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, "\\u003C");
 }
 
 function tokenOk(req: IncomingMessage, expected?: string): boolean {
@@ -160,18 +291,40 @@ function serveLoraPreview(req: IncomingMessage, res: ServerResponse): void {
   createReadStream(abs).pipe(res);
 }
 
+/** English source for the landing page's subtitle — also its "is this page translated?"
+ *  probe, so it is named once rather than repeated at two call sites that could drift. */
+const LANDING_SUBTITLE_EN =
+  "Control plane for the panel orchestrator — MCP servers, OAuth, and service settings. The ComfyUI sidebar panel stays focused on chat, providers, and the live canvas.";
+
 function consoleLandingHtml(opts: {
   bridgePort: number;
   consolePort: number;
   comfyuiUrl: string;
+  locale: Locale;
 }): string {
   const { bridgePort, consolePort, comfyuiUrl } = opts;
+  // The subtitle is the probe: the longest sentence on the page, so a translation of it
+  // is never accidentally identical to the English.
+  const locale = renderedLocale(opts.locale, "console.landing.subtitle", LANDING_SUBTITLE_EN);
+  const t = pageT(locale);
+  // The status line is written with innerHTML (it carries its own <span>), so these
+  // strings are HTML-escaped like the rest of the page BEFORE being serialized into the
+  // script — `t()` does that — and the object goes through scriptJson so no translation
+  // can close the <script> element either.
+  const T = scriptJson({
+    running: t("console.landing.status.running", "Orchestrator running"),
+    none: t("console.landing.status.none", "no backends"),
+    ready: t("console.landing.status.ready", "ready"),
+    signIn: t("console.landing.status.sign_in", "sign in"),
+    installCli: t("console.landing.status.install_cli", "install CLI"),
+    failed: t("console.landing.status.failed", "Could not load status"),
+  });
   return `<!DOCTYPE html>
-<html lang="en">
+<html ${htmlAttrs(locale)}>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ComfyUI MCP Console</title>
+  <title>${t("console.landing.title", "ComfyUI MCP Console")}</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
     body { margin: 0; background: #0f1115; color: #e8eaed; line-height: 1.5; }
@@ -180,7 +333,9 @@ function consoleLandingHtml(opts: {
     .sub { color: #9aa0a6; font-size: 0.9rem; margin-bottom: 1.5rem; }
     section { background: #181b22; border: 1px solid #2a2f3a; border-radius: 10px; padding: 1rem 1.1rem; margin-bottom: 1rem; }
     h2 { font-size: 0.95rem; margin: 0 0 0.6rem; color: #c4c7ce; }
-    ul { margin: 0.4rem 0 0; padding-left: 1.2rem; }
+    /* padding-INLINE-start, not padding-left: identical in LTR, but on an RTL page the
+       physical property reserves the gutter on the wrong side and the bullets overhang. */
+    ul { margin: 0.4rem 0 0; padding-inline-start: 1.2rem; }
     li { margin: 0.25rem 0; }
     code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
     pre { background: #0b0d11; border: 1px solid #2a2f3a; border-radius: 8px; padding: 0.75rem; overflow-x: auto; }
@@ -192,76 +347,107 @@ function consoleLandingHtml(opts: {
 </head>
 <body>
   <main>
-    <h1>ComfyUI MCP Console</h1>
-    <p class="sub">Control plane for the panel orchestrator — MCP servers, OAuth, and service settings. The ComfyUI sidebar panel stays focused on chat, providers, and the live canvas.</p>
+    <h1>${t("console.landing.title", "ComfyUI MCP Console")}</h1>
+    <p class="sub">${t("console.landing.subtitle", LANDING_SUBTITLE_EN)}</p>
 
     <section>
-      <h2>Connection</h2>
-      <p>Bridge <code>ws://127.0.0.1:${bridgePort}</code> · ComfyUI <code>${escapeHtml(comfyuiUrl)}</code></p>
-      <p id="status">Loading provider readiness…</p>
+      <h2>${t("console.landing.connection.heading", "Connection")}</h2>
+      <p>${t("console.landing.connection.endpoints", "Bridge {bridge} · ComfyUI {comfyui}", {
+        bridge: ltrCode(locale, `ws://127.0.0.1:${bridgePort}`),
+        comfyui: ltrCode(locale, escapeHtml(comfyuiUrl)),
+      })}</p>
+      <p id="status">${t("console.landing.status.loading", "Loading provider readiness…")}</p>
     </section>
 
     <section>
-      <h2>Coming here (panel stays in ComfyUI)</h2>
+      <h2>${t("console.landing.here.heading", "Coming here (panel stays in ComfyUI)")}</h2>
       <ul>
-        <li>Start / stop / restart orchestrator</li>
-        <li>MCP server mappings &amp; inherited <code>~/.claude.json</code> tools</li>
-        <li>OAuth &amp; API provider sign-in</li>
-        <li>LoRA library, image collections, Photomap-style tooling</li>
-        <li>A2UI-rich tool surfaces</li>
+        <li>${t("console.landing.here.lifecycle", "Start / stop / restart orchestrator")}</li>
+        <li>${t("console.landing.here.mcp", "MCP server mappings & inherited {file} tools", {
+          file: ltrCode(locale, "~/.claude.json"),
+        })}</li>
+        <li>${t("console.landing.here.oauth", "OAuth & API provider sign-in")}</li>
+        <li>${t("console.landing.here.library", "LoRA library, image collections, Photomap-style tooling")}</li>
+        <li>${t("console.landing.here.a2ui", "A2UI-rich tool surfaces")}</li>
       </ul>
     </section>
 
     <section>
-      <h2>Stays in the ComfyUI panel</h2>
+      <h2>${t("console.landing.panel.heading", "Stays in the ComfyUI panel")}</h2>
       <ul>
-        <li>Provider / model / effort pickers &amp; context window meter</li>
-        <li>Video storyboards &amp; live graph edits</li>
-        <li>Connect / Disconnect to this bridge</li>
+        <li>${t("console.landing.panel.pickers", "Provider / model / effort pickers & context window meter")}</li>
+        <li>${t("console.landing.panel.storyboards", "Video storyboards & live graph edits")}</li>
+        <li>${t("console.landing.panel.connect", "Connect / Disconnect to this bridge")}</li>
       </ul>
     </section>
 
     <section>
-      <h2>API</h2>
+      <h2>${t("console.landing.api.heading", "API")}</h2>
       <pre>GET /api/status</pre>
     </section>
   </main>
   <script>
+    const T = ${T};
     fetch('/api/status').then(r => r.json()).then(d => {
       const el = document.getElementById('status');
       const rows = (d.backends || []).map(b =>
-        b.backend + ': ' + (b.ready ? 'ready' : (b.cli ? 'sign in' : 'install CLI'))
+        b.backend + ': ' + (b.ready ? T.ready : (b.cli ? T.signIn : T.installCli))
       ).join(' · ');
-      el.innerHTML = '<span class="ok">Orchestrator running</span> — ' + (rows || 'no backends');
+      el.innerHTML = '<span class="ok">' + T.running + '</span> — ' + (rows || T.none);
     }).catch(() => {
-      document.getElementById('status').innerHTML = '<span class="warn">Could not load status</span>';
+      document.getElementById('status').innerHTML = '<span class="warn">' + T.failed + '</span>';
     });
   </script>
 </body>
 </html>`;
 }
 
+/** English source for the API Keys footer — also that page's "is this translated?" probe. */
+const CREDENTIALS_PRIVACY_EN = "Stored locally, per instance. Values never leave this machine.";
+
+/** English source for the token-rejection fragment; it is its own translation probe. */
+const UNAUTHORIZED_EN = "Unauthorized — reconnect the panel.";
+
 function credentialsHtml(
   slots: { id: string; label: string; help?: string }[],
   consoleUrl: string,
   token: string,
+  negotiatedLocale: Locale,
 ): string {
+  // Probe on the footer sentence — the page's one piece of real prose; the rest is single
+  // words a catalog might legitimately leave as-is. See renderedLocale.
+  const locale = renderedLocale(negotiatedLocale, "console.credentials.privacy", CREDENTIALS_PRIVACY_EN);
+  const t = pageT(locale);
   const rows = slots
     .map(
       (s) => `      <div class="row" data-slot="${escapeHtml(s.id)}">
         <div class="meta"><span class="label">${escapeHtml(s.label)}</span>${s.help ? `<span class="help">${escapeHtml(s.help)}</span>` : ""}</div>
         <div class="state"><span class="badge" data-badge>—</span></div>
-        <div class="entry"><input type="password" placeholder="Paste key…" data-input autocomplete="off" spellcheck="false" /><button data-save>Save</button></div>
+        <div class="entry"><input type="password" placeholder="${t("console.credentials.paste_key", "Paste key…")}" data-input autocomplete="off" spellcheck="false" /><button data-save>${t("console.credentials.save", "Save")}</button></div>
       </div>`,
     )
     .join("\n");
-  const cfg = JSON.stringify({ consoleUrl, token });
+  const cfg = scriptJson({ consoleUrl, token });
+  // Unlike the landing page's status line, every string below is assigned to
+  // `textContent`, never innerHTML — so these are NOT HTML-escaped (`&` would show up as
+  // "&amp;" on screen); scriptJson alone keeps them from escaping the <script>.
+  const T = scriptJson({
+    loadFailed: trFor(locale, "console.credentials.load_failed", "Could not load status — reconnect the panel."),
+    // `{masked}` is the masked key itself — a translation that drops it turns the badge
+    // into a bare "set" and loses the confirmation the row exists to give.
+    set: trSlots(locale, "console.credentials.badge_set", "set · {masked}", ["masked"]),
+    notSet: trFor(locale, "console.credentials.badge_unset", "not set"),
+    saving: trFor(locale, "console.credentials.saving", "Saving…"),
+    saved: trFor(locale, "console.credentials.saved", "Saved ✓"),
+    save: trFor(locale, "console.credentials.save", "Save"),
+    saveFailed: trFor(locale, "console.credentials.save_failed", "save failed"),
+  });
   return `<!DOCTYPE html>
-<html lang="en">
+<html ${htmlAttrs(locale)}>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>API Keys</title>
+  <title>${t("console.credentials.title", "API Keys")}</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
     body { margin: 0; background: #0f1115; color: #e8eaed; }
@@ -288,18 +474,19 @@ function credentialsHtml(
 </head>
 <body>
   <main>
-    <header><h1>API Keys</h1><button class="close" data-close title="Close">✕</button></header>
+    <header><h1>${t("console.credentials.title", "API Keys")}</h1><button class="close" data-close title="${t("console.credentials.close", "Close")}">✕</button></header>
     <div id="rows">
 ${rows}
     </div>
     <p class="err" id="err"></p>
     <footer>
-      <span class="help">Stored locally, per instance. Values never leave this machine.</span>
-      <button class="advanced" data-advanced>Advanced ↗</button>
+      <span class="help">${t("console.credentials.privacy", CREDENTIALS_PRIVACY_EN)}</span>
+      <button class="advanced" data-advanced>${t("console.credentials.advanced", "Advanced ↗")}</button>
     </footer>
   </main>
   <script>
     const CFG = ${cfg};
+    const T = ${T};
     const q = (t) => "?token=" + encodeURIComponent(t);
     function postHeight() {
       try { parent.postMessage({ type: "resize", height: document.body.scrollHeight }, "*"); } catch {}
@@ -312,10 +499,10 @@ ${rows}
           const row = document.querySelector('.row[data-slot="' + s.id + '"]');
           if (!row) continue;
           const badge = row.querySelector("[data-badge]");
-          badge.textContent = s.set ? "set · " + s.masked : "not set";
+          badge.textContent = s.set ? T.set.replace("{masked}", () => s.masked) : T.notSet;
           badge.classList.toggle("set", !!s.set);
         }
-      } catch (e) { document.getElementById("err").textContent = "Could not load status — reconnect the panel."; }
+      } catch (e) { document.getElementById("err").textContent = T.loadFailed; }
       postHeight();
     }
     document.querySelectorAll(".row").forEach((row) => {
@@ -324,22 +511,22 @@ ${rows}
       btn.addEventListener("click", async () => {
         const value = input.value.trim();
         if (!value) return;
-        btn.disabled = true; btn.textContent = "Saving…";
+        btn.disabled = true; btn.textContent = T.saving;
         try {
           const r = await fetch("/api/secrets" + q(CFG.token), {
             method: "POST", headers: { "content-type": "application/json" },
             body: JSON.stringify({ slot: row.dataset.slot, value }),
           });
           const d = await r.json();
-          if (!r.ok || !d.ok) throw new Error(d.error || "save failed");
+          if (!r.ok || !d.ok) throw new Error(d.error || T.saveFailed);
           input.value = "";
           const badge = row.querySelector("[data-badge]");
-          badge.textContent = "set · " + d.masked; badge.classList.add("set");
-          btn.textContent = "Saved ✓"; btn.classList.add("ok");
-          setTimeout(() => { btn.textContent = "Save"; btn.classList.remove("ok"); btn.disabled = false; }, 1500);
+          badge.textContent = T.set.replace("{masked}", () => d.masked); badge.classList.add("set");
+          btn.textContent = T.saved; btn.classList.add("ok");
+          setTimeout(() => { btn.textContent = T.save; btn.classList.remove("ok"); btn.disabled = false; }, 1500);
         } catch (e) {
           document.getElementById("err").textContent = String(e.message || e);
-          btn.textContent = "Save"; btn.disabled = false;
+          btn.textContent = T.save; btn.disabled = false;
         }
       });
     });
@@ -632,6 +819,12 @@ export function startPanelConsoleHttpServer(opts: {
           // Built from the one shared list, so a new obligation on the receipt
           // reaches this endpoint without anyone remembering to wire it up here.
           const warnings = [
+            // The slot fan-out suspends per-alias emits and makes ONE at the end, so the
+            // respawn cost belongs to the OUTCOME, not to any single receipt — every
+            // receipt here carries an empty list by construction. Rendering only the
+            // receipts is why this endpoint warned about nothing while orphaning the same
+            // transfers the agent-facing path warns about (codex).
+            ...(atRiskNote(outcome.atRiskDownloads, undefined) ? [atRiskNote(outcome.atRiskDownloads, undefined)!] : []),
             ...outcome.receipts.flatMap((r) => receiptDisclosures(r)),
             // A confirmed slot save performs no rollback, so this is normally
             // empty — but it is included from the same place either way, so the
@@ -675,10 +868,28 @@ export function startPanelConsoleHttpServer(opts: {
       return;
     }
     if (req.method === "GET" && path === "/credentials") {
-      if (!tokenOk(req, opts.token)) { sendHtml(res, 401, "<p>Unauthorized — reconnect the panel.</p>"); return; }
+      // The rejection is a page the same person reads, so it follows the same language as
+      // the page they were trying to open — not English-only because the token was wrong.
+      const locale = pageLocale(req);
+      if (!tokenOk(req, opts.token)) {
+        // A bare fragment has no <html> to carry the language, so the <p> carries it —
+        // otherwise an Arabic or Persian rejection lays out left-to-right. The fragment
+        // is a single sentence, so it is its own translated-or-not probe.
+        const shown = renderedLocale(locale, "console.unauthorized", UNAUTHORIZED_EN);
+        sendHtml(
+          res,
+          401,
+          `<p ${htmlAttrs(shown)}>${trHtml(shown, "console.unauthorized", UNAUTHORIZED_EN)}</p>`,
+        );
+        return;
+      }
       const bound = server.address();
       const boundPort = bound && typeof bound === "object" ? bound.port : opts.port;
-      sendFramedHtml(res, 200, credentialsHtml(CREDENTIAL_SLOTS, `http://${host}:${boundPort}`, opts.token ?? ""));
+      sendFramedHtml(
+        res,
+        200,
+        credentialsHtml(CREDENTIAL_SLOTS, `http://${host}:${boundPort}`, opts.token ?? "", locale),
+      );
       return;
     }
     if (req.method === "GET" && (path === "/" || path === "/console")) {
@@ -689,6 +900,7 @@ export function startPanelConsoleHttpServer(opts: {
           bridgePort: opts.bridgePort,
           consolePort: opts.port,
           comfyuiUrl: opts.comfyuiUrl,
+          locale: pageLocale(req),
         }),
       );
       return;

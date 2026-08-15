@@ -14,7 +14,14 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     name: Build (${{ matrix.os }})
     steps:
+      # fetch-depth: 0 because `npm test` runs check:blog-stale, which asks git WHEN a pack
+      # last changed. The default depth-1 clone holds a single commit, so every path looks
+      # like it was introduced by the tip — the gate then reports every stamped post as stale.
+      # (The gate now detects a shallow clone and skips rather than lying, so without this it
+      # would still pass — it would just be inert here, which is where it needs to run.)
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:

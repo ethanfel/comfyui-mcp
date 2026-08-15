@@ -94,6 +94,7 @@ import {
 } from "../../orchestrator/pi-backend.js";
 import { backendReadiness } from "../../orchestrator/backend-readiness.js";
 import { PI_ENV_API_KEYS } from "../../orchestrator/pi-credentials.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 const FAKE_BIN = join(tmpdir(), "fake-pi", "pi.exe");
 
@@ -541,7 +542,7 @@ describe("PiBackend turns", () => {
     const drain = (async () => {
       for await (const ev of gen) events.push(ev);
     })();
-    await vi.waitFor(() => expect(hoisted.spawns.length).toBe(1));
+    await waitFor(() => expect(hoisted.spawns.length).toBe(1));
     await backend.interrupt();
     await drain;
     expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);

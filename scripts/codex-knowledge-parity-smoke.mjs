@@ -18,12 +18,20 @@
 //      a full SKILL.md is slow).
 
 import { spawn } from "node:child_process";
+import { makeGraph, parityVerdict, MOCK_WORKFLOW_UUID } from "./knowledge-parity-mock-graph.mjs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fs from "node:fs";
 import net from "node:net";
 import { WebSocket } from "ws";
+
+/** Panel version the mock advertises (#1384). Kept in step with the product's own derived
+ *  fence minimum by src/__tests__/scripts/knowledge-parity-mock-version.test.ts — a raised
+ *  floor fails that test instead of silently refusing every graph write in the smoke. */
+const MOCK_PANEL_VERSION = "0.13.0";
+/** A well-formed workflow uuid, so the per-command stamp fence has something to fence on. */
+// MOCK_WORKFLOW_UUID is imported above — it belongs with the executors that answer with it.
 
 const PORT = Number(process.env.TEST_PORT || 9151);
 const MCP_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
@@ -32,45 +40,6 @@ const DEAD_COMFY = "http://127.0.0.1:9";
 const CAP_MS = Number(process.env.SCENARIO_CAP_MS || 240000);
 const TRACE = join(tmpdir(), `comfyui-mcp-tooltrace-${PORT}-${Date.now()}.jsonl`);
 
-function makeGraph() {
-  let seq = 0;
-  const nodes = new Map();
-  const add = (type, title) => {
-    const id = ++seq;
-    nodes.set(id, {
-      id, type, title: title || type, is_subgraph: false,
-      widgets: { value: 0, text: "" },
-      inputs: [{ name: "in0", type: "*", link: null }, { name: "model", type: "MODEL", link: null }],
-      outputs: [{ name: "out0", type: "*", links: [] }, { name: "MODEL", type: "MODEL", links: [] }],
-    });
-    return nodes.get(id);
-  };
-  const brief = (n) => ({ id: n.id, type: n.type, title: n.title, is_subgraph: !!n.is_subgraph, widgets: n.widgets, inputs: n.inputs, outputs: n.outputs });
-  const need = (id) => { const n = nodes.get(Number(id)); if (!n) throw new Error(`No node ${id}`); return n; };
-  const EXEC = {
-    graph_get_state: () => ({ viewing: { scope: "root" }, node_count: nodes.size, truncated: false, nodes: [...nodes.values()].map(brief) }),
-    graph_add_node: ({ class_type, title }) => { if (!class_type) throw new Error("class_type required"); return { added: brief(add(class_type, title)) }; },
-    graph_remove_node: ({ node_id }) => { const n = need(node_id); nodes.delete(Number(node_id)); return { removed: brief(n) }; },
-    graph_clear: () => { const c = nodes.size; nodes.clear(); return { cleared: c }; },
-    graph_connect: ({ from_node_id, to_node_id }) => ({ connected: { from: { node_id: from_node_id }, to: { node_id: to_node_id } } }),
-    graph_disconnect: ({ node_id }) => ({ disconnected: { node_id } }),
-    graph_set_widget: ({ node_id, widget, value }) => { const n = need(node_id); const p = n.widgets[widget]; n.widgets[widget] = value; return { set: { node_id, widget, previous: p, value } }; },
-    graph_set_title: ({ node_id, title }) => { const n = need(node_id); const p = n.title; n.title = title; return { node_id, previous: p, title }; },
-    graph_move_node: ({ node_id, pos }) => ({ moved: { node_id, to: pos } }),
-    graph_canvas: ({ action }) => ({ canvas: { action } }),
-    graph_run: ({ batch_count }) => ({ queued: true, batch_count: batch_count ?? 1 }),
-    graph_get_errors: () => ({ last_execution_error: null, node_errors: null, note: "no errors" }),
-    workflow_save: () => ({ saved: true }),
-    workflow_save_as: ({ name }) => ({ saved_as: `workflows/${name}.json` }),
-    workflow_new: () => ({ created: true }),
-    workflow_open: ({ path }) => ({ opened: { path } }),
-    workflow_list: () => ({ active: { path: "workflows/current.json", filename: "current.json", key: "cur" }, open: [] }),
-    graph_select_nodes: ({ node_ids }) => ({ selected: node_ids }),
-    set_todo: ({ items }) => ({ ok: true, count: (items || []).length }),
-    ask_user: (m) => (m.options && m.options[0] && m.options[0].label) || "yes",
-  };
-  return { nodes, EXEC };
-}
 
 function waitForPort(port, timeoutMs = 30000) {
   const start = Date.now();
@@ -84,13 +53,43 @@ function waitForPort(port, timeoutMs = 30000) {
   });
 }
 
+/** Wait for a line to appear in a log file the child is writing. */
+function waitForLine(path, needle, timeoutMs = 60000) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      let text = "";
+      try {
+        text = fs.readFileSync(path, "utf8");
+      } catch {
+        // Not created yet.
+      }
+      if (text.includes(needle)) return resolve(true);
+      if (Date.now() - start > timeoutMs) {
+        return reject(new Error(`timed out waiting for "${needle}" in ${path}`));
+      }
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
+}
+
 function runScenario(task) {
   return new Promise((resolve) => {
     const { nodes, EXEC } = makeGraph();
     const commands = [];
     const says = [];
     let done = false, idleTimer = null;
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
+    // SEND AN ORIGIN, because a real panel does (#1384). A browser sets this header on the
+    // upgrade and forbids page JS from overriding it, so the bridge treats it as trusted
+    // provenance of the page the socket runs in — and refuses every graph EDIT without one.
+    // The `ws` library sends no Origin by default, so the mock read as a relay connection
+    // of unknown provenance and the smoke reported a knowledge failure that was really its
+    // own handshake. The refusal is correct product behaviour; the mock was the thing
+    // pretending to be a browser without doing what a browser does.
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`, {
+      headers: { Origin: DEAD_COMFY },
+    });
     const hard = setTimeout(finish, CAP_MS);
     function finish() {
       if (done) return; done = true;
@@ -101,7 +100,30 @@ function runScenario(task) {
       resolve({ counts, says, finalNodes: nodes.size });
     }
     ws.on("open", () => {
-      ws.send(JSON.stringify({ type: "hello", tab_id: `codex-kp-smoke`, title: "smoke" }));
+      // #1384 — ADVERTISE A PANEL VERSION AND THE FENCE CAPABILITIES.
+      //
+      // The hello carried only tab_id and title, so the graph-write fence refused
+      // `graph_clear` before the mock executor ever saw it: "this tab advertised NO panel
+      // version". The smoke exercises graph writes, so a mock that cannot pass the write
+      // fence tests nothing it claims to.
+      //
+      // MOCK_PANEL_VERSION is asserted against the product's own derived minimum by
+      // src/__tests__/scripts/knowledge-parity-mock-version.test.ts. A literal here is a
+      // second copy of a number the code already computes — it went stale once (the fence
+      // floor moved to 0.11.35) and would have again, since #1359 raised
+      // requiredPanelVersion() to 0.13.0. The ratchet makes a raised floor fail a test
+      // that names this file, instead of surfacing months later as a fence bug.
+      ws.send(
+        JSON.stringify({
+          type: "hello",
+          tab_id: `codex-kp-smoke`,
+          title: "smoke",
+          panel_version: MOCK_PANEL_VERSION,
+          enforces_workflow_stamp: true,
+          enforces_workflow_stamp_at_write: true,
+          workflow_uuid: MOCK_WORKFLOW_UUID,
+        }),
+      );
       setTimeout(() => { console.log(`   -> TASK: ${task}`); ws.send(JSON.stringify({ type: "user_message", text: task })); }, 1500);
     });
     ws.on("message", (buf) => {
@@ -109,7 +131,37 @@ function runScenario(task) {
       if (typeof m.rid === "string" && typeof m.cmd === "string") {
         commands.push(m.cmd);
         let reply;
-        try { const fn = EXEC[m.cmd]; if (!fn) throw new Error(`unknown ${m.cmd}`); reply = { rid: m.rid, ok: true, result: fn(m) }; }
+        // ENFORCE THE STAMP WE ADVERTISE (#1384, codex). The hello claims
+        // `enforces_workflow_stamp` and `enforces_workflow_stamp_at_write`; a mock that
+        // claims them and then executes whatever arrives is certifying behaviour it does
+        // not have, so the smoke would pass against a stale-stamp bug that a real panel
+        // refuses. A command carrying no stamp is left alone — reads are not fenced.
+        const stamp = m.workflow_uuid ?? m.expected_workflow_uuid;
+        if (typeof stamp === "string" && stamp !== MOCK_WORKFLOW_UUID) {
+          ws.send(
+            JSON.stringify({
+              rid: m.rid,
+              ok: false,
+              error: `workflow stamp mismatch: command carried ${stamp}, this tab holds ${MOCK_WORKFLOW_UUID}`,
+            }),
+          );
+          return;
+        }
+        try {
+          const fn = EXEC[m.cmd];
+          // SAY WHAT THIS IS. `unknown graph_outline` from a tab advertising a current
+          // panel version reads as a product defect, and an agent with a bug-report tool
+          // will file it as one. Naming the harness in the error costs nothing and stops
+          // the next run from opening an issue about a stub.
+          if (!fn)
+            throw new Error(
+              `unknown ${m.cmd} — this tab is the knowledge-parity SMOKE MOCK ` +
+                `(scripts/codex-knowledge-parity-smoke.mjs), not a real panel. It implements a ` +
+                `subset of the bridge. Do not file this as a panel defect; work with what is ` +
+                `available or say the command is unavailable here.`,
+            );
+          reply = { rid: m.rid, ok: true, result: fn(m) };
+        }
         catch (e) { reply = { rid: m.rid, ok: false, error: e.message }; }
         console.log(`   <cmd ${m.cmd}>`);
         try { ws.send(JSON.stringify(reply)); } catch {}
@@ -152,7 +204,22 @@ async function main() {
   const orch = spawn(process.execPath, [MCP_ENTRY, "--panel-orchestrator"], { env, stdio: ["ignore", logFd, logFd] });
   let exitCode = 1;
   try {
+    // WAIT FOR THE ORCHESTRATOR TO SAY IT IS READY (#1384).
+    //
+    // The bridge binds FIRST and the per-tab message handler is installed much later —
+    // ~4 seconds apart on this machine. Probing the bridge port declared the orchestrator
+    // "up" while it was still booting, so the scenario's user_message arrived before
+    // `onPanelMessage` existed and was dropped: the run reported "Codex consulted bundled
+    // skills: NO" with an EMPTY tool trace, a harness race indistinguishable in the output
+    // from the knowledge failure this smoke exists to detect.
+    //
+    // Waiting for a LATER PORT is not a fix either (codex): the console binds before the
+    // handler is installed, and COMFYUI_MCP_CONSOLE_PORT can move it, so a hard-coded
+    // PORT+3 can wait for something that never binds. The "ready" line is printed after
+    // the handler is in place, and it is the orchestrator's own statement rather than an
+    // inference from one of its side effects.
     await waitForPort(PORT);
+    await waitForLine(logPath, "[panel-orchestrator] ready —");
     console.log("[kp-smoke] orchestrator up.\n");
 
     console.log("• Scenario: set up a krea2 workflow on my canvas");
@@ -178,7 +245,11 @@ async function main() {
     const discovery = calledListSkills || calledReadSkill || calledListPacks || calledReadPack;
     // Applied ready expertise = read the pack workflow (the expert graph) and/or
     // built nodes on the canvas from it.
-    const builtOnCanvas = (r.counts.graph_add_node || 0) >= 1;
+    // THE CANVAS, not one command that changes it (codex). The PREFERRED path is a single
+    // `graph_load` of the pack's ready workflow, which populates the canvas without a single
+    // `graph_add_node` — so counting adds alone failed the very route this smoke is meant to
+    // reward.
+    const builtOnCanvas = r.finalNodes > 0 || (r.counts.graph_add_node || 0) >= 1;
     const appliedPack = calledReadPack || discoveredKrea2;
 
     console.log(`\n===== CODEX KNOWLEDGE-PARITY SMOKE =====`);
@@ -192,8 +263,11 @@ async function main() {
     console.log(`Codex applied the pack / read its ready workflow: ${appliedPack ? "YES" : "NO"}`);
     console.log(`Codex built nodes on the live canvas: ${builtOnCanvas ? "YES" : "NO"}`);
 
-    // PASS = it discovered the family knowledge AND used the ready pack expertise.
-    exitCode = discovery && discoveredKrea2 ? 0 : 1;
+    // PASS = it discovered the family knowledge, used the ready pack expertise, AND the
+    // canvas actually changed. `builtOnCanvas` was printed as a criterion and then left out
+    // of the verdict (codex), so a run that read the pack and applied NOTHING — the
+    // zero-node load this file also fixes — passed while reporting "built nodes: NO".
+    exitCode = parityVerdict({ discovery, discoveredKrea2, appliedPack, builtOnCanvas }) ? 0 : 1;
     console.log(`\n${exitCode === 0 ? "PASS" : "FAIL"} — knowledge parity ${exitCode === 0 ? "achieved" : "NOT achieved"}.`);
   } catch (e) {
     console.error("[kp-smoke] ERROR:", e.message);

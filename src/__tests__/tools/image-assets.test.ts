@@ -178,6 +178,11 @@ describe("image/asset registration", () => {
       "histogram",
       "limit",
       "lossless",
+      // #1495 — the two knobs on the inline preview budget. Listed here on purpose: this
+      // assertion is the surface gate, so a parameter cannot appear without someone
+      // deciding it should.
+      "max_preview_bytes",
+      "max_preview_dimension",
       "out_path",
       "path",
       "pattern",
@@ -313,7 +318,11 @@ describe("get_image: each action reaches exactly one service", () => {
 
   it('action:"get" forwards filename/type/subfolder and the allowMedia flag unchanged', async () => {
     await getImage()({ action: "get", filename: "p.png", type: "temp", subfolder: "sub" });
-    expect(getOutputImageMock).toHaveBeenCalledWith("p.png", "temp", "sub", { allowMedia: true });
+    expect(getOutputImageMock).toHaveBeenCalledWith("p.png", "temp", "sub", {
+      allowMedia: true,
+      // #1373 — the input dir legitimately holds workflow .json files.
+      allowJson: true,
+    });
   });
 
   it('action:"get" still defaults type/subfolder in the handler, not the schema', async () => {
@@ -321,7 +330,10 @@ describe("get_image: each action reaches exactly one service", () => {
     // the OTHER actions that share them; the get branch supplies the same
     // defaults it always did.
     await getImage()({ action: "get", filename: "p.png" });
-    expect(getOutputImageMock).toHaveBeenCalledWith("p.png", "output", "", { allowMedia: true });
+    expect(getOutputImageMock).toHaveBeenCalledWith("p.png", "output", "", {
+      allowMedia: true,
+      allowJson: true,
+    });
   });
 
   it('action:"convert" forwards exactly the encoder options the retired converter took', async () => {
@@ -552,7 +564,10 @@ describe("guards test ABSENCE, never falsiness", () => {
   // A `!x` guard would swallow that path and substitute generic text.
   it('get_image action:"get" forwards an empty filename to the service', async () => {
     await getImage()({ action: "get", filename: "" });
-    expect(getOutputImageMock).toHaveBeenCalledWith("", "output", "", { allowMedia: true });
+    expect(getOutputImageMock).toHaveBeenCalledWith("", "output", "", {
+      allowMedia: true,
+      allowJson: true,
+    });
   });
 
   it('get_image action:"view"/"asset_metadata" forward an empty asset_id', async () => {

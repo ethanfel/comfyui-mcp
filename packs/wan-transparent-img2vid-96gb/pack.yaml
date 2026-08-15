@@ -1,17 +1,19 @@
-name: wan-transparent-img2vid
-display_name: WAN 2.2 Transparent Expressions — Image to Video
+name: wan-transparent-img2vid-96gb
+display_name: WAN 2.2 Transparent Expressions — Image to Video (96GB fp16)
 family: wan
 kind: img2vid
 description: >-
   WAN 2.2 image-to-video workflow that renders transparent-background animated
   character expressions (looping, pingpong WebP + GIF with an alpha channel) for
-  use as SillyTavern expression sprites. Drives the WAN 2.2 I2V A14B (Q8_0 GGUF)
-  high/low-noise UNets with the 4-step Lightning I2V LoRAs, then cuts the subject
+  use as SillyTavern expression sprites. Drives the FULL fp16 WAN 2.2 I2V A14B
+  UNets via UNETLoader (26.6GB each, not GGUF — this is the 96GB tier; use
+  wan-transparent-img2vid for the GGUF quants) with the 4-step Lightning I2V
+  LoRAs, then cuts the subject
   out per-frame with the ComfyUI-RMBG BiRefNetRMBG node (Alpha output, the
   BiRefNet_toonout matting model) so the exported animation has a transparent
   background. Single-pipeline graph sliced from the wan-transparent monolith
   (one "WAN 2.2 IMAGE TO VIDEO" group, un-bypassed into a standalone graph).
-vram: "12-24GB (Q8_0 I2V; drop to a smaller GGUF quant for <12GB)"
+vram: "96GB (full fp16 I2V A14B, 26.6GB per UNet, --highvram); OOMs on 24GB — use wan-transparent-img2vid for GGUF"
 workflow: workflow.json
 skill: wan-t2v-video
 launch_args: []
@@ -29,9 +31,11 @@ notes:
     node (ComfyUI-RMBG) removes the background per frame and outputs RGBA using the
     BiRefNet_toonout model; VHS_VideoCombine then exports a lossless pingpong WebP
     and a GIF with the alpha preserved.
-  - Base WAN 2.2 weights (VAE, umt5 text encoder, I2V high/low UNets, Lightning I2V
-    LoRAs) come from the WAN 2.2 ULTRA installer mirror; this pack only pulls the
-    subset the transparent workflow references (I2V branch, Q8_0).
+  - Base WAN 2.2 weights (VAE, umt5 text encoder, Lightning I2V LoRAs) come from
+    the WAN 2.2 ULTRA installer mirror; the I2V high/low UNets are the full fp16
+    Comfy-Org repackaged weights (diffusion_models/wan2.2_i2v_*_14B_fp16.safetensors,
+    26.6GB each, loaded with UNETLoader). Launch ComfyUI with --highvram. For
+    anything smaller than a 96GB card, install wan-transparent-img2vid instead.
   - >-
     Torch/CUDA fix — if a custom node (e.g. ComfyUI-RMBG) drags in a Torch
     version that breaks CUDA, reinstall the matching CUDA build, e.g.

@@ -1035,6 +1035,107 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     expect(fetchSpy).toHaveBeenCalled();
   });
 
+  it("#1341: a bundle whose BINARY is branded differently is still the supervisor", async () => {
+    // The reporter's live mac: backend PID parented by a healthy
+    // `/Applications/ComfyUI.app/Contents/MacOS/Comfy Desktop` (ComfyUI Desktop
+    // 1.0.38). The matcher tied the two names together with a backreference, on the
+    // convention that a bundle's binary is named after the bundle — which current
+    // packaging does not follow. So a real supervisor was rejected, the ancestry walk
+    // ran to PID 1, and the tool refused a safe restart with "no Desktop app is still
+    // supervising it — its parent process is gone."
+    //
+    // This is the COMMAND-LINE branch, which is the one macOS actually takes: `ps` has
+    // no authenticated-executable column, so a Desktop-managed mac never reaches the
+    // executablePath check. Fixing only that one would have left this untouched.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine: "/Applications/ComfyUI.app/Contents/MacOS/Comfy Desktop",
+          startedAt: "2000",
+          parentPid: 1,
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => {
+      if (pid === 4321) return 300;
+      if (pid === 300) return 1;
+      return undefined;
+    });
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    // Recognised as supervised: the restart proceeds rather than refusing.
+    expect(result.message).not.toMatch(/its parent process is gone/i);
+    expect(result.message).not.toMatch(/no Desktop app is still supervising/i);
+  });
+
+  it("#1341: the same, on the AUTHENTICATED executable path", async () => {
+    // The other half of the change. Both matchers carried the identical backreference.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine: "(unreadable)",
+          executablePath: "/Applications/ComfyUI.app/Contents/MacOS/Comfy Desktop",
+          startedAt: "2000",
+          parentPid: 1,
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => {
+      if (pid === 4321) return 300;
+      if (pid === 300) return 1;
+      return undefined;
+    });
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/its parent process is gone/i);
+  });
+
+  it("#1341: relaxing the NAME PAIR did not relax the name SET", async () => {
+    // The direction that would matter. Both halves are still drawn from the two
+    // trusted product names — dropping the requirement that they MATCH must not
+    // become "any bundle, any binary". A bundle that is not ours stays rejected even
+    // when its binary is branded like ours.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine: "/Applications/Malware.app/Contents/MacOS/Comfy Desktop",
+          startedAt: "2000",
+          parentPid: 1,
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => {
+      if (pid === 4321) return 300;
+      if (pid === 300) return 1;
+      return undefined;
+    });
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(killWasIssued()).toBe(false);
+  });
+
   it("a shim living INSIDE the bundle is not the bundle's shell", async () => {
     // The accidental sibling of the two forgeries the gate already caught. Accepting
     // any binary under `Contents/MacOS/` meant a launcher script or venv python that

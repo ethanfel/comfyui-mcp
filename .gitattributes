@@ -12,3 +12,12 @@
 docs/design/tool-surface.txt text eol=lf
 docs/design/panel-surface.txt text eol=lf
 docs/design/tool-vocabulary.json text eol=lf
+
+# Same reasoning, one gate later. `locales/en/main.json` is GENERATED from the
+# `tr()` call sites (scripts/i18n-build-en.mjs) and a test compares the committed
+# file to a fresh build byte for byte. `core.autocrlf` is on for most Windows
+# developers, so without this the checked-out file is CRLF, the build writes LF,
+# and that test fails on a clean clone for a reason nothing about it would
+# suggest. The translations are pinned alongside it so every catalog in the
+# directory is the same shape on every platform.
+locales/**/*.json text eol=lf

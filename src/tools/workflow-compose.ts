@@ -115,7 +115,13 @@ export function registerWorkflowComposeTools(server: McpServer): void {
       template: z
         .enum(TEMPLATE_NAMES as [string, ...string[]])
         .optional()
-        .describe('action:"create" (REQUIRED) — Template name: txt2img, img2img, upscale, or inpaint'),
+        // Interpolated, not hand-listed. The hand-written version said "txt2img, img2img,
+        // upscale, or inpaint" long after the set grew to ten, and it reads as exhaustive —
+        // so an agent never tried the six it did not name. The enum above is already built
+        // from TEMPLATE_NAMES; the prose now comes from the same source.
+        .describe(
+          `action:"create" (REQUIRED) — Template name, one of: ${TEMPLATE_NAMES.join(", ")}`,
+        ),
       params: z
         .record(z.string(), z.any())
         .optional()

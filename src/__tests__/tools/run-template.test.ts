@@ -38,6 +38,7 @@ vi.mock("../../comfyui/client.js", () => ({
 }));
 
 import { registerWorkflowExecuteTools } from "../../tools/workflow-execute.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   isError?: boolean;
@@ -258,7 +259,7 @@ describe('enqueue_workflow (action:"run_template")', () => {
 
     const p = handler({ action: "run_template", template: "anima-txt2img", wait: true, timeout_s: 30 });
     // first poll: not done → 1.5s sleep → second poll: done
-    await vi.waitFor(async () => {
+    await waitFor(async () => {
       const res = await p;
       const out = JSON.parse(res.content[0].text);
       expect(out.status).toBe("completed");

@@ -70,28 +70,30 @@ JavaScript).
    codex login   # ChatGPT (Codex)
    ```
 
-3. **Restart ComfyUI**, open the **Agent** tab, **pick a provider** (Claude /
-   ChatGPT chips), and click **Connect**. The panel starts that provider's
-   orchestrator (`npx -y comfyui-mcp@latest connect`) on your subscription and
-   links to its loopback bridge. Type a request and the agent responds.
-   **Disconnect** stops it.
+3. **Start the orchestrator** on your machine and leave it running — see
+   [Starting the panel orchestrator](./installation#3-starting-the-panel-orchestrator):
 
-No `claude mcp add`, no API key. The orchestrator is started **only when you click
-Connect** — never silently on load — and the panel auto-connects if a bridge is
-already running. Prerequisites are Node.js/`npx` on your PATH and the provider login
-above. To run an orchestrator yourself, turn on **Settings → General → "Use
-external/local orchestrator (advanced)"**, launch `npx -y comfyui-mcp@latest
-connect`, then click Connect — the panel links to the bridge that is already
-running instead of starting its own. Change the bridge port with
+   ```bash
+   npx -y comfyui-mcp@latest connect
+   ```
+
+4. **Restart ComfyUI**, open the **Agent** tab, **pick a provider** (Claude /
+   ChatGPT chips), and click **Connect**. The panel links to the orchestrator's
+   loopback bridge. Type a request and the agent responds. **Disconnect** unlinks
+   it; the orchestrator keeps running until you stop it.
+
+No `claude mcp add`, no API key. The panel is a pure-frontend extension and cannot
+spawn the orchestrator itself, so it is always a process you start — the panel
+auto-connects to a bridge that is already running. Prerequisites are Node.js/`npx`
+on your PATH and the provider login above. Change the bridge port with
 `COMFYUI_MCP_BRIDGE_PORT`.
 
 <Note>
 **Driving a remote ComfyUI** (a cloud GPU pod, another box on your LAN)? The setup
-above still applies, but the orchestrator needs to run **on your own machine**,
-not the remote box — turn on **Settings → General → "Use external/local
-orchestrator (advanced)"**, then click Connect. `connect <remote-url>` on your
-laptop handles the rest, including a secure tunnel back to the pod's HTTPS page.
-See [Cloud deployment](./cloud-deployment) for the full walkthrough.
+above still applies, but run the orchestrator **on your own machine**, not the
+remote box: `npx -y comfyui-mcp@latest connect <remote-url>` handles the rest,
+including a secure tunnel back to the pod's HTTPS page. Then click Connect in the
+panel. See [Cloud deployment](./cloud-deployment) for the full walkthrough.
 </Note>
 
 <Note>

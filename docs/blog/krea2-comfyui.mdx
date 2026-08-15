@@ -1,5 +1,5 @@
 ---
-title: "How to Run Krea 2 Locally in ComfyUI (2026 Guide)"
+title: "How to Run Krea 2 Locally in ComfyUI"
 description: "Run Krea 2 Turbo — Krea.ai's 12B open-weight text-to-image model — locally in ComfyUI. 8-step turbo speed, Qwen3-VL prompting, JSON area prompts, install, and VRAM tips."
 keywords:
   - Krea 2 ComfyUI
@@ -36,13 +36,16 @@ ComfyUI ≥ v0.26.0), pairing a **Qwen3-VL 4B** text encoder with the **Qwen ima
 VAE**. The Qwen3-VL encoder is what gives it sharp prompt adherence and the
 ability to read **structured JSON prompts** (more on that below).
 
-### The license actually lets you ship
+## Licensing
 
 Krea 2 is released under the
-[Krea 2 Community License](https://www.krea.ai/krea-2-licensing): **free
-commercial use** for individuals and businesses up to 50 seats, with an
-enterprise agreement beyond that. For most solo creators and small studios,
-that's a genuinely permissive "use it in production" license.
+[Krea 2 Community License](https://www.krea.ai/krea-2-licensing): commercial use
+is permitted while your **company-wide annual revenue is under $1,000,000 USD**,
+counting all affiliated entities under common ownership or control. At or above
+that, you need a separate enterprise license from Krea before any commercial use.
+The gate is revenue, not headcount — a small team inside a larger company is not
+covered. For solo creators and small studios that's a genuinely permissive "use it
+in production" license; check the license itself before shipping commercially.
 
 ## Krea 2 vs Z-Image, Ideogram 4, and Flux
 
@@ -158,8 +161,10 @@ behavior is intact.
 
 ## FAQ
 
-**Is Krea 2 free for commercial use?** Yes, under the Krea 2 Community License,
-up to 50 seats; larger orgs need an enterprise agreement.
+**Is Krea 2 free for commercial use?** Under the Krea 2 Community License, yes —
+while your company's total annual revenue is under **$1,000,000 USD**. At or above
+that threshold you need an enterprise license from Krea first. It is a revenue
+test, not a seat count.
 
 **Raw or Turbo?** Turbo for speed (8 steps); Raw if you want the un-distilled base
 for fine-tuning or maximum fidelity.

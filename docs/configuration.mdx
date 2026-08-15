@@ -274,6 +274,54 @@ available, HTTP polling otherwise).
   single step won't honor it immediately — this wait is what detects a true wedge.
 </ParamField>
 
+## Restricting the tool surface
+
+For a **hosted** deployment — a shared Open WebUI, a team frontend — the operator is not
+the person prompting. These variables withhold tools from the model entirely: a withheld
+tool is never registered, so it is absent from `tools/list`, absent from `call_tool`, and
+the model never learns it exists.
+
+<ParamField path="COMFYUI_MCP_TOOL_PRESET" type="string">
+  `safe` — everything except tools that change the machine or the model library.
+  Installing, deleting and restarting are withheld. **Rendering still works, and so do
+  the things that come with it**: queueing generations, `list_api_nodes` (hosted partner
+  nodes that spend PAID credits), and `report_issue` (files a public GitHub issue). Use
+  `readonly` if a shared frontend's users must not be able to spend or publish.
+  `readonly` — inspection only: no renders queued, nothing written, nothing spent.
+  Both also withhold the whole `panel_*` surface, which drives a live shared canvas.
+</ParamField>
+<ParamField path="COMFYUI_MCP_TOOL_DENY" type="string">
+  Comma-separated tool names to withhold, e.g. `restart_comfyui,download_model`. A
+  trailing `*` matches a family: `train_*`. Applied on top of any preset **and** on top
+  of an allow list.
+</ParamField>
+<ParamField path="COMFYUI_MCP_TOOL_ALLOW" type="string">
+  Comma-separated allow list. When set, the surface is **exactly** these tools — anything
+  not named is withheld even if no deny rule mentions it. Use it to opt individual tools
+  back in past a preset: `COMFYUI_MCP_TOOL_PRESET=safe` plus
+  `COMFYUI_MCP_TOOL_ALLOW=panel_graph_outline,panel_query_graph`.
+
+  Only an **exact name** opts a tool back in past a preset. A glob (`list_*`) narrows the
+  surface like any other entry but cannot re-open what a preset closed — otherwise
+  `ALLOW=list_*` would re-admit `list_packs`, whose `install_deps` action installs and
+  runs third-party code, and `ALLOW=*` would make every preset inert.
+</ParamField>
+
+```bash A hosted deployment that cannot install or restart anything
+COMFYUI_MCP_TOOL_PRESET=safe npx comfyui-mcp@latest --http --host 0.0.0.0 --port 9100
+```
+
+<Warning>
+  This is a boundary against the **model** and the people prompting it — not against
+  whoever sets the environment, who can simply unset it, and not a substitute for keeping
+  an untrusted party off the ComfyUI host.
+
+  A misconfiguration **refuses to start** rather than starting unrestricted: an unknown
+  preset name, or a variable that is set but empty (an unexpanded `${VAR}` in a compose
+  file), aborts with the reason. Coming up with a full tool surface while you believe it
+  is restricted is worse than having no filter at all.
+</Warning>
+
 ## Transport
 
 The server speaks **stdio** by default (what Claude Code expects). It can also serve the

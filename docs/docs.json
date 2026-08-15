@@ -11,8 +11,7 @@
   "favicon": "/favicon.svg",
   "logo": {
     "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg",
-    "href": "https://github.com/artokun/comfyui-mcp"
+    "dark": "/logo/dark.svg"
   },
   "appearance": {
     "default": "system"
@@ -35,148 +34,374 @@
     ]
   },
   "navigation": {
-    "tabs": [
+    "languages": [
       {
-        "tab": "Guides",
-        "groups": [
+        "language": "en",
+        "default": true,
+        "tabs": [
           {
-            "group": "Getting Started",
-            "pages": [
-              "index",
-              "quickstart",
-              "using-tools",
-              "local-vs-comfy-cloud",
-              "installation",
-              "roadmap"
+            "tab": "Guides",
+            "groups": [
+              {
+                "group": "Getting Started",
+                "pages": [
+                  "index",
+                  "quickstart",
+                  "using-tools",
+                  "local-vs-comfy-cloud",
+                  "installation",
+                  "roadmap"
+                ]
+              },
+              {
+                "group": "Configuration",
+                "pages": [
+                  "configuration",
+                  "remote-connector",
+                  "cloud-deployment",
+                  "docker",
+                  "self-hosted-relay",
+                  "concepts",
+                  "plugin",
+                  "panel",
+                  "apps",
+                  "mobile",
+                  "third-party-hosts",
+                  "backends",
+                  "local-llms",
+                  "arena",
+                  "troubleshooting"
+                ]
+              }
             ]
           },
           {
-            "group": "Configuration",
-            "pages": [
-              "configuration",
-              "remote-connector",
-              "cloud-deployment",
-              "docker",
-              "self-hosted-relay",
-              "concepts",
-              "plugin",
-              "panel",
-              "apps",
-              "mobile",
-              "third-party-hosts",
-              "backends",
-              "local-llms",
-              "arena",
-              "troubleshooting"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "Tool Reference",
-        "groups": [
-          {
-            "group": "Tools",
-            "pages": [
-              "tools/image-generation",
-              "tools/workflow-execution",
-              "tools/workflow-authoring",
-              "tools/workflow-library",
-              "tools/assets-images",
-              "tools/models",
-              "tools/custom-nodes",
-              "tools/api-nodes",
-              "tools/install-environment",
-              "tools/process-control",
-              "tools/defaults-stats-skills",
-              "tools/runpod",
-              "tools/training",
-              "tools/apps",
-              "tools/comfy-cli",
-              "tools/skills-knowledge"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "Blog",
-        "groups": [
-          {
-            "group": "Blog",
-            "pages": [
-              "blog/index",
-              "blog/micro-apps",
-              "blog/runpod-comfyui",
-              "blog/train-lora-runpod",
-              "blog/lora-trainer-p1",
-              "blog/blind-mode-privacy",
-              "blog/gpt-5-6-comfyui",
-              "blog/kimi-k3-comfyui",
-              "blog/manager-405-dialects",
-              "blog/panel-owned-sessions",
-              "blog/civitai-in-comfyui",
-              "blog/comfyui-mobile-app",
-              "blog/flatten-workflows",
-              "blog/self-updating-orchestrator",
-              "blog/gemma4-fine-tune-arena",
-              "blog/vision-per-model",
-              "blog/local-llms-comfyui",
-              "blog/comfyui-agent-claude-or-chatgpt",
-              "blog/self-healing-comfyui-agent",
-              "blog/panel-agent-subscription",
-              "blog/panel-workflow-layout",
-              "blog/installer-packs-that-cant-rot",
-              "blog/comfyui-mcp-tdqs-case-study"
+            "tab": "Tool Reference",
+            "groups": [
+              {
+                "group": "Tools",
+                "pages": [
+                  "tools/image-generation",
+                  "tools/workflow-execution",
+                  "tools/workflow-authoring",
+                  "tools/workflow-library",
+                  "tools/assets-images",
+                  "tools/models",
+                  "tools/custom-nodes",
+                  "tools/api-nodes",
+                  "tools/install-environment",
+                  "tools/process-control",
+                  "tools/defaults-stats-skills",
+                  "tools/runpod",
+                  "tools/training",
+                  "tools/apps",
+                  "tools/comfy-cli",
+                  "tools/skills-knowledge"
+                ]
+              }
             ]
           },
           {
-            "group": "Model Highlights",
-            "pages": [
-              "blog/krea2-comfyui",
-              "blog/wan-2.2-comfyui",
-              "blog/qwen-image-comfyui",
-              "blog/wan-animate-comfyui",
-              "blog/wan-transparent-comfyui",
-              "blog/z-image-comfyui",
-              "blog/ernie-image-comfyui",
-              "blog/anima-comfyui",
-              "blog/ltx-2.3-comfyui",
-              "blog/video-upscale-comfyui",
-              "blog/video-extend-pusa-comfyui",
-              "blog/ideogram-4-comfyui"
+            "tab": "Blog",
+            "groups": [
+              {
+                "group": "Blog",
+                "pages": [
+                  "blog/index",
+                  "blog/micro-apps",
+                  "blog/runpod-comfyui",
+                  "blog/train-lora-runpod",
+                  "blog/lora-trainer-p1",
+                  "blog/blind-mode-privacy",
+                  "blog/gpt-5-6-comfyui",
+                  "blog/kimi-k3-comfyui",
+                  "blog/manager-405-dialects",
+                  "blog/panel-owned-sessions",
+                  "blog/civitai-in-comfyui",
+                  "blog/comfyui-mobile-app",
+                  "blog/flatten-workflows",
+                  "blog/self-updating-orchestrator",
+                  "blog/gemma4-fine-tune-arena",
+                  "blog/vision-per-model",
+                  "blog/local-llms-comfyui",
+                  "blog/comfyui-agent-claude-or-chatgpt",
+                  "blog/self-healing-comfyui-agent",
+                  "blog/panel-agent-subscription",
+                  "blog/panel-workflow-layout",
+                  "blog/installer-packs-that-cant-rot",
+                  "blog/comfyui-mcp-tdqs-case-study"
+                ]
+              },
+              {
+                "group": "Model Highlights",
+                "pages": [
+                  "blog/krea2-comfyui",
+                  "blog/wan-2.2-comfyui",
+                  "blog/qwen-image-comfyui",
+                  "blog/wan-animate-comfyui",
+                  "blog/wan-transparent-comfyui",
+                  "blog/z-image-comfyui",
+                  "blog/ernie-image-comfyui",
+                  "blog/anima-comfyui",
+                  "blog/ltx-2.3-comfyui",
+                  "blog/video-upscale-comfyui",
+                  "blog/video-extend-pusa-comfyui",
+                  "blog/ideogram-4-comfyui"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Changelog",
+            "groups": [
+              {
+                "group": "Changelog",
+                "pages": [
+                  "changelog/index",
+                  "changelog/2026-07-28",
+                  "changelog/2026-07-21",
+                  "changelog/2026-07-20",
+                  "changelog/2026-07-19",
+                  "changelog/2026-07-18",
+                  "changelog/2026-07-17",
+                  "changelog/2026-07-16",
+                  "changelog/2026-07-15",
+                  "changelog/2026-07-14",
+                  "changelog/2026-07-12",
+                  "changelog/2026-07-09",
+                  "changelog/2026-07-08",
+                  "changelog/2026-06-29",
+                  "changelog/2026-06-27",
+                  "changelog/2026-06-26",
+                  "changelog/2026-06-25",
+                  "changelog/2026-06-24",
+                  "changelog/2026-06-19",
+                  "changelog/2026-06-17",
+                  "changelog/2026-06-16",
+                  "changelog/2026-06-05",
+                  "changelog/2026-05-29"
+                ]
+              }
             ]
           }
         ]
       },
       {
-        "tab": "Changelog",
-        "groups": [
+        "language": "ko",
+        "tabs": [
           {
-            "group": "Changelog",
-            "pages": [
-              "changelog/index",
-              "changelog/2026-07-28",
-              "changelog/2026-07-21",
-              "changelog/2026-07-20",
-              "changelog/2026-07-19",
-              "changelog/2026-07-18",
-              "changelog/2026-07-17",
-              "changelog/2026-07-16",
-              "changelog/2026-07-15",
-              "changelog/2026-07-14",
-              "changelog/2026-07-12",
-              "changelog/2026-07-09",
-              "changelog/2026-07-08",
-              "changelog/2026-06-29",
-              "changelog/2026-06-27",
-              "changelog/2026-06-26",
-              "changelog/2026-06-25",
-              "changelog/2026-06-24",
-              "changelog/2026-06-19",
-              "changelog/2026-06-17",
-              "changelog/2026-06-16",
-              "changelog/2026-06-05",
-              "changelog/2026-05-29"
+            "tab": "가이드",
+            "groups": [
+              {
+                "group": "시작하기",
+                "pages": [
+                  "ko/index",
+                  "ko/quickstart",
+                  "ko/installation",
+                  "ko/panel",
+                  "ko/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "ja",
+        "tabs": [
+          {
+            "tab": "ガイド",
+            "groups": [
+              {
+                "group": "はじめに",
+                "pages": [
+                  "ja/index",
+                  "ja/quickstart",
+                  "ja/installation",
+                  "ja/panel",
+                  "ja/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "zh",
+        "tabs": [
+          {
+            "tab": "指南",
+            "groups": [
+              {
+                "group": "入门",
+                "pages": [
+                  "zh/index",
+                  "zh/quickstart",
+                  "zh/installation",
+                  "zh/panel",
+                  "zh/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "fr",
+        "tabs": [
+          {
+            "tab": "Guides",
+            "groups": [
+              {
+                "group": "Démarrage",
+                "pages": [
+                  "fr/index",
+                  "fr/quickstart",
+                  "fr/installation",
+                  "fr/panel",
+                  "fr/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "es",
+        "tabs": [
+          {
+            "tab": "Guías",
+            "groups": [
+              {
+                "group": "Primeros pasos",
+                "pages": [
+                  "es/index",
+                  "es/quickstart",
+                  "es/installation",
+                  "es/panel",
+                  "es/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "zh-TW",
+        "tabs": [
+          {
+            "tab": "指南",
+            "groups": [
+              {
+                "group": "入門",
+                "pages": [
+                  "zh-TW/index",
+                  "zh-TW/quickstart",
+                  "zh-TW/installation",
+                  "zh-TW/panel",
+                  "zh-TW/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "ru",
+        "tabs": [
+          {
+            "tab": "Руководства",
+            "groups": [
+              {
+                "group": "Начало работы",
+                "pages": [
+                  "ru/index",
+                  "ru/quickstart",
+                  "ru/installation",
+                  "ru/panel",
+                  "ru/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "ar",
+        "tabs": [
+          {
+            "tab": "الأدلة",
+            "groups": [
+              {
+                "group": "البداية",
+                "pages": [
+                  "ar/index",
+                  "ar/quickstart",
+                  "ar/installation",
+                  "ar/panel",
+                  "ar/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "pt-BR",
+        "tabs": [
+          {
+            "tab": "Guias",
+            "groups": [
+              {
+                "group": "Primeiros passos",
+                "pages": [
+                  "pt-BR/index",
+                  "pt-BR/quickstart",
+                  "pt-BR/installation",
+                  "pt-BR/panel",
+                  "pt-BR/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "tr",
+        "tabs": [
+          {
+            "tab": "Kılavuzlar",
+            "groups": [
+              {
+                "group": "Başlangıç",
+                "pages": [
+                  "tr/index",
+                  "tr/quickstart",
+                  "tr/installation",
+                  "tr/panel",
+                  "tr/troubleshooting"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "fa",
+        "tabs": [
+          {
+            "tab": "راهنماها",
+            "groups": [
+              {
+                "group": "شروع به کار",
+                "pages": [
+                  "fa/index",
+                  "fa/quickstart",
+                  "fa/installation",
+                  "fa/panel",
+                  "fa/troubleshooting"
+                ]
+              }
             ]
           }
         ]

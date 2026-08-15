@@ -1,0 +1,217 @@
+---
+title: "Sorun Giderme"
+description: "Kullanıcıların gerçekten karşılaştığı sorunların çözümleri: ComfyUI-Manager sürüm uyuşmazlıkları (405 hataları), git URL'siyle yapılan kurulumların sessizce atlanması, panele uzak bir tarayıcıdan erişilememesi, eskimiş npx önbellekleri ve port yönlendirmeli uzak sunucuların yerel sanılması."
+icon: "wrench"
+---
+
+Buradaki her madde, gerçek bir hata bildiriminden doğdu. Sizinki burada yoksa
+[bir issue açın](https://github.com/artokun/comfyui-mcp/issues) — büyük ihtimalle
+bu sayfada yerini alır.
+
+## `install_custom_node`, `/v2/manager/queue/task` için `405 Method Not Allowed` ile başarısız oluyor
+
+**Nedeni:** ComfyUI-Manager'ın iki kuşağı var. `/v2/manager/*` API'si **v4 soyuna**
+aittir (pip paketi `comfyui_manager` ≥ 4.x); ComfyUI-Manager'ın varsayılan olarak
+kurduğu **yayınlanmış Manager 3.x** ise aynı kuyruğu farklı rotalar üzerinden sunar.
+
+**Çözüm:** `comfyui-mcp` sürümünü **0.24.3** ve üzerine güncelleyin — hedef başına
+Manager kuşağını otomatik algılar ve her iki lehçeyi de konuşur. Manager tarafında
+bir değişiklik gerekmez.
+
+**İsteğe bağlı ama önerilir — Manager v4'e yükseltin:** 3.x'in uzaktan yapamadığı
+işler için (özellikle 3.x'in beyaz listeyle kısıtladığı **rastgele URL'den model
+indirme**):
+
+```bash
+# in your ComfyUI python environment
+pip install -U comfyui_manager
+# then remove/disable the old custom_nodes/ComfyUI-Manager clone and restart
+```
+
+[RunPod imajı](/docs/cloud-deployment) zaten Manager v4 ile geliyor.
+
+**`useCmCli: true` hakkında not:** cm-cli yedeği, Manager'ın CLI'sini bir alt süreç
+olarak çalıştırır, dolayısıyla **yerel dosya sistemine** ihtiyaç duyar — uzak/`--tunnel`
+hedeflere karşı çalışamaz ve `python` PATH üzerinde değilse `COMFYUI_PYTHON`
+değişkeninin ComfyUI venv'inizin yorumlayıcısını göstermesi gerekir. Uzak hedefler
+için doğru mekanizma Manager'ın HTTP yoludur (varsayılan).
+
+## git URL'siyle kurulan özel düğüm hiç görünmüyor
+
+Registry kimliğiyle yapılan kurulumlar çalışıyor, ama ham bir GitHub URL'siyle yapılan
+kurulum başarılı olduğunu bildiriyor ve paket hiçbir zaman ortaya çıkmıyor.
+
+**Nedeni:** Manager, rastgele git URL'siyle yapılan kurulumları yüksek riskli sayar
+ve izin verici bir güvenlik düzeyinin altında **bunları sessizce atlar** (kuyruk
+görevini yine de "done" olarak işaretler). Manager 3.x'te ayrıca buna özel bir
+`allow_git_url_install` yapılandırma bayrağı vardır.
+
+**Çözüm:** Manager'ın `config.ini` dosyasında (ComfyUI kullanıcı dizininizin altında):
+
+```ini
+[default]
+security_level = weak          ; Manager v4: allows git-URL installs
+allow_git_url_install = True   ; Manager 3.x: additionally required
+```
+
+Ardından ComfyUI'yi yeniden başlatın. RunPod imajında bu, `1.6` imajından itibaren
+varsayılandır (`COMFY_SECURITY_LEVEL` ortam değişkeni bunu geçersiz kılar; düzey her
+açılışta yeniden uygulanır). `1.4`/`1.5` imajları bunu *amaçlıyordu* ama gömülü bir
+`COMFY_SECURITY_LEVEL=normal-` ortam değişkeni, açılış betiğinin varsayılanını
+geçersiz kıldı — o imajlarda podun ortamında `COMFY_SECURITY_LEVEL=weak` ayarlayın.
+Bunu yalnızca sizin denetiminizdeki bir makinede gevşetin — Manager'ın kurulum
+korumalarını kaldırır.
+
+## RunPod: Agent Panel sekmesi boş — dosyaları duruyor ama hepsi 0 bayt
+
+ComfyUI `comfyui-mcp-panel`'i listeliyor ama kenar çubuğu sekmesi hiç yüklenmiyor;
+`ls -la /workspace/custom_nodes/comfyui-mcp-panel` her dosyayı **0 bayt** gösteriyor.
+Kullanıcının kurduğu düğümler de aynı şekilde boş olabilir.
+
+**Nedeni:** ağ birimi bir noktada **doldu** (çoğu zaman küçük bir birimde ilk
+açılıştaki ~7 GB'lık spotcheck modeli kopyası ya da büyük bir model indirmesi
+yüzünden). ENOSPC durumunda `cp`/`git` her dosyayı yine de *oluşturur* ama içine
+hiçbir şey yazmaz — ve birim kalıcı olduğu için bu boş kabuklar her yeniden
+dağıtımdan sağ çıkar.
+
+**Çözüm:** birimde yer açın ya da birimi büyütün, ardından podu yeniden başlatın.
+`1.6` imajından itibaren açılış betiği, birim azaldığında/dolduğunda uyarır,
+sığmayacaksa spotcheck modeli kopyasını atlar ve 0 baytlık bir paneli otomatik olarak
+**kendi kendine onarır** (GitHub'dan yeniden klonlayarak ya da çevrimdışıysa imajdaki
+tohum kopyadan). Ayrıca bozuk başka düğümler varsa adlarını vererek
+`WARN: custom nodes with 0-byte __init__.py` günlüğünü yazar — onları Manager
+üzerinden yeniden kurun. `<= 1.5` imajlarında panel klasörünü silip yeniden başlatın:
+`rm -rf /workspace/custom_nodes/comfyui-mcp-panel`.
+
+## Panel "Köprüde (ws://127.0.0.1:9180) dinleyen bir ajan yok" diyor
+
+ComfyUI'yi, orkestratörün çalıştığı makineden **farklı bir makinedeki tarayıcıda**
+açıyorsunuz. Köprü tasarım gereği yalnızca loopback üzerinde çalışır ve
+tarayıcınızdaki `127.0.0.1`, sunucunun değil tarayıcının makinesidir.
+
+**Çözüm — orkestratörü tarayıcının BULUNDUĞU makinede çalıştırın** (desteklenen
+topoloji budur; ajan *sizin* makinenizde çalışır ve uzaktaki ComfyUI'yi yönetir):
+
+```bash
+npx -y comfyui-mcp@latest connect http://<comfyui-host>:8188
+```
+
+Ardından panelde Bağlan'a tıklayın. ComfyUI makinesinde, ComfyUI ve panel özel
+düğümü dışında hiçbir şeyin çalışması gerekmez. **https** üzerinden sunulan bir
+ComfyUI için (RunPod proxy'si), orkestratör köprüyü otomatik olarak güvenli bir
+`wss://` tüneline yükseltir — komut aynıdır.
+
+**Ya da orkestratörü sunucu tarafında çalıştırın (≥ 0.24.5)** — ajanın ComfyUI'nin
+yanında yaşaması ve tarayıcıların LAN'ın herhangi bir yerinden bağlanması gereken
+7/24 başsız bir makine için (örneğin bağımsız bir Ollama/OpenClaw sunucusu):
+
+```bash
+# on the SERVER — bind the bridge on the LAN, token-gated (mandatory)
+COMFYUI_MCP_BRIDGE_HOST=0.0.0.0 \
+COMFYUI_MCP_BRIDGE_TOKEN=<pick-a-long-secret> \
+npx -y comfyui-mcp@latest --panel-orchestrator
+```
+
+Yapıştırmaya hazır bir `ws://<server-ip>:9180/?token=…` yazdırır — bunu herhangi bir
+makinede panelin **Ayarlar → Gelişmiş → Köprü adresi** alanına koyup Bağlan'a
+tıklayın. Loopback olmayan bir bağlama, token olmadan **başlamayı reddeder** ve her
+bağlantı WebSocket yükseltmesi sırasında denetlenir (sabit zamanlı). Bu adresi bir
+parola gibi görün: elinde tutan herkes ajanı yönetebilir.
+
+## Yeni sürüm çıktı ama hâlâ eski davranışı görüyorum
+
+`npx` paketleri agresif biçimde önbelleğe alır — `npx -y comfyui-mcp@latest`,
+`~/.npm/_npx` içinden haftalar öncesine ait bir derlemeyi sunabilir.
+
+```bash
+# clear it, then relaunch
+npx clear-npx-cache
+# or on Windows:
+#   Remove-Item -Recurse -Force "$env:LOCALAPPDATA\npm-cache\_npx"
+```
+
+Panel özel düğümünü de kontrol edin: eski bir kurulumdan kalma olarak bir **ağ
+biriminde** (RunPod'da `/workspace`) duruyorsa, o kopya imajın kendini otomatik
+güncelleyen kopyasını gölgeler.
+`git -C <panel-dir> fetch && git -C <panel-dir> reset --hard origin/main` çalıştırın
+ya da `comfyui-agent-panel` paketini ComfyUI-Manager'dan yeniden kurun; ardından
+ComfyUI'yi yeniden başlatıp tarayıcı sekmesini zorla yenileyin (Ctrl+Shift+R).
+
+## Port yönlendirmeli uzak ComfyUI yerel sanılıyor (dstack, SSH tünelleri)
+
+`localhost:8188` üzerinden erişilebilen uzak bir ComfyUI (dstack, `ssh -L`, kubectl
+port-forward) loopback sezgisini yanıltır: comfyui-mcp yerel bir kurulum olduğunu
+varsayar ve ComfyUI'nin bulunmadığı bir dosya sistemine karşı yalnızca yerelde
+çalışan araçları etkinleştirir.
+
+**Çözüm (≥ 0.24.1):** `--force-remote` (ya da `COMFYUI_MCP_FORCE_REMOTE=1`) geçirin:
+
+```bash
+npx -y comfyui-mcp@latest connect http://localhost:8188 --force-remote
+```
+
+Uzak hedeflerin üretim geçmişi `~/.comfyui-mcp/instances/<host_port>/` altında
+tutulur (`COMFYUI_MCP_DATA_DIR` ile değiştirilebilir).
+
+## Docker: konteyner HTTP modunda hemen kapanıyor
+
+Kimlik doğrulaması olmadan loopback dışı bir adrese bağlanmak **tasarım gereği kesin
+olarak başarısız olur** (`0.0.0.0` üzerinde açık bir `/mcp` uç noktası dışarıya açık
+olurdu). Bir token verin ya da açıkça devre dışı bırakın:
+
+```bash
+docker run --rm -p 9100:9100 -e COMFYUI_MCP_HTTP_TOKEN=changeme comfyui-mcp \
+  --http --host 0.0.0.0 --port 9100
+# or (trusted networks only):
+#   ... --http --host 0.0.0.0 --port 9100 --allow-unauthenticated-non-loopback
+```
+
+stdio modunun (varsayılan olan ve MCP istemcilerinin kullandığı mod) bunların
+hiçbirine ihtiyacı yoktur.
+
+## Ajan hiç araç çağırmıyor — hata yok, sadece konuşuyor
+
+İş akışınızı okumak yerine anlatıyor ya da bir betik yazmayı öneriyor. Hata yok çünkü
+hiçbir şey başarısız olmadı: ya araçlar istemcinize hiç ulaşmadı, ya istemciniz
+çağrıları durduruyor, ya da yetenek hiç gündeme gelmemiş bir adla var. Bu üçü
+dışarıdan birebir aynı görünür ve çözümleri birbirinin tersidir; bu yüzden tahmin
+etmek, kontrol etmekten kötüdür.
+
+Ajanınıza soracağınız iki soru bunları birbirinden ayırır —
+bkz. [Hiçbir şey söylemediğinde](/docs/using-tools#when-it-says-nothing). İstemci
+tarafındaki bir izin engelinin bu sunucuya hiç ulaşmadığını unutmayın; dolayısıyla
+aşağıdaki günlüklerin hiçbirinde görünmez.
+
+## Yerel modeller: araç çağrıları başarısız oluyor ya da model araçları "göremiyor"
+
+- **İlk hamle: [ince ayarlı modelimizi](/docs/local-llms#our-fine-tuned-local-models-free-recommended) kullanın** —
+  `ollama pull artokun/gemma4-comfyui-mcp:e4b` (panelin Ollama varsayılanı).
+  Doğrudan comfyui-mcp araç takımı üzerinde eğitilmiş bir Gemma 4'tür ve "yanlış
+  araç / bozuk argüman" hatalarının çoğunu kutudan çıktığı haliyle ortadan kaldırır
+  (~2 GB VRAM için `:e2b`, ~8 GB için `:12b` — her basamak arenada kendi hazır
+  temel modelini geçiyor; `:e4b` en dengeli seçenek olmayı sürdürüyor).
+- **gemma3'ün Ollama'da yerel araç çağırma desteği yoktur** — desteklenmiyor;
+  yukarıdaki ince ayarımızı, hazır `gemma4` (e4b+), `qwen3` ya da `llama3.1+`
+  kullanın.
+- Küçük modeller için [kompakt araç modunu](/docs/local-llms) açın — bu
+  **varsayılan değildir**, bu yüzden sunucuyu `--compact` (ya da
+  `COMFYUI_MCP_TOOL_MODE=compact`) ile başlatın. Bu olmadan şemanın tamamı küçük
+  bir bağlamı taşırır ve model araç adları uydurmaya başlar.
+- Soğuk model yüklemeleri ilk token'dan önce 30 saniyeden uzun sürebilir — panelin
+  gözetleyicisi bunu hesaba katar, ama anında ölen bir istek genellikle model
+  etiketinin çekilmemiş olduğu anlamına gelir (`ollama pull <tag>`).
+- **Aniden her isteğin başarısız olması / 11434 üzerinde bağlantının reddedilmesi** —
+  Ollama uygulaması/arka plan servisi çalışmıyordur. Tepsi uygulamasından çıkmak
+  API'yi de beraberinde öldürür ve bunu bir ajan çalışırken kazara yapmak kolaydır
+  (panel, yerel bir arka ucun kullanımda olduğuna dair uyarı vermez). Uygulamayı
+  yeniden başlatıp (ya da `ollama serve`) yeniden bağlanın — oturumlar kaldığı
+  yerden sürer; paneli yeniden başlatmaya gerek yoktur.
+
+## Günlüklere nereden bakılır
+
+- **Orkestratör**: `connect` / `--panel-orchestrator` komutunu çalıştıran terminal.
+- **ComfyUI tarafı**: `get_system_stats (action:"logs")` MCP aracı ya da RunPod'da podun günlük akışı.
+- **Panel JS**: tarayıcının devtools konsolu (köprü istemcisi bağlanma/yeniden
+  bağlanma geçişlerini günlüğe yazar).
+- **Tek çağrıda sağlık durumu**: `get_system_stats (action:"health")` aracı
+  sürüm/GPU/VRAM/kuyruk/model dizinleri/son hataları bir arada verir.

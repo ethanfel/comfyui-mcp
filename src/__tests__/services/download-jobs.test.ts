@@ -2286,6 +2286,24 @@ describe("download job registry", () => {
 
     it("never confirms a Manager dispatch, even if a verdict got attached", () => {
       const r = describePlacement({ ...base, viaManager: true, live_visible: "visible" });
+      // THE invariant, unchanged: a listing proves a file of that NAME exists
+      // somewhere the server reads. That is placement, never validity (#473 — a
+      // login page saved as a .safetensors lists perfectly happily), so no
+      // Manager outcome may render as a confirmed success.
+      expect(r.confirmed).toBe(false);
+      // #1374 changed the WORDING deliberately, and only for the arms that now
+      // carry an observation. The old regex pinned one static sentence that was
+      // returned for every Manager outcome — true of all of them and therefore
+      // distinguishing none, which is what let a REJECTED dispatch read as `done`.
+      // What still has to hold is that this is not sold as verified.
+      expect(r.warning).toMatch(/PLACEMENT, not validity/);
+      expect(r.pathLabel).not.toBe("landed at");
+    });
+
+    it("still says NOT VERIFIED for a Manager dispatch with no observation (#1374)", () => {
+      // The arm that keeps the original wording: nothing was learned, so the
+      // pre-#1374 sentence is exactly right and must survive.
+      const r = describePlacement({ ...base, viaManager: true, live_visible: "unknown" });
       expect(r.confirmed).toBe(false);
       expect(r.warning).toMatch(/NOT verified as landed/);
     });

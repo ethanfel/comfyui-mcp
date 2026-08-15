@@ -64,17 +64,119 @@ function enclosingExports(file: string, callee: string): string[] {
   return [...new Set(found)];
 }
 
+/**
+ * A host-reaching primitive: something a test can call that answers differently
+ * depending on what is running on the machine executing it.
+ *
+ * #1263 was filed for ONE of these and the gate was written around it by name. There
+ * is more than one, which is the whole point — `restart-live-first.test.ts` passed here
+ * and failed on all three CI runners because `gatherProcessInfo` reaches
+ * `acquireInstanceWitness`, which opens a REAL WebSocket to COMFYUI_URL. This rig has a
+ * ComfyUI on 8188; CI has nothing. Same defect as the process probe, different coat,
+ * and a gate hardcoded to the first could not see it.
+ *
+ * Adding one here is now a three-line change rather than a rewrite, which matters
+ * because the next channel will not be the last: a health probe over `fetch` cost a CI
+ * failure on #1332 the same day, for the same reason.
+ *
+ * THAT THIRD CHANNEL IS DELIBERATELY ABSENT, and the reason is worth recording so the
+ * next person does not re-derive it. Its probe (`probeComfyEndpoint`, reached through
+ * the private `probeComfyHealth` / `probeDeclineRecovery` / `observeRecovery`) has
+ * exactly ONE exported caller: `buildPanelToolDefs()`. Every panel tool is registered
+ * inside it, so every panel test names it — gating on it would flag essentially the
+ * whole suite, and a gate that cries wolf is a list people learn to edit rather than
+ * read. It is stubbable (`__panelToolsTestHooks.setHealthProbe`), so the remedy exists;
+ * what is missing is a way to attribute reachability to a TOOL rather than to the one
+ * export that registers all 91 of them. That is what would have to change first.
+ */
+interface Probe {
+  /** Short name used in failure output. */
+  id: string;
+  /** The function whose CALLERS are the entry points into this channel. */
+  callee: string;
+  /** Entry points the walk cannot see because the caller is module-private. */
+  privateSeeds: string[];
+  /** A substring proving the test stubbed this channel at its module boundary. */
+  moduleHint: string;
+  /** What the reader must do about it. */
+  remedy: string;
+  /** Entry points that must be found, so a broken walk fails loudly instead of
+   *  silently gating nothing. */
+  expectEntries: string[];
+}
+
+const PROBES: Probe[] = [
+  {
+    id: "live process table",
+    callee: "resolveLiveInterpreter",
+    // `observeLivePython` is module-private, so its exported caller is the entry.
+    privateSeeds: ["resolveLiveServerRoot"],
+    moduleHint: "live-interpreter",
+    expectEntries: ["resolveLiveServerRoot", "gatherEnvCapabilities"],
+    remedy:
+      "`resolveLiveInterpreter` shells out to find the python actually serving the port " +
+      "on THIS machine, so these assert one thing where ComfyUI is running and another " +
+      "where it is not. Stub it at its module boundary:\n\n" +
+      '  vi.mock("../../services/live-interpreter.js", async () => ({\n' +
+      '    ...(await vi.importActual("../../services/live-interpreter.js")),\n' +
+      "    resolveLiveInterpreter: () => undefined,\n" +
+      "  }));\n",
+  },
+  {
+    // #1374 — SAME MODULE, SECOND DOOR. The shell-out moved down into
+    // `observeLiveServerProcess`, which reports the OS's own image record as well as
+    // the interpreter, and `resolveLiveInterpreter` is now a wrapper around it. A
+    // file that stubs only the wrapper (which six of them did, verbatim from the
+    // remedy above) still reaches the real process table through the other export —
+    // and the probe above cannot see that, because its `moduleHint` is satisfied by
+    // any mention of the module. So this one is keyed on the FUNCTION NAME: a file
+    // is exempt only if it actually names the export it has to replace.
+    id: "live process table (uncollapsed observation)",
+    callee: "observeLiveServerProcess",
+    privateSeeds: ["resolveLiveServerRoot"],
+    moduleHint: "observeLiveServerProcess",
+    expectEntries: ["resolveLiveServerRoot", "resolveLiveInterpreter"],
+    remedy:
+      "`observeLiveServerProcess` is where the netstat/WMI shell-out now lives, and " +
+      "`resolveLiveInterpreter` only wraps it — so stubbing the wrapper alone leaves " +
+      "these reading the REAL process table. Stub BOTH:\n\n" +
+      '  vi.mock("../../services/live-interpreter.js", async () => ({\n' +
+      '    ...(await vi.importActual("../../services/live-interpreter.js")),\n' +
+      "    resolveLiveInterpreter: () => undefined,\n" +
+      "    observeLiveServerProcess: () => undefined,\n" +
+      "  }));\n",
+  },
+  {
+    id: "instance witness (real WebSocket)",
+    callee: "acquireInstanceWitness",
+    // Both call sites sit in NON-exported functions (`gatherProcessInfo`,
+    // `restartViaManagerReboot`), so the exported-caller walk finds nothing on its own
+    // — which is precisely why a gate keyed on `export function` missed this channel.
+    // Seeding the private names lets the second hop resolve their exported callers.
+    privateSeeds: ["gatherProcessInfo", "restartViaManagerReboot"],
+    moduleHint: "instance-witness",
+    expectEntries: ["restartComfyUI"],
+    remedy:
+      "`acquireInstanceWitness` opens a REAL WebSocket to COMFYUI_URL, so these take one " +
+      "branch on a machine with ComfyUI running and another on CI — which is exactly how " +
+      "restart-live-first.test.ts passed here and failed on all three runners. Stub it:\n\n" +
+      '  vi.mock("../../services/instance-witness.js", async () => ({\n' +
+      '    ...(await vi.importActual("../../services/instance-witness.js")),\n' +
+      "    acquireInstanceWitness: async () => undefined,\n" +
+      "  }));\n",
+  },
+];
+
 /** Everything that can reach the process probe: its direct callers, then the
  *  exported functions that call THOSE. Two hops is what the real graph needs
  *  today; a third would only widen the set, and the assertion below is about a
  *  set GROWING, so a miss shows up as a new unstubbed file rather than silence. */
-function reachingEntryPoints(): string[] {
+function reachingEntryPoints(probe: Probe): string[] {
   const direct = new Set<string>();
   for (const file of PRODUCT) {
-    for (const fn of enclosingExports(file, "resolveLiveInterpreter")) direct.add(fn);
+    for (const fn of enclosingExports(file, probe.callee)) direct.add(fn);
   }
-  // `observeLivePython` is module-private, so its exported caller is the entry.
-  direct.add("resolveLiveServerRoot");
+  for (const seed of probe.privateSeeds) direct.add(seed);
 
   const hop2 = new Set<string>();
   for (const file of PRODUCT) {
@@ -107,12 +209,12 @@ function reachingEntryPoints(): string[] {
  * learn to edit rather than read, so its false-positive direction matters as
  * much as its false-negative one.
  */
-function unstubbedTests(): string[] {
-  const entries = reachingEntryPoints();
+function unstubbedTests(probe: Probe): string[] {
+  const entries = reachingEntryPoints(probe);
   const out: string[] = [];
   for (const file of TESTS) {
     const s = readFileSync(file, "utf-8");
-    if (s.includes("live-interpreter")) continue;
+    if (s.includes(probe.moduleHint)) continue;
     const reaches = entries.some(
       (e) =>
         new RegExp(`\\b${e}\\b`).test(s) &&
@@ -134,40 +236,77 @@ function unstubbedTests(): string[] {
  * the probe should return for the case it is testing, which is exactly the
  * thinking that produced #1263's two new cases.
  */
-const KNOWN_UNSTUBBED = [
-  "__tests__/orchestrator/late-mutation-e2e.test.ts",
-];
+const KNOWN_UNSTUBBED: Record<string, string[]> = {
+  "live process table": ["__tests__/orchestrator/late-mutation-e2e.test.ts"],
+  // Pre-existing, and a finding about the FIRST probe rather than about #1374:
+  // `env-capabilities.test.ts` has read the real process table all along, and was
+  // exempted only because its prose mentions "live-interpreter" —
+  // `moduleHint` cannot tell a stub from a comment. The name-keyed probe below sees
+  // it. Ratcheted rather than fixed here for the reason the list exists: that file
+  // deliberately runs the real probe set to prove a per-gather read is not cached,
+  // and deciding what the process probe should answer for it is its own judgement.
+  "live process table (uncollapsed observation)": [
+    "__tests__/services/env-capabilities.test.ts",
+  ],
+  // The witness channel as it stands today. Ratcheted rather than fixed wholesale, for
+  // the same reason as the list above: five passing files is a large diff with no
+  // observable failure behind it, and each needs its own judgement about what the
+  // witness should return for the case it drives.
+  //
+  // `restart-live-first.test.ts` is the one that already cost three red CI runners
+  // (#1315). Note what its fix was: keeping the `startedAt` stamp so the #914 branch is
+  // not taken — a PER-TEST avoidance, not a stub. That is why it still appears here and
+  // should: the file can reach the channel again the moment a case omits the stamp, and
+  // nothing but this list would notice.
+  "instance witness (real WebSocket)": [
+    "__tests__/orchestrator/panel-restart-legacy-fallback.test.ts",
+    "__tests__/services/restart-launcher-env.test.ts",
+    "__tests__/services/restart-live-first.test.ts",
+    "__tests__/services/restart-posix-port-release.test.ts",
+    "__tests__/services/restart-relaunch-lifecycle.test.ts",
+  ],
+};
 
-describe("the live-process probe is stubbed in tests that reach it (#1290)", () => {
+describe.each(PROBES)("host-reaching probe: $id (#1290/#1263)", (probe) => {
   it("finds the entry points by reading the code, not from a list", () => {
     // If this ever comes back empty the gate is inert, and every assertion below
     // would pass while checking nothing.
-    const entries = reachingEntryPoints();
-    expect(entries).toContain("resolveLiveServerRoot");
-    expect(entries).toContain("gatherEnvCapabilities");
-    expect(entries.length, "the graph walk found nothing — the gate is dead").toBeGreaterThan(2);
+    const entries = reachingEntryPoints(probe);
+    for (const e of probe.expectEntries) expect(entries).toContain(e);
+    expect(
+      entries.length,
+      `the graph walk found nothing for ${probe.id} — the gate is dead`,
+    ).toBeGreaterThan(0);
   });
 
-  it("NO NEW test file reads the live process table", () => {
-    const offenders = unstubbedTests().filter((f) => !KNOWN_UNSTUBBED.includes(f));
+  it("NO NEW test file reaches this probe unstubbed", () => {
+    const known = KNOWN_UNSTUBBED[probe.id] ?? [];
+    const offenders = unstubbedTests(probe).filter((f) => !known.includes(f));
     expect(
       offenders,
-      "These tests reach `resolveLiveInterpreter`, which shells out to find the python " +
-        "actually serving the port on THIS machine — so they assert one thing where " +
-        "ComfyUI is running and another where it is not, and CI cannot tell you (#1263). " +
-        "Stub it at its module boundary:\n\n" +
-        '  vi.mock("../../services/live-interpreter.js", async () => ({\n' +
-        "    ...(await vi.importActual(\"../../services/live-interpreter.js\")),\n" +
-        "    resolveLiveInterpreter: () => undefined,\n" +
-        "  }));\n",
+      `These tests reach the ${probe.id} without stubbing it, so they assert one thing ` +
+        `on a machine where ComfyUI is running and another where it is not — and CI ` +
+        `cannot tell you, because CI is one of the machines where they pass (#1263).\n\n` +
+        probe.remedy,
     ).toEqual([]);
   });
 
   it("the known list only shrinks — a fixed file must be removed from it", () => {
     // Otherwise the ratchet rusts: files get stubbed, the list keeps naming them,
     // and it stops describing anything.
-    const current = unstubbedTests();
-    const stale = KNOWN_UNSTUBBED.filter((f) => !current.includes(f));
+    const known = KNOWN_UNSTUBBED[probe.id] ?? [];
+    const current = unstubbedTests(probe);
+    const stale = known.filter((f) => !current.includes(f));
     expect(stale, "these are stubbed now — delete them from KNOWN_UNSTUBBED").toEqual([]);
+  });
+});
+
+describe("the gate itself (#1263)", () => {
+  it("covers MORE THAN ONE channel — one hardcoded probe is how the second was missed", () => {
+    // The original gate was written around `resolveLiveInterpreter` by name, so the
+    // witness channel walked straight past it and cost three red CI runners. This
+    // assertion is what stops the table collapsing back to a single entry.
+    expect(PROBES.length).toBeGreaterThan(1);
+    expect(PROBES.map((p) => p.callee)).toContain("acquireInstanceWitness");
   });
 });

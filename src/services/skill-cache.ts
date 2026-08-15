@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { join, resolve } from "node:path";
 import { generateSkill } from "./skill-generator.js";
 import { getNodePackDetails } from "./registry-client.js";
@@ -41,7 +42,14 @@ const defaultDeps: SkillCacheDeps = {
 };
 
 function cacheDir(): string {
-  return resolve(process.env.COMFYUI_SKILL_CACHE_DIR || DEFAULT_CACHE_DIR);
+  // #1526 — same treatment as the download cache root, and found the same way:
+  // review pointed out that calling that one "the last raw path env var" was
+  // false while this sat two files away. A trailing space here sends cached
+  // skills to a directory that is not the configured one, silently.
+  const configured = normalizeInstallPathEnv(process.env.COMFYUI_SKILL_CACHE_DIR, {
+    varName: "COMFYUI_SKILL_CACHE_DIR",
+  }).path;
+  return resolve(configured || DEFAULT_CACHE_DIR);
 }
 
 function shortHash(value: string): string {

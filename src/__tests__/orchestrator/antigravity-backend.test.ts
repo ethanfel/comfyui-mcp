@@ -97,6 +97,7 @@ import {
   resolveAgyBin,
 } from "../../orchestrator/antigravity-backend.js";
 import { backendReadiness } from "../../orchestrator/backend-readiness.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 const FAKE_BIN = join(tmpdir(), "fake-agy", "agy.exe");
 
@@ -512,7 +513,7 @@ describe("AntigravityBackend turns", () => {
     const drain = (async () => {
       for await (const ev of gen) events.push(ev);
     })();
-    await vi.waitFor(() => expect(hoisted.spawns.length).toBe(1));
+    await waitFor(() => expect(hoisted.spawns.length).toBe(1));
     await backend.interrupt();
     await drain;
     expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);

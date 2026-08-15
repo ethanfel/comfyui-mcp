@@ -1,0 +1,199 @@
+---
+title: "故障排查"
+description: "用户真正会遇到的问题及其解决办法：ComfyUI-Manager 版本代次不匹配（405 错误）、git URL 安装被静默跳过、远程浏览器连不上面板、npx 缓存过期，以及端口转发的远程实例被误判为本地。"
+icon: "wrench"
+---
+
+本页的每一条都源自真实的问题反馈。如果你遇到的问题不在其中，
+请[提交 issue](https://github.com/artokun/comfyui-mcp/issues)——它多半
+也会出现在这一页上。
+
+## `install_custom_node` 在 `/v2/manager/queue/task` 上以 `405 Method Not Allowed` 失败
+
+**原因：** ComfyUI-Manager 存在两代版本。`/v2/manager/*` API 属于 **v4 系列**
+（pip 包 `comfyui_manager` ≥ 4.x）；而**已发布的 Manager 3.x**——也就是
+ComfyUI-Manager 默认安装的那一版——用不同的路由提供同一个队列。
+
+**解决：** 将 `comfyui-mcp` 更新到 **0.24.3** 及以上——它会按目标自动检测
+Manager 的代次，并同时支持两种方言。无需改动 Manager。
+
+**可选但推荐——升级到 Manager v4**，以获得 3.x 无法远程完成的功能（尤其是
+**任意 URL 的模型下载**，3.x 会用白名单加以限制）：
+
+```bash
+# in your ComfyUI python environment
+pip install -U comfyui_manager
+# then remove/disable the old custom_nodes/ComfyUI-Manager clone and restart
+```
+
+[RunPod 镜像](/docs/cloud-deployment)已经自带 Manager v4。
+
+**关于 `useCmCli: true` 的说明：** cm-cli 回退方式会以子进程运行 Manager 的
+CLI，因此需要**本地文件系统**——它无法用于远程/`--tunnel` 目标；并且当
+`python` 不在 PATH 上时，需要把 `COMFYUI_PYTHON` 指向 ComfyUI venv 的解释器。
+对于远程目标，Manager 的 HTTP 路径（默认方式）才是正确的机制。
+
+## 通过 git URL 安装的自定义节点始终不出现
+
+用注册表 ID 安装可以正常工作，但用原始 GitHub URL 安装会报告成功，节点包却
+从未出现。
+
+**原因：** Manager 把任意 git URL 的安装视为高风险，在安全等级不够宽松时会
+**静默跳过**（但仍会把队列任务标记为“done”）。在 Manager 3.x 上还另有一个
+专门的 `allow_git_url_install` 配置开关。
+
+**解决：** 在 Manager 的 `config.ini`（位于你的 ComfyUI 用户目录下）中：
+
+```ini
+[default]
+security_level = weak          ; Manager v4: allows git-URL installs
+allow_git_url_install = True   ; Manager 3.x: additionally required
+```
+
+改完后重启 ComfyUI。在 RunPod 镜像上，从镜像 `1.6` 起这已是默认设置
+（`COMFY_SECURITY_LEVEL` 环境变量会覆盖它；该等级在每次启动时都会重新写入）。
+`1.4`/`1.5` 镜像*本意*如此，但内置的 `COMFY_SECURITY_LEVEL=normal-` 环境变量
+覆盖了启动脚本的默认值——在这些镜像上，请在实例的环境变量中设置
+`COMFY_SECURITY_LEVEL=weak`。只在你自己掌控的机器上放宽这项设置——它会移除
+Manager 的安装防护。
+
+## RunPod：智能体面板标签页是空的——文件存在但全是 0 字节
+
+ComfyUI 列出了 `comfyui-mcp-panel`，但侧边栏标签页始终加载不出来；
+`ls -la /workspace/custom_nodes/comfyui-mcp-panel` 显示每个文件都是
+**0 字节**。用户自行安装的节点也可能以同样的方式变成空文件。
+
+**原因：** 网络卷在某个时刻**空间耗尽**了（常见于小容量卷上首次启动时约 7 GB
+的抽检模型拷贝，或一次大模型下载）。发生 ENOSPC 时，`cp`/`git` 仍会*创建*
+每个文件，却写不进任何内容——而由于卷是持久化的，这些空壳会在每次重新部署后
+继续留存。
+
+**解决：** 释放或扩容该卷，然后重启实例。从镜像 `1.6` 起，启动脚本会在卷空间
+不足/已满时发出警告，在放不下时跳过抽检模型拷贝，并对 0 字节的面板自动
+**自愈**（从 GitHub 重新克隆，离线时则使用镜像内置的种子副本）。它还会记录
+`WARN: custom nodes with 0-byte __init__.py` 并列出其他损坏的节点——请通过
+Manager 重新安装这些节点。在 `<= 1.5` 的镜像上，删除面板目录后重启：
+`rm -rf /workspace/custom_nodes/comfyui-mcp-panel`。
+
+## 面板提示“桥接（ws://127.0.0.1:9180）上没有智能体在监听”
+
+你是在**与编排器所在机器不同的另一台机器的浏览器里**打开 ComfyUI 的。桥接
+在设计上仅限回环地址，而浏览器里的 `127.0.0.1` 指的是浏览器所在的那台机器
+——不是服务器。
+
+**解决——在有浏览器的那台机器上运行编排器**（这是受支持的拓扑：智能体运行
+在*你自己的*机器上，并驱动远程的 ComfyUI）：
+
+```bash
+npx -y comfyui-mcp@latest connect http://<comfyui-host>:8188
+```
+
+然后在面板中点击“连接”。ComfyUI 那台机器上除了 ComfyUI 和面板自定义节点
+之外，不需要运行任何东西。如果 ComfyUI 走的是 **https**（RunPod 代理），
+编排器会自动把桥接升级为安全的 `wss://` 隧道——命令完全相同。
+
+**或者在服务器端运行编排器（≥ 0.24.5）**——适用于 7×24 小时的无头机器
+（例如一台独立的 Ollama/OpenClaw 服务器）：智能体应当与 ComfyUI 部署在一起，
+而浏览器可以从局域网的任意位置连接：
+
+```bash
+# on the SERVER — bind the bridge on the LAN, token-gated (mandatory)
+COMFYUI_MCP_BRIDGE_HOST=0.0.0.0 \
+COMFYUI_MCP_BRIDGE_TOKEN=<pick-a-long-secret> \
+npx -y comfyui-mcp@latest --panel-orchestrator
+```
+
+它会打印一个可直接粘贴的 `ws://<server-ip>:9180/?token=…`——把它填到任意
+机器上面板的**设置 → 高级 → 桥接 URL**里，然后点击“连接”。非回环地址的绑定
+在**没有令牌时会拒绝启动**，并且每一个连接都会在 WebSocket 升级时校验
+（常数时间比较）。请像对待密码一样对待这个 URL：任何拿到它的人都能驱动
+你的智能体。
+
+## 新版本已经发布，但我看到的仍是旧行为
+
+`npx` 会非常激进地缓存包——`npx -y comfyui-mcp@latest` 可能会拿出
+`~/.npm/_npx` 里几周前的构建。
+
+```bash
+# clear it, then relaunch
+npx clear-npx-cache
+# or on Windows:
+#   Remove-Item -Recurse -Force "$env:LOCALAPPDATA\npm-cache\_npx"
+```
+
+也检查一下面板自定义节点：如果它来自较早的安装、位于**网络卷**上
+（RunPod 的 `/workspace`），那份副本会遮蔽镜像中会自动更新的那一份。执行
+`git -C <panel-dir> fetch && git -C <panel-dir> reset --hard origin/main`，
+或从 ComfyUI-Manager 重新安装 `comfyui-agent-panel`，然后重启 ComfyUI 并
+强制刷新浏览器标签页（Ctrl+Shift+R）。
+
+## 端口转发的远程 ComfyUI 被误判为本地（dstack、SSH 隧道）
+
+通过 `localhost:8188` 访问的远程 ComfyUI（dstack、`ssh -L`、kubectl
+port-forward）会让回环判定失灵：comfyui-mcp 会认为这是本地安装，从而在一个
+根本没有 ComfyUI 的文件系统上启用仅限本地的工具。
+
+**解决（≥ 0.24.1）：** 传入 `--force-remote`（或 `COMFYUI_MCP_FORCE_REMOTE=1`）：
+
+```bash
+npx -y comfyui-mcp@latest connect http://localhost:8188 --force-remote
+```
+
+远程目标的生成历史保存在 `~/.comfyui-mcp/instances/<host_port>/`
+（可用 `COMFYUI_MCP_DATA_DIR` 覆盖）。
+
+## Docker：容器在 HTTP 模式下立即退出
+
+在没有鉴权的情况下绑定非回环主机会**按设计直接失败**（`0.0.0.0` 上开放的
+`/mcp` 端点会被暴露）。请传入令牌，或显式退出该检查：
+
+```bash
+docker run --rm -p 9100:9100 -e COMFYUI_MCP_HTTP_TOKEN=changeme comfyui-mcp \
+  --http --host 0.0.0.0 --port 9100
+# or (trusted networks only):
+#   ... --http --host 0.0.0.0 --port 9100 --allow-unauthenticated-non-loopback
+```
+
+stdio 模式（默认方式，也是 MCP 客户端使用的方式）完全不需要这些。
+
+## 智能体从不调用工具——没有报错，只是一直在说话
+
+它描述你的工作流而不是去读取它，或者提出替你写一个脚本。之所以没有报错，是
+因为并没有任何东西失败：要么工具根本没有送达你的客户端，要么你的客户端拦下
+了这些调用，要么该能力确实存在、只是名称从未被提及。这三种情况从外部看完全
+一样，解决办法却截然相反，所以猜测不如动手确认。
+
+向你的智能体提两个问题就能区分它们——参见
+[当它什么都不说时](/docs/using-tools#when-it-says-nothing)。注意：客户端侧的
+权限拦截根本不会到达本服务器，因此下面提到的任何日志中都不会出现它。
+
+## 本地模型：工具调用失败，或模型“看不到”工具
+
+- **第一步：使用[我们的微调模型](/docs/local-llms#our-fine-tuned-local-models-free-recommended)**——
+  `ollama pull artokun/gemma4-comfyui-mcp:e4b`（面板的 Ollama 默认模型）。
+  它是在 comfyui-mcp 工具集本身上训练的 Gemma 4，开箱即用地消除了大部分
+  “选错工具 / 参数格式错误”的失败（约 2 GB VRAM 用 `:e2b`，约 8 GB 用
+  `:12b`——每一档在竞技场上都胜过它对应的原版基础模型；`:e4b` 依然是最佳
+  平衡点）。
+- **gemma3 在 Ollama 中没有原生工具调用**——不受支持；请改用上面的微调
+  模型、原版 `gemma4`（e4b 及以上）、`qwen3` 或 `llama3.1+`。
+- 小模型请开启[紧凑工具模式](/docs/local-llms)——它**不是**默认设置，
+  因此启动服务器时要加上 `--compact`（或
+  `COMFYUI_MCP_TOOL_MODE=compact`）。不开启的话，完整的 schema 会撑爆
+  小上下文，模型就会开始编造工具名。
+- 冷启动加载模型时，第一个 token 可能要等 30 秒以上——面板的看门狗已经
+  考虑到这一点；但如果请求瞬间就失败，通常说明该模型标签还没拉取
+  （`ollama pull <tag>`）。
+- **所有请求突然失败 / 11434 端口连接被拒绝**——Ollama 应用/守护进程
+  没有在运行。退出托盘应用会连带杀掉 API，而在智能体运行到一半时很容易
+  误操作（面板不会提示当前正在使用本地后端）。重新启动该应用（或运行
+  `ollama serve`）并重新连接——会话会恢复，无需重启面板。
+
+## 到哪里查看日志
+
+- **编排器**：运行 `connect` / `--panel-orchestrator` 的那个终端。
+- **ComfyUI 端**：`get_system_stats (action:"logs")` MCP 工具，或 RunPod 上实例的日志流。
+- **面板 JS**：浏览器开发者工具的控制台（桥接客户端会记录连接/重连的
+  状态变化）。
+- **一次调用查看健康状况**：`get_system_stats (action:"health")` 工具会汇总
+  版本/GPU/VRAM/队列/模型目录/近期错误。

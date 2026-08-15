@@ -1,6 +1,6 @@
 // Agent backend port — the provider-neutral seam that lets the panel orchestrator
 // run on different agent providers (Claude Agent SDK today, OpenAI Codex next) via
-// dependency injection. See docs/design/agent-backend-injection.md.
+// dependency injection. See design/agent-backend-injection.md.
 //
 // PanelAgent keeps the orchestration (queue, turn-gate, bridge push, rewind-anchor
 // tracking, self-restart) and delegates the provider-specific bits — opening a

@@ -1,0 +1,91 @@
+---
+title: "ComfyUI MCP"
+description: "Локальная по умолчанию, изначально агентная плоскость управления для ComfyUI — MCP-сервер и плагин Claude Code, который генерирует изображения, видео и аудио, создаёт и запускает воркфлоу, управляет моделями и кастомными узлами на естественном языке. Локально, удалённо или в Comfy Cloud."
+icon: "house"
+---
+
+**ComfyUI MCP** — это **локальная по умолчанию, изначально агентная плоскость управления** для
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI): [MCP](https://modelcontextprotocol.io)-сервер
+и плагин Claude Code. Он подключает вашего ИИ-ассистента к работающему экземпляру ComfyUI —
+**локальному**, **удалённому** или **[Comfy Cloud](https://cloud.comfy.org)**, — чтобы вы могли
+генерировать изображения, видео и аудио, запускать и создавать воркфлоу, управлять моделями и
+кастомными узлами и управлять сервером — всё это на естественном языке. Это не тонкий мост
+«промпт → изображение», а полноценный агент, который работает с ComfyUI за вас.
+
+<Frame caption="Панель агента управляет ComfyUI от начала до конца — читает, что установлено локально, собирает граф, освобождает VRAM и запускает рендер">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="Быстрый старт" icon="rocket" href="/docs/ru/quickstart">
+    Добавьте сервер в Claude Code и сгенерируйте первое изображение примерно за 2 минуты.
+  </Card>
+  <Card title="Справочник инструментов" icon="wrench" href="/docs/tools/image-generation">
+    37 инструментов, документация автоматически собрана из их актуальных схем.
+  </Card>
+  <Card title="Установка" icon="download" href="/docs/ru/installation">
+    Установите ComfyUI и подключите MCP-сервер (локальный или удалённый).
+  </Card>
+  <Card title="Конфигурация" icon="gear" href="/docs/configuration">
+    Переменные окружения, транспорты, токены и подключение к удалённому ComfyUI.
+  </Card>
+</CardGroup>
+
+## Что вы можете делать
+
+<CardGroup cols={3}>
+  <Card title="Генерация" icon="image">
+    Генерация изображения по тексту через `generate_image`, а также кондиционирование
+    ControlNet и IP-Adapter.
+  </Card>
+  <Card title="Создание воркфлоу" icon="pen-ruler">
+    Создавайте из шаблонов, изменяйте, проверяйте, визуализируйте и конвертируйте туда-обратно
+    в компактный DSL.
+  </Card>
+  <Card title="Управление моделями" icon="box">
+    Ищите на HuggingFace/CivitAI, скачивайте, просматривайте и удаляйте модели.
+  </Card>
+  <Card title="Кастомные узлы" icon="puzzle">
+    Устанавливайте, обновляйте, делайте снимки и bisect пакетов узлов через ComfyUI-Manager.
+  </Card>
+  <Card title="Установка и обслуживание" icon="terminal">
+    Устанавливайте и обновляйте ComfyUI, изучайте окружение, запускайте и останавливайте сервер.
+  </Card>
+  <Card title="Локально, удалённо или в облаке" icon="globe">
+    Автоматически находит локальную установку, указывает на удалённую через `--comfyui-url` или
+    обращается к [Comfy Cloud](https://cloud.comfy.org) через `COMFYUI_API_KEY` — локальный
+    ComfyUI не нужен.
+  </Card>
+</CardGroup>
+
+<Note>
+  Работает на **macOS**, **Linux** и **Windows**, автоматически определяет локальную установку
+  ComfyUI и её порт. Исходный код и issues — на [GitHub](https://github.com/artokun/comfyui-mcp).
+</Note>
+
+## Область применения: локально, удалённо или Comfy Cloud
+
+`comfyui-mcp` — это MCP от сообщества для **локального** и **удалённого** ComfyUI, и это основной
+сценарий (установки на Mac/Linux/Windows, RunPod, VPS, LAN и т. д.).
+
+Для пользователей **Comfy Cloud** у Comfy-Org есть [официальный агентский инструментарий](https://docs.comfy.org/agent-tools) — Comfy Cloud MCP (публичная бета) и Comfy In-App Agent (закрытая альфа), — который поддерживает команда Comfy и который работает на Comfy Cloud. Если у вас нет GPU или вы хотите обойтись вообще без настройки, используйте его ([сравнение бок о бок](/docs/local-vs-comfy-cloud)). В `comfyui-mcp` также есть облачный режим от сообщества (`COMFYUI_API_KEY`), так что один MCP может работать со всеми тремя вариантами развёртывания из одной конфигурации — выберите тот, который подходит вашему рабочему процессу.
+
+---
+
+## Сопровождающий
+
+Разработку и поддержку ведёт [**@artokun**](https://github.com/artokun) — постоянный контрибьютор
+в [Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)
+(рендерер графа v2 / рендеринг подграфов / вынесенные виджеты) и в
+[Python-ядро ComfyUI](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun).
+
+**Команда Comfy-Org** (или любой, кто нанимает в экосистеме ComfyUI): [art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com).

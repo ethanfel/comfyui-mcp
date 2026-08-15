@@ -48,8 +48,8 @@ string, common field aliases (`tool_name`, `arguments`) are accepted, and
 validation errors come back with the expected schema so the model can
 self-correct instead of dying on an opaque protocol error.
 
-Compact is the **default** — no flags needed. The opt-ins below are only
-needed to force a mode explicitly (the flag wins over the env var):
+Compact is **opt-in** — the direct surface is the default, so a small model
+needs one of these (the flag wins over the env var):
 
 ```bash
 npx -y comfyui-mcp --compact
@@ -57,10 +57,9 @@ npx -y comfyui-mcp --compact
 COMFYUI_MCP_TOOL_MODE=compact npx -y comfyui-mcp
 ```
 
-`--full` / `--tool-mode full` / `COMFYUI_MCP_TOOL_MODE=full` opts back into
-the classic full-schema surface — right for frontier-model harnesses
-(Claude Code / Cursor / Claude Desktop) whose clients handle large tool
-lists well.
+The default suits frontier-model harnesses (Claude Code / Cursor / Claude
+Desktop), whose clients handle large tool lists well. `--full` is still
+accepted and is now a no-op.
 
 ### Auto-selection: keyed on the model, not the provider
 

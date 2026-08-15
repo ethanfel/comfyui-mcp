@@ -505,3 +505,41 @@ export class SessionStore {
     return this.flush();
   }
 }
+
+/**
+ * Move a tab's trusted workflow command stamp onto the id that replaced it (#1331).
+ *
+ * RESTORES A FUNCTION THIS REPO ALREADY HAD. #436 shipped `carryWorkflowCommandStamp` for
+ * exactly this, with a note that deleting the stamp "flapped sessions"; the #884
+ * orchestrator-scoped-sessions refactor rewrote the migration block and left a bare
+ * `delete` behind. The argument survived in the comments around it — including a paragraph
+ * naming this precise scenario — while the code implementing it did not.
+ *
+ * A same-socket re-hello mints a new tab id on a workflow switch, a save/rename
+ * (tmp: → wf:), or an id-scheme change. Deleting the stamp there and re-setting it only
+ * when THIS hello resolves an identity means a reconnect hello that lands before the canvas
+ * identity is readable leaves the tab with no stamp at all, and every fenced command is
+ * refused for the rest of the session.
+ *
+ * CARRYING CANNOT WIDEN AUTHORIZATION: the panel authorizes a fenced command iff the stamp
+ * equals the live active workflow uuid, so a carried-but-stale stamp naming workflow A on a
+ * canvas showing B is refused exactly as an absent one would be. What it avoids is the
+ * unrecoverable half — an absent stamp makes the bridge send frames with no workflow_uuid,
+ * which the panel also counts as a mismatch, and the panel's re-advertise repair is capped
+ * at 3 attempts per identity.
+ *
+ * Extracted and CALLED by the hello handler rather than inlined, so the tests exercise the
+ * function production runs instead of a re-implementation of what it ought to do.
+ */
+export function carryWorkflowCommandStamp(
+  stamps: Map<string, string>,
+  migratedFrom: string,
+  panelTab: string,
+): void {
+  const carried = stamps.get(migratedFrom);
+  // An entry already recorded for the new id is NEWER evidence than anything held under
+  // the old one, so it wins.
+  if (carried !== undefined && !stamps.has(panelTab)) stamps.set(panelTab, carried);
+  // The old id is still retired: a straggler command addressed to it must not resolve.
+  stamps.delete(migratedFrom);
+}

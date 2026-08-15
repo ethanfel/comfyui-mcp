@@ -34,6 +34,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { npxUpdateNote } from "./npx-restart-scope.js";
 
 /** npm package name — authoritative for the registry lookup and update command. */
 export const PACKAGE_NAME = "comfyui-mcp";
@@ -907,7 +908,7 @@ export async function selfUpdateStatus(
   } else if (!updateAvailable) {
     note = `Up to date (${info.currentVersion}).`;
   } else if (info.mode === "npx") {
-    note = `${latest} available — npx fetches the latest on next run; restart to pick it up.`;
+    note = npxUpdateNote(latest);
   } else if (info.mode === "unknown") {
     note = `${latest} available — could not classify install; update manually.`;
   } else {
@@ -996,7 +997,7 @@ export async function runSelfUpdate(
     to: latest,
     note:
       info.mode === "npx"
-        ? `${latest} available — npx fetches the latest on next run; restart to pick it up.`
+        ? npxUpdateNote(latest)
         : `${latest} available — could not classify install; update manually.`,
   };
 }

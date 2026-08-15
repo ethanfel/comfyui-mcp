@@ -47,6 +47,14 @@ policy:
 Every attached image is resolved from its ComfyUI ref into inline base64 and
 sent, every time, to every model. Then one of three things happens:
 
+<Note>
+Two backends are declared `vision: false` in `agent-backend.ts` and opt out of this
+entirely: **agy** and **pi**, the third-party headless coding-agent CLIs. Neither
+documents any image input in the mode we drive it in, so there is nothing to attempt
+and nothing to strip — the capability is reported as absent up front rather than
+discovered by a rejected request.
+</Note>
+
 1. **The model sees it.** Great — that's the point.
 2. **The model silently ignores it** (text-only model, tolerant endpoint). Not
    ideal, but not harmful — and increasingly rare as servers get stricter.

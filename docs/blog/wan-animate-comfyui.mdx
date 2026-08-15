@@ -1,5 +1,5 @@
 ---
-title: "WAN Animate 2.2 in ComfyUI: Character Replace (2026)"
+title: "WAN Animate 2.2 in ComfyUI: Character Replace"
 description: "Replace any character in a video from ONE reference image, or transfer motion to a still, with WAN Animate 2.2 in ComfyUI. Install, VRAM, fixes."
 keywords:
   - WAN Animate ComfyUI
@@ -10,6 +10,7 @@ keywords:
   - video to video ComfyUI
   - motion transfer AI video
   - kijai WanVideoWrapper
+verified: 2026-08-14
 ---
 
 _by [artokun](https://github.com/artokun) · June 16, 2026 · wan · video · ComfyUI · model highlight_
@@ -30,8 +31,9 @@ instead of hand-cloning six custom-node repos and chasing dtype errors.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `wan-animate` pack
 > (`apply_manifest --path packs/wan-animate/manifest.yaml`, or run the generated
-> installer), install SageAttention + Triton with the bundled `.bat`, then drive
-> the graph from your own Claude session via the Panel. Jump to
+> installer), then drive the graph from your own Claude session via the Panel. The
+> shipped graph asks for SageAttention — if you don't have it, set `attention_mode`
+> to `sdpa` and skip the toolchain entirely. Jump to
 > [Install](#install-wan-animate-2-2-in-comfyui).
 
 ## What is WAN Animate 2.2?
@@ -89,6 +91,20 @@ Where rivals win: VACE for breadth of edit types, T2V for from-scratch creation,
 LTX for raw speed. WAN Animate earns the spotlight for the one thing it's built
 to dominate — **driving a character with another character's performance.**
 
+## Licensing
+
+**WAN Animate 2.2 is Apache 2.0** — fully permissive, commercial use included.
+[Wan-AI/Wan2.2-Animate-14B](https://huggingface.co/Wan-AI/Wan2.2-Animate-14B) states
+it in the model card: the models in the repository are licensed under Apache 2.0.
+
+That is rare in the video-model space and is a large part of why this model got
+adopted so fast against the closed Runway and ByteDance options — you can put
+character replacement into a commercial pipeline without negotiating anything.
+
+The detection and segmentation models the pack pulls alongside it (SeC, ViTPose,
+YOLO) are separate projects with their own terms; check those if you redistribute
+the bundle rather than just using it.
+
 ## System & VRAM requirements
 
 The pack targets the **14B fp8-scaled** build. Plan for **24 GB+** for a smooth
@@ -127,12 +143,20 @@ apply_manifest --path packs/wan-animate/manifest.yaml
 # (the folder containing custom_nodes/ and models/)
 ```
 
-> **Required: SageAttention + Triton.** The WanVideoWrapper sampler needs them.
-> Run the bundled `install_triton_and_sageattention_auto.bat` from your portable
-> Python folder (`...\ComfyUI_windows_portable\python_embeded\`) **before your first
-> generate**. It detects your Torch/CUDA, installs `triton-windows` and the matching
-> woct0rdho SageAttention wheel, and drops the Python include/libs zip so Triton can
-> compile. Restart ComfyUI afterward, then load `workflow.json`.
+> **The shipped graph asks for SageAttention.** `WanVideoModelLoader` is set to
+> `attention_mode: sageattn`, which needs `triton-windows` plus a matching
+> SageAttention wheel in the Python that runs ComfyUI (on Windows portable, that is
+> `...\ComfyUI_windows_portable\python_embeded\`). **This pack does not install
+> them**, and it does not ship a script that does — if you have seen
+> `install_triton_and_sageattention_auto.bat` referenced, that is a third-party
+> community helper, not something included here.
+>
+> **You do not have to install either.** Set `attention_mode` to **`sdpa`** on the
+> `WanVideoModelLoader` node and the graph runs on stock PyTorch attention — slower
+> per step, no Triton, no wheel matching. That is a supported value on this exact
+> node; the [`wan-pusa-extend`](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-pusa-extend)
+> pack ships `sdpa` for the same reason. Switch to `sageattn` later if you want the
+> speed and have the toolchain working.
 
 Because the pack ships with the [plugin](../plugin), your **own Claude session can
 drive the live graph through the [Panel](../panel)** — load the reference image,
@@ -219,8 +243,10 @@ If you're already running our WAN stack, note that the WAN 2.2 T2V pack also shi
   from the matching CUDA index, e.g.
   `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128`
   (use the `cuXXX` matching your driver).
-- **Triton/SageAttention errors at sampling.** Re-run
-  `install_triton_and_sageattention_auto.bat` from `python_embeded\` and restart.
+- **Triton/SageAttention errors at sampling.** Set `attention_mode` to `sdpa` on the
+  `WanVideoModelLoader` node and restart — that removes the dependency entirely and
+  costs only speed. Chasing a working Triton + SageAttention wheel pair is the harder
+  path, and nothing in this pack installs them for you.
 - **Masking is wrong / character not isolated.** The shipped workflow defaults to
   **SeC** (manual/prompted); the SAM2 auto path is muted. Pick the matching
   mask / background_image getter per the in-graph notes.
@@ -262,9 +288,9 @@ not a universal benchmark.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`wan-animate` pack** — nodes + models land in the right folders, validated.
-3. Run `install_triton_and_sageattention_auto.bat`, restart, and load `workflow.json`.
+3. Restart and load `workflow.json`. If you don't have Triton + SageAttention set up, set `attention_mode` to `sdpa` on the `WanVideoModelLoader` node — slower, but no toolchain to install.
 4. Open the [Panel](../panel) and let the panel's agent load the image, point at the driving video, and iterate.
 
 That's the whole point of the project: expert ComfyUI setups that install in one

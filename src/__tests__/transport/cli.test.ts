@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   exportExplicitToolMode,
+  helpRow,
   parseCliArgs,
   renderCliHelp,
   validateConnectUrl,
 } from "../../transport/cli.js";
+import { displayWidth } from "../../i18n/terminal-layout.js";
+import { __resetI18nForTest, trFor } from "../../i18n/index.js";
 
 const base = ["node", "comfyui-mcp"];
 
@@ -238,7 +241,34 @@ describe("validateConnectUrl", () => {
   });
 });
 
+/**
+ * Pin the CLI's language for a block of assertions.
+ *
+ * Not optional hygiene: `renderCliHelp()` now runs every string through `tr()`, and `tr()`
+ * resolves its locale from COMFYUI_MCP_LANG / LC_ALL / LC_MESSAGES / LANG. A contributor
+ * whose shell is `LANG=ko_KR.UTF-8` — the entire audience this feature is for — would
+ * otherwise get a red suite on an unmodified tree, and the `(active: …)` row makes that true
+ * TODAY, before any catalog exists. COMFYUI_MCP_LANG is set rather than the others because
+ * it wins the precedence chain outright, so one variable is enough to pin the answer.
+ */
+function pinLocale(locale: string): () => void {
+  const prev = process.env.COMFYUI_MCP_LANG;
+  process.env.COMFYUI_MCP_LANG = locale;
+  __resetI18nForTest();
+  return () => {
+    if (prev === undefined) delete process.env.COMFYUI_MCP_LANG;
+    else process.env.COMFYUI_MCP_LANG = prev;
+    __resetI18nForTest();
+  };
+}
+
 describe("--help (#860)", () => {
+  let restore = () => {};
+  beforeEach(() => {
+    restore = pinLocale("en");
+  });
+  afterEach(() => restore());
+
   it("sets help for both --help and -h, and does not disturb other options", () => {
     for (const flag of ["--help", "-h"]) {
       const cli = parseCliArgs([...base, flag], {});
@@ -294,5 +324,89 @@ describe("--help (#860)", () => {
     ]) {
       expect(help, `${flag} must appear in --help`).toContain(flag);
     }
+  });
+
+  it("consumes --lang's value so it cannot be read as an operand", () => {
+    // The parser stores nothing for `--lang` — processLocale() reads it off argv directly,
+    // because the locale has to be resolved before this parser runs. But the VALUE still has
+    // to be eaten: `connect` and `setup` both take their operand from the next bare token,
+    // so a loose locale code sitting in argv is one keystroke away from being read as one.
+    for (const argv of [
+      [...base, "--lang", "ko", "setup", "hermes"],
+      [...base, "--lang=ko", "setup", "hermes"],
+    ]) {
+      expect(parseCliArgs(argv, {}).setupAgent, argv.join(" ")).toBe("hermes");
+    }
+    // ...and the flag itself must not be mistaken for an operand either.
+    expect(parseCliArgs([...base, "setup", "--lang", "ko"], {}).setupAgent).toBe("");
+    expect(parseCliArgs([...base, "connect", "--lang", "ko"], {}).comfyuiUrl).toBeUndefined();
+    expect(parseCliArgs([...base, "connect", "http://x:8188", "--lang", "ko"], {}).comfyuiUrl).toBe(
+      "http://x:8188",
+    );
+  });
+
+  it("documents --lang, the one flag parseCliArgs never sees", () => {
+    // `--lang` is read straight out of argv by processLocale(), so the "every flag the
+    // parser accepts" test above structurally cannot cover it — and a language switch
+    // nobody can find is the same undiscoverability #860 was about.
+    const help = renderCliHelp();
+    expect(help).toContain("--lang <code>");
+    expect(help).toContain("env: COMFYUI_MCP_LANG");
+  });
+});
+
+describe("--help is translated, and degrades to English", () => {
+  let restore = () => {};
+  afterEach(() => restore());
+
+  it("renders the shipped catalog, and never a raw key", () => {
+    // This test used to assert the OPPOSITE — that a Korean screen came back byte-identical
+    // to English — because no catalog existed to render. That was the honest assertion then
+    // and is a false one now: locales/ko/main.json ships, so the prose has to move.
+    //
+    // What survives the change is the pair that actually matters. The descriptions are the
+    // reader's half and must be translated; the left column is what the user TYPES and must
+    // not be. And a raw `cli.*` key on screen is the failure mode a missing fallback produces,
+    // which no amount of translation should ever be able to cause.
+    restore = pinLocale("en");
+    const english = renderCliHelp();
+    restore();
+    restore = pinLocale("ko");
+    const korean = renderCliHelp();
+
+    // The parenthetical around the active locale is itself a translated key, so match the
+    // row rather than the English sentence: `env: <VAR>` is typed, `ko` is the answer.
+    expect(korean).toMatch(/env: COMFYUI_MCP_LANG {2,}\(\S+: ko\)/);
+    expect(english).toContain("env: COMFYUI_MCP_LANG   (active: en)");
+    expect(korean).not.toBe(english);
+    expect(korean).toMatch(/[가-힣]/);
+    expect(korean).not.toMatch(/\bcli\.[a-z_]+\b/);
+    for (const typed of ["comfyui-mcp connect [<comfyui-url>]", "--tool-mode <compact|full>", "--host <host>", "env: MCP_PORT", "-h, --help"]) {
+      expect(korean).toContain(typed);
+    }
+  });
+
+  it("still falls back to English for a key no catalog carries", () => {
+    // The degradation path, now that it can no longer be observed from the assembled screen.
+    // Every release between a NEW `tr()` call site and its translation lives here, and the
+    // guarantee is a complete English sentence rather than a key.
+    expect(trFor("ko", "cli.help_not_a_real_key", "start the MCP server")).toBe("start the MCP server");
+  });
+
+  it("lays the two columns out in terminal CELLS, not characters", () => {
+    // The mutation this catches: `padTo(...)` swapped for `String.prototype.padEnd`.
+    //
+    // Written when no catalog existed, at which point every string on the screen was ASCII, the
+    // assembled output was IDENTICAL under both, and this helper was the ONLY place the
+    // difference could be observed. Catalogs ship now, so the full-screen test above would also
+    // notice — but only for the locales it happens to render. This stays because it isolates
+    // the property (cells, not characters) from any particular translation.
+    const ascii = helpRow("--host <host>", "HTTP bind host", "env: MCP_HOST");
+    const korean = helpRow("--host <host>", "호스트", "env: MCP_HOST");
+    expect(displayWidth(ascii.slice(0, ascii.indexOf("env:")))).toBe(
+      displayWidth(korean.slice(0, korean.indexOf("env:"))),
+    );
+    // ...and prove the naive version would have disagreed here.
+    expect(korean.indexOf("env:")).not.toBe(ascii.indexOf("env:"));
   });
 });

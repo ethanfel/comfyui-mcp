@@ -1,0 +1,86 @@
+---
+title: "ComfyUI MCP"
+description: "ComfyUI 的本機優先、代理原生控制平面 —— 一個 MCP 伺服器 + Claude Code 外掛，用自然語言生成圖片、影片與音訊，撰寫並執行工作流程，管理模型與自訂節點。支援本機、遠端或 Comfy Cloud。"
+icon: "house"
+---
+
+**ComfyUI MCP** 是 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 的**本機優先、代理原生控制平面**
+—— 一個 [MCP](https://modelcontextprotocol.io) 伺服器，同時也是 Claude Code 外掛。它把你的 AI 助理
+連上正在執行的 ComfyUI 實例 —— **本機**、**遠端**或 **[Comfy Cloud](https://cloud.comfy.org)** ——
+讓你用自然語言生成圖片、影片與音訊，執行並撰寫工作流程，管理模型與自訂節點，還能控制伺服器。
+它不是單薄的「提示詞轉圖片」橋接，而是一個替你操作 ComfyUI 的完整代理。
+
+<Frame caption="代理面板端到端地驅動 ComfyUI —— 讀取本機已安裝的內容、為節點圖接線、釋放 VRAM，然後執行算圖">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="快速上手" icon="rocket" href="/docs/zh-TW/quickstart">
+    把伺服器加進 Claude Code，約 2 分鐘就能生成第一張圖片。
+  </Card>
+  <Card title="工具參考" icon="wrench" href="/docs/tools/image-generation">
+    37 個工具，說明皆由其即時 schema 自動產生。
+  </Card>
+  <Card title="安裝" icon="download" href="/docs/zh-TW/installation">
+    安裝 ComfyUI 並接上 MCP 伺服器（本機或遠端）。
+  </Card>
+  <Card title="設定" icon="gear" href="/docs/configuration">
+    環境變數、傳輸方式、權杖，以及遠端目標的指定。
+  </Card>
+</CardGroup>
+
+## 你可以做什麼
+
+<CardGroup cols={3}>
+  <Card title="生成" icon="image">
+    用 `generate_image` 做文生圖，並支援 ControlNet 與 IP-Adapter 條件控制。
+  </Card>
+  <Card title="撰寫工作流程" icon="pen-ruler">
+    從範本建立，並進行修改、驗證、視覺化，還能與精簡 DSL 雙向轉換。
+  </Card>
+  <Card title="管理模型" icon="box">
+    搜尋 HuggingFace/CivitAI，下載、列出並移除模型。
+  </Card>
+  <Card title="自訂節點" icon="puzzle">
+    透過 ComfyUI-Manager 安裝、更新、快照與二分排查節點包。
+  </Card>
+  <Card title="安裝與維護" icon="terminal">
+    安裝／更新 ComfyUI，檢查執行環境，啟動／停止伺服器。
+  </Card>
+  <Card title="本機、遠端或雲端" icon="globe">
+    自動偵測本機安裝，用 `--comfyui-url` 指向遠端，或透過 `COMFYUI_API_KEY` 與
+    [Comfy Cloud](https://cloud.comfy.org) 通訊 —— 不需要本機的 ComfyUI。
+  </Card>
+</CardGroup>
+
+<Note>
+  可在 **macOS**、**Linux** 與 **Windows** 上運作，並會自動偵測本機的 ComfyUI 安裝與連接埠。
+  原始碼與 issue 都在 [GitHub](https://github.com/artokun/comfyui-mcp)。
+</Note>
+
+## 適用範圍：本機、遠端或 Comfy Cloud
+
+`comfyui-mcp` 是面向**本機**與**遠端** ComfyUI 的社群 MCP —— 這就是它的主要對象
+（Mac/Linux/Windows 上的安裝、RunPod、VPS、區域網路等）。
+
+給 **Comfy Cloud** 使用者：Comfy-Org 提供了[官方代理工具](https://docs.comfy.org/agent-tools) —— Comfy Cloud MCP（公開 Beta）與 Comfy In-App Agent（私人 Alpha）—— 由 Comfy 團隊維護，並執行在 Comfy Cloud 上。如果你沒有 GPU，或想要零設定就開始，就用那一套（[並列比較](/docs/local-vs-comfy-cloud)）。`comfyui-mcp` 也內建了社群版的雲端模式（`COMFYUI_API_KEY`），所以單一個 MCP 就能從同一份設定指向這三種部署形態 —— 挑最合你工作方式的那一種。
+
+---
+
+## 維護者
+
+由 [**@artokun**](https://github.com/artokun) 開發並維護 —— 他是
+[Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)
+（v2 節點圖渲染器／子圖渲染／提升的控制項）與
+[ComfyUI Python 核心](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun)的長期貢獻者。
+
+**Comfy-Org 的各位**（或任何在 ComfyUI 生態系裡招人的朋友）：[art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com)。

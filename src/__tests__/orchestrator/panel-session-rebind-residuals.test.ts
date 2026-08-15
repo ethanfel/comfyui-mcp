@@ -331,7 +331,13 @@ describe("#474 panel_set_workflow_target({mode:'current'}) recovery", () => {
     const ctx = makePanelToolCtx(bridge, "dead-tab", new WorkflowTargetStore());
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toMatch(/Multiple panel tabs/);
+    // #971 — this used to match the BRIDGE's raw /Multiple panel tabs/, which ended
+    // "— pass tab_id". This tool has no tab_id parameter and #754 strict schemas make
+    // an unknown key a hard error, so that instruction could not be followed and the
+    // session had no exit. The refusal is unchanged (still fails, still does not
+    // defer, still does not guess); only its wording is now actionable.
+    expect(textOf(res)).toMatch(/Several ComfyUI tabs are connected/i);
+    expect(textOf(res)).not.toMatch(/pass tab_id/i);
     expect(ctx.tabId).toBe("dead-tab");
   });
 
@@ -446,12 +452,29 @@ describe("#442 defect 4: a MUTATING panel command names the rebind on a no-route
     expect(text).not.toMatch(/Retry in a moment/);
   });
 
-  it("#709: a NO-IDENTITY refusal (not capability-marked) keeps the retry/rebind wrapper", async () => {
+  it("#709/#1331: a NO-IDENTITY refusal carries an actionable recovery, now MEASURED", async () => {
     // Same gate, THIRD branch: the panel enforces the stamp but the workflow has no
-    // trusted identity to fence against — a binding/identity problem where retrying
-    // or rebinding onto the live tab genuinely re-resolves the identity. The error
-    // is dispatched:false but deliberately NOT capability-marked, so the generic
-    // recovery wrapper MUST still fire.
+    // trusted identity to fence against. The error is dispatched:false but deliberately
+    // NOT capability-marked, so this must NOT be left bare — #709's requirement, and it
+    // still holds.
+    //
+    // WHAT CHANGED (#1331), and why this test moved with it. #709 asserted the LITERAL
+    // generic wrapper, "rebind with panel_set_workflow_target({mode:'current'})". Two
+    // different states produce this identical message and they need opposite remedies:
+    // when the session is bound to a stale tab and the LIVE canvas has an identity, the
+    // rebind genuinely re-resolves it; when the live canvas has none, the rebind reads
+    // an identity to adopt, finds none, and reports success while every mutation keeps
+    // failing. The reporter of #1331 got the second and followed the advice for the
+    // first, costing four calls to reach a state the panel already believed it was in.
+    //
+    // So the orchestrator now MEASURES which state it is in rather than printing one
+    // remedy for both. The requirement #709 protects — an actionable recovery, the
+    // cause preserved, nothing applied — is unchanged and asserted below.
+    //
+    // The bridge also had to become realistic: it used to throw the identity refusal
+    // for EVERY command, including workflow_list. That state cannot occur — the
+    // refusal's own text says read-only commands still work — and it is what a
+    // re-derivation reads.
     const identityCause = markDispatched(
       new Error(
         `"graph_set_widget" cannot be safely targeted to the active workflow: this workflow ` +
@@ -462,15 +485,31 @@ describe("#442 defect 4: a MUTATING panel command names the rebind on a no-route
     );
     const live = new Set(["wf:workflows/x.json"]);
     const sent: Array<{ cmd: Record<string, unknown> }> = [];
+    const LIVE_UUID = "44444444-4444-4444-8444-444444444444";
+    let listCalls = 0;
     const bridge = {
       send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
         if (opts?.tabId && !live.has(opts.tabId)) throw new Error("unexpected route");
+        if (cmd.cmd === "workflow_list") {
+          // #709's actual state: the LIVE canvas does have an identity, so the rebind
+          // can re-resolve it — which is precisely why retry/rebind was right here.
+          listCalls += 1;
+          const active = {
+            path: "workflows/x.json",
+            routing_key: "wf:workflows/x.json",
+            workflow_uuid: LIVE_UUID,
+          };
+          return { active, workflows: [{ ...active, active: true }], active_confirmed: true };
+        }
         throw identityCause;
       },
       push: () => 1,
       canReach: (id: string) => live.has(id),
+      isHeadless: () => false,
       tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
       resolveActiveTabId: () => [...live][0],
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => ({ known: true, uuid: LIVE_UUID }),
     } as unknown as PanelToolCtx["bridge"];
     const ctx = makePanelToolCtx(bridge, "wf:workflows/x.json", new WorkflowTargetStore());
 
@@ -482,8 +521,13 @@ describe("#442 defect 4: a MUTATING panel command names the rebind on a no-route
     expect(sent.length).toBe(0);
     const text = textOf(res);
     expect(text).toMatch(/no trusted identity/); // the cause is preserved…
-    expect(text).toContain('rebind with panel_set_workflow_target({mode:"current"})'); // …AND the wrapper fires
-    expect(text).toMatch(/Nothing was applied/i);
+    // …the live canvas was actually re-read — not asserted from text alone…
+    expect(listCalls).toBeGreaterThan(0);
+    // …and the recovery is the one that fits THIS state: the fence was re-derived, so
+    // the caller retries rather than being sent to re-open a workflow that is fine.
+    expect(text).toMatch(/CHECKED: the live canvas DOES carry an identity/);
+    expect(text).toContain(LIVE_UUID);
+    expect(text).toMatch(/RETRY THIS EXACT CALL ONCE/);
   });
 
   it("does NOT mis-wrap a POST-dispatch executor failure that merely quotes 'no connected tab' as 'nothing applied'", async () => {    // A LIVE tab that ACCEPTS the command (it IS dispatched, pushed to `sent`) but whose

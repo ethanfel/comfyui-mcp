@@ -5092,9 +5092,34 @@ async function updateViaRegistryZipReinstall(opts: {
 
   // STEP 2 — move the old panel OUT, to a sibling of custom_nodes. Leaving it
   // beside the new one would shadow it in the browser (#641).
-  try {
-    ops.rename(dir, backupDir);
-  } catch (err) {
+  //
+  // #771 r2 — there may be NO old panel to move. When ComfyUI-Manager unlinks
+  // the pack and then fails to put it back, this fallback is reached with
+  // `dir` already gone, and `rename` fails ENOENT. That failure was then
+  // reported as "could not move the existing panel out of custom_nodes … your
+  // panel at <dir> is untouched", which is false twice over: there is no panel
+  // there, and it is precisely the case where a clean install is the only
+  // remedy.
+  //
+  // Skipping the move is not a relaxation of the #641 guard. That guard exists
+  // so an OLD copy cannot shadow the new one, and here there is no old copy.
+  //
+  // The question is "is there a directory ENTRY in the way", not "does a panel
+  // resolve there", and those differ for a DANGLING SYMLINK (review finding):
+  // `existsSync` follows the link and reports false, while the entry is still
+  // very much present — so skipping the move on `existsSync` alone would leave
+  // it sitting there and STEP 3's rename onto it would fail. That is milder
+  // than the bug it replaces (a safe failure, not a shadow) but it would defeat
+  // this very recovery on a real filesystem shape. `isSymlink` lstats, so it
+  // sees the link itself.
+  //
+  // Requires PROVEN absence in BOTH senses — no resolvable target and no link
+  // entry — so a probe that merely failed still takes the careful path below.
+  const hadExistingPanel = deps.existsSync(dir) || deps.isSymlink(dir) === true;
+  if (hadExistingPanel) {
+    try {
+      ops.rename(dir, backupDir);
+    } catch (err) {
     // The old panel is still in place and serving; get the staged copy OUT of
     // custom_nodes so it cannot shadow it, and leave the install exactly as we
     // found it.
@@ -5130,7 +5155,8 @@ async function updateViaRegistryZipReinstall(opts: {
             `shadow it — remove that directory, then restart ComfyUI.`) +
         ` Check permissions / that ComfyUI does not hold the directory open (stop ` +
         `ComfyUI and retry).`,
-    );
+      );
+    }
   }
 
   // STEP 3 — put the new panel under its proper name. Until this lands the
@@ -5714,6 +5740,46 @@ async function runPanelActionCore(
     // cannot verify the applied version (fail closed; never trust a HEAD move
     // alone when the pyproject version can't be read).
     if (!post.installed || !post.version) {
+      // #771 r2 — REACHABILITY, not a missing remedy. The verified reinstall
+      // ~200 lines below (`zipSwapOps` → updateViaRegistryZipReinstall) exists
+      // for exactly this situation: "Manager drained its queue without moving
+      // the pack, and this is a registry-zip install with no .git to
+      // fast-forward". But it is gated on `post.dir`, and THIS throw fires
+      // first whenever the post-op reading is unusable.
+      //
+      // So the one state where a fresh clone is the ONLY possible remedy — the
+      // pack is GONE after a drained queue — was the state routed to a bare
+      // throw, whose own text tells the reader to "reinstall the panel from
+      // source": an operation this file already implements and had just
+      // decided not to run. That is the #771 self-blocking loop, one install
+      // shape over from the one it was filed about.
+      //
+      // The asymmetry made it easy to miss: when Manager THROWS, the sibling
+      // path substitutes `detection.dir` for a missing post-op dir and the
+      // rescue fires. When Manager LIES with a drained queue — the more common
+      // failure, and the reporter's case — it did not.
+      //
+      // Same substitution as that sibling path rather than a second rule, and
+      // the same shape gate: a registry zip (`!previousRev`) that WAS installed
+      // before. A checkout keeps the throw — it has a git history, so a
+      // destructive re-clone is not the right answer for it.
+      const rescueDir = post.dir ?? detection.dir;
+      const rescueOps =
+        !previousRev && detection.installed && rescueDir ? resolveSwapOps(deps) : undefined;
+      if (rescueOps && rescueDir) {
+        return updateViaRegistryZipReinstall({
+          deps,
+          ops: rescueOps,
+          dir: rescueDir,
+          comfyuiPath: comfyPath,
+          previousVersion,
+          result,
+          assertSameTarget,
+          managerReason: post.installed
+            ? `ComfyUI-Manager reported the queue drained but the pack's version is unreadable at ${rescueDir}`
+            : `ComfyUI-Manager reported the queue drained and the pack is no longer present at ${rescueDir}`,
+        });
+      }
       throw new PanelInstallError(
         `Could not verify the panel update applied: the pack is ${
           post.installed ? "present but its version is unreadable" : "not present"

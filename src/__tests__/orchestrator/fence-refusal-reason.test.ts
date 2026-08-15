@@ -24,7 +24,7 @@
 
 import { describe, expect, it } from "vitest";
 import { UiBridge } from "../../services/ui-bridge.js";
-import { unreachableReason, identityReason } from "../../orchestrator/fence-refusal.js";
+import { NO_ORIGIN_REMEDY, identityReason, unreachableReason } from "../../orchestrator/fence-refusal.js";
 import { workflowIdentityParts } from "../../orchestrator/session-store.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import {
@@ -172,8 +172,20 @@ describe("the refusal message names the gate and matches the remedy to it", () =
       ),
     );
 
-    expect(text).toMatch(/Refreshing the tab will NOT help/);
-    expect(text).toMatch(/COMFYUI_MCP_TUNNEL_BACKEND=relay/);
+    // Its intent is unchanged: a structural gate must not be answered with a
+    // refresh. Its WORDING moved to the shared NO_ORIGIN_REMEDY (panel#1065),
+    // because the copy asserted here had gone stale — it still told the user to
+    // abandon the relay backend and to report a protocol gap that #1240 closed,
+    // which is how panel#1065 came to be filed, quoting this exact sentence.
+    expect(text).toMatch(/Refreshing the tab will not change either case/i);
+    expect(text).toContain(NO_ORIGIN_REMEDY);
+    // The advice that cost a working setup must be gone, not merely reworded.
+    expect(text).not.toMatch(/COMFYUI_MCP_TUNNEL_BACKEND=relay/);
+    expect(text).not.toMatch(/forward the browser'?s handshake Origin/i);
+    // The real remedy has to be the one they are actually given — and it has to be
+    // true for a NON-relay caller too, so it names both causes rather than one.
+    expect(text).toMatch(/On a RELAY connection/);
+    expect(text).toMatch(/On any other path/);
     // The generic remedy must be suppressed, not merely preceded.
     expect(text).not.toMatch(/Ask the user to manually refresh/);
   });

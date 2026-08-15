@@ -1,0 +1,90 @@
+---
+title: "ComfyUI MCP"
+description: "سطح کنترلِ محلی‌محور و بومیِ عامل برای ComfyUI — یک سرور MCP به‌همراه افزونهٔ Claude Code که با زبان طبیعی تصویر، ویدیو و صدا تولید می‌کند، گردش‌کار می‌نویسد و اجرا می‌کند، و مدل‌ها و گره‌های سفارشی را مدیریت می‌کند. محلی، از راه دور، یا Comfy Cloud."
+icon: "house"
+---
+
+**ComfyUI MCP** همان **سطح کنترلِ محلی‌محور و بومیِ عامل** برای
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) است — یک سرور
+[MCP](https://modelcontextprotocol.io) و افزونهٔ Claude Code. دستیار هوش مصنوعی شما را به یک نمونهٔ
+در حال اجرای ComfyUI وصل می‌کند — **محلی**، **از راه دور**، یا
+**[Comfy Cloud](https://cloud.comfy.org)** — تا بتوانید تصویر، ویدیو و صدا تولید کنید، گردش‌کارها را
+اجرا و تألیف کنید، مدل‌ها و گره‌های سفارشی را مدیریت کنید و سرور را کنترل کنید؛ همهٔ این‌ها با زبان
+طبیعی. این یک پل نازکِ پرامپت‌به‌تصویر نیست — یک عامل کامل است که ComfyUI را به‌جای شما می‌گرداند.
+
+<Frame caption="پنل عامل، ComfyUI را از ابتدا تا انتها هدایت می‌کند — می‌خواند چه چیزی به‌صورت محلی نصب است، اتصال‌های گراف را برقرار می‌کند، VRAM را آزاد می‌کند و رندر را اجرا می‌کند">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="شروع سریع" icon="rocket" href="/docs/fa/quickstart">
+    سرور را به Claude Code اضافه کنید و در حدود ۲ دقیقه اولین تصویرتان را تولید کنید.
+  </Card>
+  <Card title="مرجع ابزارها" icon="wrench" href="/docs/tools/image-generation">
+    ۳۷ ابزار، که به‌صورت خودکار از روی اسکیماهای زندهٔ خودشان مستند شده‌اند.
+  </Card>
+  <Card title="نصب" icon="download" href="/docs/fa/installation">
+    ComfyUI را نصب کنید و سرور MCP را وصل کنید (محلی یا از راه دور).
+  </Card>
+  <Card title="پیکربندی" icon="gear" href="/docs/configuration">
+    متغیرهای محیطی، ترانسپورت‌ها، توکن‌ها، و هدف‌گیری میزبان از راه دور.
+  </Card>
+</CardGroup>
+
+## کارهایی که می‌توانید انجام دهید
+
+<CardGroup cols={3}>
+  <Card title="تولید" icon="image">
+    تبدیل متن به تصویر با `generate_image`، به‌علاوهٔ شرطی‌سازی با ControlNet و IP-Adapter.
+  </Card>
+  <Card title="تألیف گردش‌کار" icon="pen-ruler">
+    از روی قالب‌ها بسازید، تغییر دهید، اعتبارسنجی و بصری‌سازی کنید، و با یک DSL فشرده رفت‌وبرگشت کنید.
+  </Card>
+  <Card title="مدیریت مدل‌ها" icon="box">
+    در HuggingFace/CivitAI جست‌وجو کنید و مدل‌ها را دانلود، فهرست و حذف کنید.
+  </Card>
+  <Card title="گره‌های سفارشی" icon="puzzle">
+    بسته‌های گره را از راه ComfyUI-Manager نصب و به‌روزرسانی کنید، از آن‌ها اسنپ‌شات بگیرید و با
+    دوبخشی‌سازی مقصر را پیدا کنید.
+  </Card>
+  <Card title="نصب و نگهداری" icon="terminal">
+    ComfyUI را نصب یا به‌روزرسانی کنید، محیط را بررسی کنید، سرور را شروع یا متوقف کنید.
+  </Card>
+  <Card title="محلی، از راه دور، یا ابری" icon="globe">
+    نصب محلی را خودکار تشخیص می‌دهد، با `--comfyui-url` به یک میزبان از راه دور اشاره می‌کند، یا از
+    راه `COMFYUI_API_KEY` با [Comfy Cloud](https://cloud.comfy.org) کار می‌کند — به هیچ ComfyUI
+    محلی نیازی نیست.
+  </Card>
+</CardGroup>
+
+<Note>
+  روی **macOS**، **Linux** و **Windows** کار می‌کند و نصب محلی ComfyUI و پورت آن را خودکار تشخیص
+  می‌دهد. کد منبع و پیگیری مشکل‌ها در [GitHub](https://github.com/artokun/comfyui-mcp) است.
+</Note>
+
+## دامنه: محلی، از راه دور، یا Comfy Cloud
+
+`comfyui-mcp` همان MCP جامعه‌محور برای ComfyUI **محلی** و **از راه دور** است — هدف اصلی همین است
+(نصب‌های Mac/Linux/Windows، RunPod، VPS، شبکهٔ محلی و مانند آن).
+
+برای کاربران **Comfy Cloud**، تیم Comfy-Org [ابزار عامل رسمی](https://docs.comfy.org/agent-tools) عرضه می‌کند — Comfy Cloud MCP (بتای عمومی) و Comfy In-App Agent (آلفای خصوصی) — که تیم Comfy آن‌ها را نگهداری می‌کند و روی Comfy Cloud اجرا می‌شوند. اگر GPU ندارید یا می‌خواهید هیچ برپاسازی‌ای لازم نباشد، از همان استفاده کنید ([مقایسهٔ کنار هم](/docs/local-vs-comfy-cloud)). `comfyui-mcp` یک حالت ابری جامعه‌محور (`COMFYUI_API_KEY`) هم دارد، پس یک MCP واحد می‌تواند هر سه شکل استقرار را از یک پیکربندی هدف بگیرد — هرکدام که با گردش‌کار شما جور است انتخاب کنید.
+
+---
+
+## نگهدارنده
+
+ساخته و نگهداری‌شده به دست [**@artokun**](https://github.com/artokun) — مشارکت‌کنندهٔ همیشگی در
+[Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)
+(رندرکنندهٔ گراف v2 / رندر زیرگراف / ویجت‌های ارتقایافته) و
+[هستهٔ پایتونی ComfyUI](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun).
+
+**دوستان Comfy-Org** (یا هر کسی که در زیست‌بوم ComfyUI استخدام می‌کند): [art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com).

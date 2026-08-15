@@ -180,6 +180,28 @@ const CLAIMS = [
   { file: "docs/local-vs-comfy-cloud.mdx", key: "mcp_tools", re: /(\d+) MCP tools/ },
   { file: "docs/local-vs-comfy-cloud.mdx", key: "skills", re: /(\d+) model-specific skills/ },
   { file: "docs/local-llms.mdx", key: "mcp_tools", re: /The full surface is (\d+) tools/ },
+  // PROSE counts, not just badges. The badge patterns above were all correct while
+  // "35 skills total" sat five lines under a correct "**38 AI skills**" badge in the same
+  // file, and docs/index.mdx advertised "80+ tools" against a real 37 — both invisible to
+  // this gate because it only matched the bolded forms. A count is a count wherever it is
+  // written.
+  { file: "README.md", key: "skills", re: /(\d+) skills total/ },
+  { file: "docs/index.mdx", key: "mcp_tools", re: /(\d+)\+? tools, auto-documented/ },
+  // The blog drifts the same way the README did. local-llms-comfyui said "roughly 200 tools"
+  // — five times the real surface — because the consolidation landed and the post didn't move.
+  // `\s+`, not literal spaces. A non-match is a FAILURE here ("could not find a claim
+  // matching…"), so a routine re-wrap of this hard-wrapped prose — "MCP server exposes\n**37
+  // tools**" — would reject factually correct text. The panel row below was already
+  // wrap-tolerant; this one was not, which is the kind of inconsistency that only shows up
+  // the day someone reflows a paragraph.
+  { file: "docs/blog/local-llms-comfyui.mdx", key: "mcp_tools", re: /MCP\s+server\s+exposes\s+\*\*(\d+)\s+tools\*\*/ },
+  // The SAME sentence also counts the panel surface, and guarding only its first half left
+  // the second half free to drift — it had already been rewritten to "a comparable set",
+  // which reads as ~37 against a real 92. Both numbers in a sentence need the same gate.
+  // `\s+` on both sides, not a literal space: the sentence is hard-wrapped, and which words
+  // land on which line shifts whenever the paragraph is re-flowed. A no-match is a loud
+  // failure here, not a silent pass, but a gate that cries at a re-wrap still gets muted.
+  { file: "docs/blog/local-llms-comfyui.mdx", key: "panel_tools", re: /the\s+panel\s+adds\s+\*\*(\d+)\*\*\s+`panel_\*`\s+live-canvas\s+tools/ },
 ];
 
 const c = await counts();

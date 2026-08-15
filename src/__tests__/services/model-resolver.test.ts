@@ -18,6 +18,10 @@ vi.mock("../../config.js", () => {
   return {
     config,
     isRemoteMode: () => remoteOverride.value ?? !config.comfyuiPath,
+    // #1374 — the route decision stamps the target it was made against, so this mock
+    // has to provide it. Faked rather than spread from the real config: these suites
+    // control `config` themselves and a real base URL would not match what they set.
+    getComfyUIBaseUrl: () => `http://127.0.0.1:8188`,
   };
 });
 /** Per-test override for isRemoteMode; null = derive from comfyuiPath (legacy). */
@@ -57,25 +61,33 @@ vi.mock("node:fs/promises", () => ({
 // dir so these path-safety tests stay hermetic (no real ComfyUI connection).
 /** Successive models roots resolveModelsDirWithBases hands out (see the mock). */
 const liveRoots = vi.hoisted(() => ({ queue: [] as string[] }));
-vi.mock("../../services/output-dir.js", () => ({
-  resolveModelsDir: vi.fn(async () => "/comfy/models"),
-  // The download resolver now derives the models dir AND the base-install dirs
-  // (for the code-root veto) from ONE call. No base dirs here → the symlink-escape
-  // guard falls back to the models-root sibling (#633 codex r4).
-  resolveModelsDirWithBases: vi.fn(async () => ({
-    // Successive values let a test model the live server being REPLACED between the
-    // destination resolution and the write (#369 write-time binding). Defaults to a
-    // single stable root.
-    modelsDir: liveRoots.queue.shift() ?? "/comfy/models",
-    baseDirs: [],
-    snapshot: { reachable: false },
-    // Live-authoritative: these path-safety tests are about containment, not about
-    // the #369 stale-install check (which only runs for a locally-configured root).
-    source: "live-root" as const,
-  })),
-  isLiveAuthoritativeModelsDir: (s: string) =>
-    s === "argv-flag" || s === "live-root" || s === "observed-root",
-}));
+vi.mock("../../services/output-dir.js", async (importOriginal) => {
+  // Provenance predicates from the REAL module — see the same note in
+  // download-live-destination.test.ts. Which sources skip the #369 disagreement
+  // check is the rule under test elsewhere; a hand-copied second definition here
+  // would let these suites pass against a rule production no longer uses.
+  const real = (await importOriginal()) as typeof import("../../services/output-dir.js");
+  return {
+    resolveModelsDir: vi.fn(async () => "/comfy/models"),
+    // The download resolver now derives the models dir AND the base-install dirs
+    // (for the code-root veto) from ONE call. No base dirs here → the symlink-escape
+    // guard falls back to the models-root sibling (#633 codex r4).
+    resolveModelsDirWithBases: vi.fn(async () => ({
+      // Successive values let a test model the live server being REPLACED between the
+      // destination resolution and the write (#369 write-time binding). Defaults to a
+      // single stable root.
+      modelsDir: liveRoots.queue.shift() ?? "/comfy/models",
+      baseDirs: [],
+      snapshot: { reachable: false },
+      // NAMED BY THE SERVER: these path-safety tests are about containment, not
+      // about the #369 stale-install check (which now also runs for an INFERRED
+      // root, so "live-authoritative" is no longer the exempting property).
+      source: "live-root" as const,
+    })),
+    isLiveAuthoritativeModelsDir: real.isLiveAuthoritativeModelsDir,
+    modelsDirNamedByServer: real.modelsDirNamedByServer,
+  };
+});
 
 // The symlink-escape guard consults registered extra_model_paths roots (#633) for
 // its code-root VETO. Stub to none (and non-authoritative live roots) so these

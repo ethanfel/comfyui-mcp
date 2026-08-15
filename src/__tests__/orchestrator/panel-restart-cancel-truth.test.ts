@@ -59,7 +59,9 @@ const text = (res: ToolResult): string =>
 const parse = (res: ToolResult): Record<string, unknown> => JSON.parse(text(res));
 
 function makeCtx(opts: {
-  confirm: "yes" | "no";
+  /** #1332 — "unreachable" is the fourth outcome: the card could not be put to the
+   *  user, or its answer could not be retrieved. It reaches the same decline branch. */
+  confirm: "yes" | "no" | "unreachable";
   /** Whether the bound tab provably fronts our local boot instance (the gate
    *  for both the boot-endpoint probe and the #742 preflight). */
   frontsBoot?: boolean;
@@ -71,6 +73,13 @@ function makeCtx(opts: {
   /** Called on every ctx.ensureReachable() — lets a test land a retarget at a
    *  specific point in the handler (the DISPATCH point is the third call). */
   onEnsureReachable?: () => void;
+  /** #1593 — the SERVER-OBSERVED handshake Origin, overridden independently of
+   *  `frontsBoot`. The two are separable in reality and the distinction is the
+   *  whole point: a tab can be unbindable (so the restart is refused) while its
+   *  origin is a perfectly concrete address that PROVES it is a different server
+   *  from the configured one. Without this the fixture can only produce the
+   *  "unproven" verdict, and the branch that matters is unreachable. */
+  serverOrigin?: string;
 }): { ctx: PanelToolCtx; sends: Array<Record<string, unknown>> } {
   const sends: Array<Record<string, unknown>> = [];
   const frontsBoot = opts.frontsBoot ?? true;
@@ -84,7 +93,7 @@ function makeCtx(opts: {
     },
     tabOrigin: () => (fronted() ? BOOT_BASE : undefined),
     // The gate reads the SERVER-OBSERVED handshake origin, not the spoofable hello URL.
-    tabServerOrigin: () => (fronted() ? BOOT_BASE : undefined),
+    tabServerOrigin: () => opts.serverOrigin ?? (fronted() ? BOOT_BASE : undefined),
     tabIsLocal: () => fronted(),
     canReach: () => true,
   } as unknown as PanelToolCtx["bridge"];
@@ -298,6 +307,42 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     expect(t3).toMatch(/no restart was dispatched/i);
     expect(t3).not.toMatch(/restart initiated earlier/i);
     expect(t3).not.toMatch(/STOPPED and did not come back/i);
+  });
+
+  it("#1332: an UNREACHABLE card does not claim ComfyUI was not restarted", async () => {
+    // The reporter accepted the restart, ComfyUI restarted (a fresh startup line in
+    // their server log), and this tool answered "Cancelled — ComfyUI was not
+    // restarted." The restart is what dropped the socket its own confirmation had to
+    // travel back on, and that transport failure used to arrive here as a decline.
+    //
+    // The server is HEALTHY throughout, which is the case the probes above cannot
+    // distinguish: "nothing happened" and "it restarted and came back" look identical
+    // from here. With an explicit decline we know which. Without one we do not.
+    __panelToolsTestHooks.setHealthProbe(async () => "healthy");
+    const { ctx, sends } = makeCtx({ confirm: "unreachable" });
+
+    const t = text(await restartTool().handler({}, ctx));
+
+    expect(t).not.toContain("Cancelled — ComfyUI was not restarted.");
+    expect(t).toMatch(/did NOT dispatch a restart/);
+    expect(t).toMatch(/could not be reached to ask/);
+    expect(t).toMatch(/no decision was made either way/);
+    expect(t).toMatch(/fresh startup line/);
+    // Still nothing dispatched — the safe behaviour is untouched.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("#1332: an EXPLICIT decline still says Cancelled — the truth is kept", async () => {
+    // The fix must not blur a real decision into hedging: when the user says no,
+    // "ComfyUI was not restarted" is an observation, not a guess.
+    __panelToolsTestHooks.setHealthProbe(async () => "healthy");
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+
+    const t = text(await restartTool().handler({}, ctx));
+
+    expect(t).toContain("Cancelled — ComfyUI was not restarted.");
+    expect(t).not.toMatch(/could not be reached to ask/);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
   it("a decline with the server down-then-HEALTHY inside the window does NOT declare a loss", async () => {
@@ -675,6 +720,62 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
+  it("#1593: the refusal does NOT send you to restart_comfyui when it would hit a DIFFERENT server", async () => {
+    // REACHABILITY, and the reason this issue is not just a wording change.
+    //
+    // #1593's reporter had a panel on :8189 while the orchestrator was configured
+    // for another address. The refusal fired — correctly, it could not account for
+    // that instance — and then told them to run restart_comfyui, which targets the
+    // CONFIGURED address. That is #851's defect verbatim, in the branch #851 did
+    // not cover: a call that recommends another tool without checking which machine
+    // that tool points at. On a shared instance, restarting the wrong one is worse
+    // than doing nothing.
+    //
+    // The tab is unbindable (so the refusal fires) but its server-observed Origin
+    // is concrete and provably different — the exact shape that was previously
+    // collapsed into "recommend it anyway".
+    const preflight = vi.fn(async () => ({ ok: true }));
+    __panelToolsTestHooks.setLocalRestartPreflight(preflight);
+    const { ctx, sends } = makeCtx({
+      confirm: "yes",
+      frontsBoot: false,
+      serverOrigin: "http://127.0.0.1:8189",
+    });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    expect(out.refused).toBe(true);
+    expect(note).toMatch(/cannot tell which server the restart would stop/i);
+    // THE change: it warns instead of recommending, and names BOTH addresses so
+    // the reader can see which two things failed to be shown equal.
+    expect(note).toMatch(/Do NOT reach for restart_comfyui/);
+    expect(note).toContain("http://127.0.0.1:8189");
+    expect(note).toContain(BOOT_BASE);
+    expect(note).not.toMatch(/USE restart_comfyui/);
+    // Everything the #814 refusal guarantees is untouched.
+    expect(preflight).not.toHaveBeenCalled();
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("#1593: a DNS-ambiguous localhost origin still gets the recommendation", async () => {
+    // Absence of proof is not proof of difference (a coordinator P0 that
+    // captureRebootHealthBase already honours). `localhost` can resolve to either
+    // family, so warning here would send a user away from a tool that would very
+    // likely have worked — the cry-wolf failure #1233 was filed for.
+    __panelToolsTestHooks.setLocalRestartPreflight(vi.fn(async () => ({ ok: true })));
+    const { ctx } = makeCtx({
+      confirm: "yes",
+      frontsBoot: false,
+      serverOrigin: "http://localhost:8188",
+    });
+
+    const note = String(parse(await restartTool().handler({}, ctx)).note ?? "");
+
+    expect(note).toMatch(/USE restart_comfyui/);
+    expect(note).not.toMatch(/Do NOT reach for restart_comfyui/);
+  });
+
   it("#814: a BOUND local target with a failing assessment refuses with its reason", async () => {
     // The bound path, where the assessment genuinely describes the instance the
     // reboot will reach. A Desktop instance whose supervisor has gone is refused
@@ -737,6 +838,46 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     const out = parse(await restartTool().handler({}, ctx));
 
     expect(out.refused).toBe(true);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("#1593: the DISPATCH-POINT refusal also stops recommending the wrong server", async () => {
+    // THE SECOND CALL SITE, driven through the real handler. The test above proves
+    // this branch is reached and refuses; it says nothing about what it then tells
+    // the caller, and reverting this site to the old unconditional "USE
+    // restart_comfyui INSTEAD" survives it — and survives the whole suite. So the
+    // fix shipped one tested call site and one untested one.
+    //
+    // This is also the only path that reaches the "different" verdict with a
+    // NON-NULL panelBase: the retarget moves the configured target to :9999 while
+    // the tab stays provably on the boot instance, so both sides of the comparison
+    // are concrete and proven. The preflight-site test reaches the same verdict by
+    // the other limb (null base, concrete observed Origin).
+    let calls = 0;
+    const { ctx, sends } = makeCtx({
+      confirm: "yes",
+      frontsBoot: true,
+      onEnsureReachable: () => {
+        calls++;
+        if (calls >= 3) {
+          hoistedConfig.configBase.value = "http://127.0.0.1:9999";
+          hoistedConfig.generation.value += 1;
+        }
+      },
+    });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    expect(out.refused).toBe(true);
+    expect(note).toMatch(/the panel connection changed while the restart was being prepared/i);
+    // Sending this caller to restart_comfyui would aim it at :9999 — the target
+    // that was just retargeted AWAY from the instance they are working in.
+    expect(note).toMatch(/Do NOT reach for restart_comfyui/);
+    expect(note).not.toMatch(/USE restart_comfyui/);
+    // Both addresses named, so the reader can see which two failed to match.
+    expect(note).toContain("http://127.0.0.1:9999");
+    expect(note).toContain(BOOT_BASE);
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 

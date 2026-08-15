@@ -1,5 +1,5 @@
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import {
@@ -74,6 +74,37 @@ export type ModelsDirSource =
  *  from local configuration the server never vouched for. */
 export function isLiveAuthoritativeModelsDir(source: ModelsDirSource): boolean {
   return source === "argv-flag" || source === "live-root" || source === "observed-root";
+}
+
+/**
+ * Did the SERVER ITSELF name this root, rather than us inferring it? (#369)
+ *
+ * Deliberately narrower than `isLiveAuthoritativeModelsDir`, and deliberately a
+ * SEPARATE predicate rather than a change to it — that one has four other callers
+ * answering different questions, and widening or narrowing it in place would move
+ * all of them at once.
+ *
+ * The distinction is what a source is EVIDENCE OF:
+ *
+ *   argv-flag / live-root — the server's own command line, naming its base or its
+ *     script root. A statement about where the server reads.
+ *   observed-root — a relative `main.py` re-anchored on the interpreter the OS
+ *     reports for the process on our port. A statement about where the BINARY
+ *     lives, from which the root is INFERRED.
+ *
+ * Those come apart in an ordinary Windows setup: with a stale portable bundle's
+ * python on PATH, `cd D:\live && python ComfyUI\main.py` anchors
+ * `C:\stale\ComfyUI` — measured, and reachable through both the absolute-argv[0]
+ * tier and the OS-image reading (#1374). A download then lands in an install the
+ * running server never reads, which is #369's original outcome by a new route.
+ *
+ * So only the first two skip the disagreement check. The inferred one runs it, at
+ * the cost of one `/models/<category>` listing call — a check that needs positive
+ * contradicting evidence and fails open on everything else, so it cannot refuse a
+ * fresh or shared tree.
+ */
+export function modelsDirNamedByServer(source: ModelsDirSource): boolean {
+  return source === "argv-flag" || source === "live-root";
 }
 
 /** Resolve a possibly-relative dir against a base (or COMFYUI_PATH, or cwd). */
@@ -441,6 +472,168 @@ function probeEntry(p: string): { kind: "file" | "absent" | "not-a-file" | "inde
   }
 }
 
+/**
+ * Extensions that make a directory entry a MODEL rather than housekeeping (#1371).
+ *
+ * Used only to answer "does this base hold models of its own for this category?" — the
+ * question that separates a stale second install from an extra_model_paths root that is
+ * simply empty here. A `.gitkeep` or a `desktop.ini` answers neither.
+ */
+const BASE_OWN_MODEL_EXTENSIONS = new Set([
+  ".safetensors",
+  ".sft",
+  ".ckpt",
+  ".pt",
+  ".pt2",
+  ".pth",
+  ".bin",
+  ".gguf",
+  ".onnx",
+  // Formats a first pass missed (codex P1). Omitting one is not neutral: a stale base
+  // holding only `.engine` files reads as EMPTY, the contradiction never fires, and the
+  // download goes into the wrong install — the exact write this gate exists to stop.
+  ".pte",
+  ".engine",
+  ".trt",
+  ".plan",
+  ".npz",
+  ".msgpack",
+  ".pkl",
+  ".model",
+]);
+
+/**
+ * Does this directory hold a model file, one level down? (#1371)
+ *
+ * Diffusers-style categories keep their weights in per-model folders, so "no model file at
+ * the top level" is not the same as "this base is empty". One level is deliberate: it
+ * covers the real layout without turning a corroboration check into a recursive walk of a
+ * models tree that can hold tens of thousands of files.
+ */
+function isModelFileEntry(entry: { name: string; isFile(): boolean; isSymbolicLink(): boolean }): boolean {
+  // SYMLINKS COUNT (codex). `Dirent.isFile()` is FALSE for a symbolic link, and sharing one
+  // model tree between installs by symlinking is ordinary practice — this file says so
+  // elsewhere. Requiring isFile() alone made a stale base whose models are links read as
+  // empty, reintroducing the misplaced write for exactly the users most likely to have two
+  // installs.
+  if (!entry.isFile() && !entry.isSymbolicLink()) return false;
+  return BASE_OWN_MODEL_EXTENSIONS.has(extname(entry.name).toLowerCase());
+}
+
+/**
+ * Is this entry a directory, INCLUDING a symlink pointing at one? (#1371)
+ *
+ * `Dirent.isDirectory()` is false for a symlink to a directory — the same trap as
+ * `isFile()` above, and it bit the same users twice. `models/checkpoints/SDXL ->
+ * /mnt/shared/SDXL` is the layout of someone sharing one model tree between installs,
+ * which is precisely the population this gate exists to protect: their base read as empty,
+ * so no contradiction was found, so the misplaced write went ahead.
+ *
+ * Following the link is safe here because the recursion below is depth-bounded and
+ * budget-bounded — a link pointing back up its own tree costs at most a couple of extra
+ * readdirs, not a cycle. A broken link throws and is simply not a directory.
+ */
+function entryIsDirectoryLike(
+  dir: string,
+  entry: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean },
+  budget: ModelScanBudget,
+): boolean {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  // THE STAT IS ITSELF THE WORK (codex P2). A category holding thousands of directory
+  // symlinks reached this line once per entry, because the readdir budget is only consumed
+  // one level down — so bounding readdirs left the symlink-heavy tree exactly as
+  // unbounded as before, in the shape the symlink fix newly made reachable.
+  if (budget.stats <= 0) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.stats -= 1;
+  try {
+    return statSync(join(dir, entry.name)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How many directories one corroboration check may read before it gives up. (#1371, codex P2)
+ *
+ * Depth alone does not bound the work: a category holding 10k subdirectories is 10k
+ * synchronous readdirs at depth 2, on the download path. Exhausting the budget answers
+ * "no model found", which is the SAFE direction — no contradiction means no refusal, only
+ * the pre-existing unconfirmed-visibility warning. A populated base almost always answers
+ * true from a file in the first directory read.
+ */
+const MODEL_SCAN_DIR_BUDGET = 512;
+
+/** Companion cap on link resolutions, for the same reason one level down. */
+const MODEL_SCAN_STAT_BUDGET = 4096;
+
+interface ModelScanBudget {
+  dirs: number;
+  stats: number;
+  /**
+   * The scan GAVE UP; it did not finish and find nothing.
+   *
+   * These are not the same answer and folding them together is the defect this repo has a
+   * gate for (#796). "No model here" contradicts the base and refuses the download; "I
+   * stopped looking" establishes nothing, and reporting it as the former would refuse a
+   * working install, while reporting it as a clean negative — which is what the first
+   * version of this bound did — silently returns the misplaced write the whole check
+   * exists to stop. The caller proceeds either way, but says which one happened.
+   */
+  truncated: boolean;
+}
+
+function newModelScanBudget(): ModelScanBudget {
+  return { dirs: MODEL_SCAN_DIR_BUDGET, stats: MODEL_SCAN_STAT_BUDGET, truncated: false };
+}
+
+/**
+ * Does this directory tree hold a model file, within a bounded depth? (#1371)
+ *
+ * TWO LEVELS, not one. A Diffusers/HF repo checkout is `<category>/<repo>/transformer/
+ * model.safetensors` — one level down finds nothing there, and "found nothing" is read as
+ * "this base is empty", which permits the misplaced write this gate exists to stop.
+ *
+ * Bounded on purpose: a models tree can hold tens of thousands of files, and this runs
+ * synchronously inside a corroboration check on the download path. Depth 2 covers the real
+ * layouts without turning that into a full walk. Deeper nesting than that is a false
+ * negative — it proceeds with the existing unconfirmed-visibility warning, which is where
+ * these users were before the gate existed.
+ */
+function directoryHoldsAModel(dir: string, depth = 2, budget = newModelScanBudget()): boolean {
+  if (depth <= 0) return false;
+  if (budget.dirs <= 0) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.dirs -= 1;
+  let entries: { name: string; isFile(): boolean; isSymbolicLink(): boolean; isDirectory(): boolean }[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    // Permission-denied or absent: nothing established either way.
+    return false;
+  }
+  for (const entry of entries) {
+    if (isModelFileEntry(entry)) return true;
+  }
+  for (const entry of entries) {
+    if (budget.dirs <= 0) {
+      budget.truncated = true;
+      return false;
+    }
+    if (
+      entryIsDirectoryLike(dir, entry, budget) &&
+      directoryHoldsAModel(join(dir, entry.name), depth - 1, budget)
+    )
+      return true;
+  }
+  return false;
+}
+
 async function corroborateBaseByModelInventory(
   base: string,
   targetCategory: string,
@@ -453,7 +646,22 @@ async function corroborateBaseByModelInventory(
       /** How many the server listed, so a PARTIAL match can be reported as one. */
       listed: number;
     }
-  | { ok: false; reason: string }
+  | {
+      ok: false;
+      reason: string;
+      /**
+       * The server listed files for this category and NONE of them are under the base
+       * (#1371). That is not "no evidence" — it is evidence AGAINST, and the two must not
+       * be answered the same way. A fresh install with an empty models dir corroborates
+       * nothing either, and refusing that would block the first download on every new
+       * setup; a base the server demonstrably does not read is where a model silently
+       * lands in the wrong install.
+       */
+      contradicted?: boolean;
+      /** The local model scan gave up at its bound, so "not contradicted" is not a finding
+       *  that this base holds nothing of its own. */
+      scanTruncated?: boolean;
+    }
 > {
   // The corroboration must be about the category this download is FOR. A complete match
   // on some OTHER category proves only that THAT folder is under this base — and a server
@@ -492,6 +700,10 @@ async function corroborateBaseByModelInventory(
   // this used to sweep for any category that happened to match.
   let unreadableCategories = 0;
   let lastReason: string | undefined;
+  /** Set when the server's own listing shows the base is NOT a root it reads (#1371). */
+  let contradictedBase = false;
+  /** The local scan hit its bound before answering. See the assignment for why it matters. */
+  let scanTruncated = false;
   for (const category of [targetCategory]) {
     let files: string[];
     try {
@@ -639,6 +851,89 @@ async function corroborateBaseByModelInventory(
           : "");
     } else if (missing.length > 0) {
       const present = files.length - missing.length;
+      // CONTRADICTION REQUIRES THIS BASE TO HAVE SOMETHING OF ITS OWN.
+      //
+      // present === 0 means none of the server's files for this category are here. That is
+      // a stale base — or an extra_model_paths layout where this IS one of the server's
+      // roots and simply has nothing in this category yet. A filename listing cannot tell
+      // those apart, and refusing the second would block a working install, which is worse
+      // than the wrong-directory write this gate exists to stop.
+      //
+      // An EMPTY (or absent) category dir here is therefore no evidence, not evidence
+      // against. A base holding a different set of files for the same category is the case
+      // that is actually diagnostic, and it is the reporter's: a second full install.
+      if (present === 0) {
+        // …and "has files of its own" must mean MODEL files (codex P0). Counting any
+        // directory entry treats a `.gitkeep`, a `desktop.ini` or a `Thumbs.db` as proof
+        // the base is a populated root — so a legitimate extra_model_paths root holding
+        // nothing but metadata for this category would be refused, which is the working
+        // install this whole refinement exists to protect. Only a real model file is
+        // evidence that this base is a place models live.
+        //
+        // KNOWN AND DELIBERATE GAP: a category whose models live in SUBFOLDERS
+        // (diffusers-style directories, `clip_vision/<dir>/model.bin`) reads as
+        // metadata-only here, so a stale base of that shape is NOT contradicted and the
+        // download proceeds with the existing unconfirmed-visibility note. That is the
+        // safe direction — it returns the behaviour to what it was before this gate rather
+        // than blocking anyone — and the alternative, treating any subdirectory as
+        // evidence, re-opens the metadata hole with an empty folder. A missed contradiction
+        // costs one misplaced file and a warning; a false one costs every download on a
+        // working install.
+        let baseHasOwnModelsHere = false;
+        const budget = newModelScanBudget();
+        // The budget is read BEFORE the link resolution, not after: `.some()` would
+        // otherwise stat every one of thousands of entries and only then let the recursion
+        // decline for want of budget (codex P2).
+        //
+        // Named rather than inlined because the guard must MARK the truncation on its way
+        // out. Written inline as `budget.dirs > 0 && …` it short-circuited silently, so the
+        // scan gave up and reported a clean negative — precisely the fold this budget was
+        // being taught to avoid, committed in the line that avoids it.
+        const subdirHoldsAModel = (entry: {
+          name: string;
+          isDirectory(): boolean;
+          isSymbolicLink(): boolean;
+        }): boolean => {
+          if (budget.dirs <= 0) {
+            budget.truncated = true;
+            return false;
+          }
+          return (
+            entryIsDirectoryLike(categoryDir, entry, budget) &&
+            directoryHoldsAModel(join(categoryDir, entry.name), 2, budget)
+          );
+        };
+        try {
+          // withFileTypes, because a DIRECTORY named `foo.safetensors` is not a model
+          // (codex): counting it would refuse a base on the strength of a folder name.
+          // A nested model directory (diffusers-style) still counts — see below.
+          // ONE budget for the whole scan, not one per subdirectory: the point of the
+          // bound is to cap this entire check, and a fresh budget per entry would let a
+          // category with 10k subdirectories spend 10k of them.
+          baseHasOwnModelsHere = readdirSync(categoryDir, { withFileTypes: true }).some(
+            (entry) =>
+              isModelFileEntry(entry) ||
+              // A SUBDIRECTORY counts too — symlinked ones included — but only when it
+              // actually holds a model file within a bounded depth. An empty folder is not
+              // evidence the base is populated: that is the metadata hole wearing a
+              // directory.
+              subdirHoldsAModel(entry),
+          );
+        } catch {
+          // Absent or unreadable — nothing established either way.
+        }
+        contradictedBase = baseHasOwnModelsHere;
+        // A TRUNCATED SCAN IS NOT A CLEAN NEGATIVE (codex P1, #796 discipline).
+        //
+        // Not finding a model means this base is a place models do not live, which
+        // contradicts nothing and lets the download proceed. Giving up after the bound
+        // means we do not know — and a stale base whose only model sits behind the 512th
+        // directory reads identically to an empty one, which is the silent misplaced write
+        // this whole check exists to stop. The download still proceeds (refusing on an
+        // inconclusive scan would block working installs, which is worse), but the fact
+        // that the check did not finish is stated rather than folded away.
+        scanTruncated = budget.truncated && !baseHasOwnModelsHere;
+      }
       lastReason =
         present === 0
           ? `the server lists ${files.length} file(s) under "${category}" and NONE of them are under ` +
@@ -662,7 +957,8 @@ async function corroborateBaseByModelInventory(
         `"${categoryDir}" (e.g. "${escaping[0]}"), so they cannot corroborate this base`;
     }
   }
-  if (lastReason) return { ok: false, reason: lastReason };
+  if (lastReason)
+    return { ok: false, reason: lastReason, contradicted: contradictedBase, scanTruncated };
   // Nothing was COMPARED. Say which of the two reasons that was: the listing could not be
   // read, or it was empty. Reporting the first as the second would be the same fold this
   // whole change is about — and an EMPTY target category genuinely cannot corroborate
@@ -853,6 +1149,55 @@ export async function resolveModelsDirWithBases(opts?: {
           "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the directory whose models/ the server actually reads.",
       );
     } else if (base) {
+      // #1371 — DO NOT WRITE INTO A BASE THE SERVER DEMONSTRABLY DOES NOT READ.
+      //
+      // This fallback took COMFYUI_PATH/models with no corroboration at all, and it is
+      // reached whenever the live root could not be derived for any reason OTHER than the
+      // relative-main.py shape the branch above handles. A reporter running two local
+      // ComfyUIs — connected to :8190, COMFYUI_PATH pointing at the other install — had a
+      // model written into the install the server never reads, while the tool told them
+      // "destination came from local configuration rather than the running server;
+      // visibility to the connected ComfyUI is unconfirmed". It knew, and wrote anyway. A
+      // warning beside a write is not a substitute for not writing.
+      //
+      // THE GATE IS EVIDENCE AGAINST, NOT ABSENCE OF EVIDENCE. Refusing whenever the base
+      // cannot be corroborated would break every correct setup whose server reports no
+      // resolvable root — per #1374 that includes the ordinary Windows-portable shape — and
+      // it would block the FIRST download on any fresh install, whose models dir is empty
+      // and therefore corroborates nothing. So this refuses only when the server's own
+      // listing shows the base is not a root it reads: files listed for this category, none
+      // of them here. Silence still writes, with the existing unconfirmed-visibility note.
+      if (snapshot.reachable && !isRemoteMode()) {
+        const verdict = await corroborateBaseByModelInventory(
+          base,
+          (opts?.targetCategory ?? "").trim(),
+        );
+        if (!verdict.ok && verdict.contradicted) {
+          throw new ValidationError(
+            `Refusing to download into "${resolve(base, "models")}": ${verdict.reason}.
+
+` +
+              `The graph you are downloading for is served by a DIFFERENT ComfyUI than this ` +
+              `configured base describes, so the file would land where that server never looks ` +
+              `and be reported as a success (#1371). Fix by pointing COMFYUI_PATH at the install ` +
+              `the connected server actually runs, or by launching that server with an absolute ` +
+              `--base-directory so its models directory can be read from it directly.`,
+          );
+        }
+        if (!verdict.ok && verdict.scanTruncated) {
+          // Proceeding, but not silently (codex P1). The refusal above needs the base to
+          // be PROVEN stale, and a scan that stopped early proves nothing — so the
+          // download goes ahead exactly as it did before this gate existed, with the one
+          // thing the user cannot otherwise know: the check did not finish.
+          logger.warn(
+            `The local check of "${resolve(base, "models")}" did not finish — it stopped at its ` +
+              `directory bound before finding a model of its own. That is NOT a finding that this ` +
+              `base is empty, so the download proceeds; but if this install is stale, the file will ` +
+              `land where the connected server never looks (#1371). ${verdict.reason}.`,
+            { modelsDir: resolve(base, "models"), basis: "filename-inventory", truncated: true },
+          );
+        }
+      }
       modelsDir = resolve(base, "models");
       source = "configured-base";
     } else {

@@ -19,6 +19,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent } from "../../orchestrator/agent-backend.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 // SHORT idle window for the panel-level test — must be set before panel-agent
 // is imported (TURN_IDLE_MS is read at module load).
@@ -159,7 +160,7 @@ describe("claude backend stall notice (#885)", () => {
     const gate = gatedChannel(["first turn", "second turn"]);
     const { backend, done } = await startBackend(gate.channel());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(1));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(1));
     expect(hoisted.prompts[0]).toBe("first turn"); // no notice before any stall
 
     // The watchdog stalls the turn; the Claude SDK offers no mid-turn steer,
@@ -168,7 +169,7 @@ describe("claude backend stall notice (#885)", () => {
     await expect(backend.recoverStalledTurn(NOTICE)).resolves.toBe(false);
     await backend.interrupt(); // the fallback path lands the interrupt
     gate.releaseNext();
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(2));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(2));
 
     const delivered = hoisted.prompts[1];
     // The notice leads, is framed as harness text (never the user's words),
@@ -186,20 +187,20 @@ describe("claude backend stall notice (#885)", () => {
     const gate = gatedChannel(["one", "two", "three"]);
     const { backend, events, done } = await startBackend(gate.channel());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(1));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(1));
     await backend.recoverStalledTurn(NOTICE);
     await backend.interrupt();
     gate.releaseNext();
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(2));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(2));
     expect(hoisted.prompts[1]).toContain(NOTICE);
     // Turn two (carrying the notice) completes; turn three is clean. Wait for
     // the result to actually route before releasing — production ordering (the
     // panel's gate releases the next batch only on the result).
     hoisted.queue.push(assistantMsg("noted — retrying"));
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(2));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(2));
     gate.releaseNext();
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(3));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(3));
     expect(hoisted.prompts[2]).toBe("three");
     hoisted.queue.end();
     await done;
@@ -209,7 +210,7 @@ describe("claude backend stall notice (#885)", () => {
     const gate = gatedChannel(["one", "two"]);
     const { backend, events, done } = await startBackend(gate.channel());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(1));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(1));
     await backend.recoverStalledTurn(NOTICE);
     // …but the "stalled" turn actually completed on its own (a success landing,
     // not an interrupt landing): the transcript has NO rejection payload, so
@@ -217,9 +218,9 @@ describe("claude backend stall notice (#885)", () => {
     // the result to route (production ordering) before the next turn shapes.
     hoisted.queue.push(assistantMsg("actually finished"));
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     gate.releaseNext();
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(2));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(2));
     expect(hoisted.prompts[1]).toBe("two");
     hoisted.queue.end();
     await done;
@@ -229,15 +230,15 @@ describe("claude backend stall notice (#885)", () => {
     const gate = gatedChannel(["one", "two"]);
     const { backend, events, done } = await startBackend(gate.channel());
     hoisted.queue.push(INIT);
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(1));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(1));
     await backend.recoverStalledTurn(NOTICE);
     // The turn failed on its own before the interrupt landed — a self-landing,
     // not a harness clear, so no rejection payload exists to correct.
     hoisted.queue.push(assistantMsg("partial work"));
     hoisted.queue.push({ type: "result", subtype: "error_max_turns" });
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     gate.releaseNext();
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(2));
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(2));
     expect(hoisted.prompts[1]).toBe("two");
     hoisted.queue.end();
     await done;
@@ -262,7 +263,7 @@ describe("claude backend stall notice (#885)", () => {
     void agent.start();
     agent.send("run the long thing");
     // The mock SDK emits NOTHING for the turn → the idle watchdog trips.
-    await vi.waitFor(() => expect(says.join("\n")).toMatch(/stopped responding/i), {
+    await waitFor(() => expect(says.join("\n")).toMatch(/stopped responding/i), {
       timeout: IDLE_MS * 20,
     });
     // The user was told the truth (a harness-cleared stall), NOT the
@@ -271,7 +272,7 @@ describe("claude backend stall notice (#885)", () => {
     expect(says.join("\n")).not.toMatch(/you did NOT cancel/i);
 
     agent.send("what happened?");
-    await vi.waitFor(() => expect(hoisted.prompts).toHaveLength(2), { timeout: IDLE_MS * 20 });
+    await waitFor(() => expect(hoisted.prompts).toHaveLength(2), { timeout: IDLE_MS * 20 });
     const delivered = hoisted.prompts[1];
     // The property #885 asks for: the agent can no longer read the interrupt's
     // generic rejection payload as a user decision — the harness correction

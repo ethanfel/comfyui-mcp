@@ -1,6 +1,6 @@
 {
   "name": "comfyui-mcp",
-  "version": "0.50.92",
+  "version": "0.51.56",
   "mcpName": "io.github.artokun/comfyui-mcp",
   "description": "Local-first, agent-native control plane for ComfyUI — MCP server + autonomous sidebar agent that drives your live graph in natural language on ANY LLM: Claude/ChatGPT/Gemini on your subscription (no API key), free local models via Ollama (fully offline), or any hosted model via an OpenAI-compatible endpoint (DeepSeek, GLM, MiMo, OpenRouter). Generate images, video & audio, author and run workflows, manage models and custom nodes; a compact tool-router mode keeps even 4B models effective, and a built-in LLM Arena benchmarks them on real ComfyUI tasks. Also a Claude Code plugin with skills, slash commands, and installer packs. Local, LAN, VPS, or Comfy Cloud.",
   "homepage": "https://comfyui-mcp.artokun.io/docs",
@@ -11,6 +11,7 @@
   },
   "files": [
     "dist",
+    "locales",
     "plugin",
     "packs",
     "scripts",
@@ -26,7 +27,7 @@
     "dev": "tsx src/index.ts",
     "dev:agent-poc": "tsx src/experimental/run.ts",
     "start": "node dist/index.js",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --passWithNoTests && npm run i18n:check && npm run check:docs-links && npm run check:docs-locale && npm run check:blog && npm run check:blog-packs && npm run check:blog-stale && npm run check:blog-structure",
     "smoke": "npm run build && node scripts/smoke-install.mjs",
     "test:watch": "vitest",
     "test:integration": "cross-env COMFYUI_INTEGRATION=true vitest run",
@@ -55,7 +56,15 @@
     "release:major": "npm version major && git push --follow-tags",
     "changelog": "node scripts/gen-changelog.mjs",
     "version": "node scripts/gen-changelog.mjs --from-pkg && git add CHANGELOG.md",
-    "prepare": "tsc"
+    "prepare": "tsc",
+    "i18n:build": "node scripts/i18n-build-en.mjs",
+    "i18n:check": "node scripts/i18n-check.mjs",
+    "check:docs-links": "node scripts/check-docs-links.mjs",
+    "check:docs-locale": "node scripts/check-docs-locale.mjs",
+    "check:blog": "node scripts/check-blog-boilerplate.mjs",
+    "check:blog-packs": "node scripts/check-blog-packs.mjs",
+    "check:blog-stale": "node scripts/check-blog-staleness.mjs --check",
+    "check:blog-structure": "node scripts/check-blog-structure.mjs"
   },
   "dependencies": {
     "@comfyorg/sdk": "^0.1.5",

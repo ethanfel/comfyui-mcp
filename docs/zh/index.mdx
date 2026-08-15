@@ -1,0 +1,77 @@
+---
+title: "ComfyUI MCP"
+description: "ComfyUI 的本地优先、智能体原生控制平面 —— 一个 MCP 服务器 + Claude Code 插件，用自然语言生成图片、视频和音频，编写并运行工作流，管理模型和自定义节点。支持本地、远程或 Comfy Cloud。"
+icon: "house"
+---
+
+**ComfyUI MCP** 是 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 的**本地优先、智能体原生控制平面** —— 一个 [MCP](https://modelcontextprotocol.io) 服务器，同时也是 Claude Code 插件。它把你的 AI 助手连接到正在运行的 ComfyUI 实例 —— **本地**、**远程**或 **[Comfy Cloud](https://cloud.comfy.org)** —— 让你用自然语言生成图片、视频和音频，执行并编写工作流，管理模型和自定义节点，以及控制服务器。它不是一个单薄的提示词转图片桥接，而是一个替你操作 ComfyUI 的完整智能体。
+
+<Frame caption="智能体面板端到端地驱动 ComfyUI —— 读取本地已安装的内容、连接节点图、释放 VRAM、运行渲染">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="快速开始" icon="rocket" href="/docs/zh/quickstart">
+    把服务器添加到 Claude Code，约 2 分钟生成第一张图片。
+  </Card>
+  <Card title="工具参考" icon="wrench" href="/docs/tools/image-generation">
+    37 个工具，文档均从实时 schema 自动生成。
+  </Card>
+  <Card title="安装" icon="download" href="/docs/zh/installation">
+    安装 ComfyUI 并接上 MCP 服务器（本地或远程）。
+  </Card>
+  <Card title="配置" icon="gear" href="/docs/configuration">
+    环境变量、传输方式、令牌，以及远程目标的指定。
+  </Card>
+</CardGroup>
+
+## 你可以做什么
+
+<CardGroup cols={3}>
+  <Card title="生成" icon="image">
+    用 `generate_image` 做文生图，并支持 ControlNet 和 IP-Adapter 条件控制。
+  </Card>
+  <Card title="编写工作流" icon="pen-ruler">
+    从模板创建，修改、校验、可视化，并与紧凑 DSL 双向互转。
+  </Card>
+  <Card title="管理模型" icon="box">
+    搜索 HuggingFace/CivitAI，下载、列出并删除模型。
+  </Card>
+  <Card title="自定义节点" icon="puzzle">
+    通过 ComfyUI-Manager 安装、更新、快照和二分排查节点包。
+  </Card>
+  <Card title="安装与维护" icon="terminal">
+    安装/更新 ComfyUI，检查运行环境，启动/停止服务器。
+  </Card>
+  <Card title="本地、远程或云端" icon="globe">
+    自动检测本地安装，用 `--comfyui-url` 指向远程，或通过 `COMFYUI_API_KEY` 与
+    [Comfy Cloud](https://cloud.comfy.org) 通信 —— 不需要本地的 ComfyUI。
+  </Card>
+</CardGroup>
+
+<Note>
+  可在 **macOS**、**Linux** 和 **Windows** 上运行，并会自动检测本地的 ComfyUI 安装和端口。源码与 issue 见 [GitHub](https://github.com/artokun/comfyui-mcp)。
+</Note>
+
+## 范围：本地、远程或 Comfy Cloud
+
+`comfyui-mcp` 是面向**本地**和**远程** ComfyUI 的社区 MCP —— 这是它的主要目标场景（Mac/Linux/Windows 安装、RunPod、VPS、局域网等）。
+
+面向 **Comfy Cloud** 用户，Comfy-Org 提供了[官方智能体工具](https://docs.comfy.org/agent-tools) —— Comfy Cloud MCP（公开测试版）和 Comfy In-App Agent（私有内测版）—— 由 Comfy 团队维护，并运行在 Comfy Cloud 上。如果你没有 GPU，或者希望零配置起步，就用它们（[并列对比](/docs/local-vs-comfy-cloud)）。`comfyui-mcp` 同样内置了社区版云模式（`COMFYUI_API_KEY`），因此一个 MCP 就能从同一份配置里指向这三种部署形态 —— 挑最适合你工作方式的那种。
+
+---
+
+## 维护者
+
+由 [**@artokun**](https://github.com/artokun) 开发并维护 —— 他是 [Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)（v2 节点图渲染器 / 子图渲染 / 提升的控件）和 [ComfyUI Python 核心](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun)的长期贡献者。
+
+**Comfy-Org 的各位**（或在 ComfyUI 生态里招人的朋友）：[art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com)。

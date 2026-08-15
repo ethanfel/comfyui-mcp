@@ -1,5 +1,5 @@
 ---
-title: "Qwen-Image & Qwen-Image-Edit in ComfyUI (2026 Guide)"
+title: "Qwen-Image & Qwen-Image-Edit in ComfyUI"
 description: "Run Qwen-Image 20B and Qwen-Image-Edit locally in ComfyUI: instruction editing, manual-mask inpainting, the WAN 2.2 refine combo, and GGUF VRAM tiers."
 keywords:
   - Qwen-Image ComfyUI
@@ -77,6 +77,18 @@ remains the go-to for photoreal portraits and is the lighter download. Qwen's
 trump cards are **editing**, **multilingual text**, and a **truly permissive
 license**. Each of those models gets its own model-highlight post — Qwen earns
 this one for being the local **edit-anything** model.
+
+## Licensing
+
+**Qwen-Image is Apache 2.0** — commercial use included, no revenue threshold, no
+separate agreement. The
+[Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI)
+repackage the pack downloads declares `apache-2.0`.
+
+That applies to Qwen-Image-Edit as well. Both are safe to build products on, which is
+a meaningful part of why the Qwen image line got adopted so quickly.
+
+The LoRAs and upscalers the packs pull are separate projects under their own terms.
 
 ## System & VRAM requirements
 
@@ -304,7 +316,7 @@ English layouts.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **[`qwen-image`](https://github.com/artokun/comfyui-mcp)** pack (20B
    T2I + WAN combo) and/or **`qwen-image-edit`** (instruction editing + mask
    inpainting) — nodes and models land in the right folders, validated.

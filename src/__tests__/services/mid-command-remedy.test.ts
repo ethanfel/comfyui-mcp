@@ -15,6 +15,9 @@
 // is no way to withdraw the first.
 
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   isInteractiveCommand,
@@ -128,13 +131,19 @@ describe("the disconnect remedy fits what was interrupted (#952)", () => {
   });
 
   it("an unknown or malformed command is treated as NON-interactive", () => {
-    // Fail toward the existing behaviour: the queue/output advice is merely
-    // unhelpful for something else, while claiming "a card may be on screen"
-    // about a write would be false.
+    // Claiming "a card may be on screen" about a write would be false, so anything
+    // not on the interactive list must classify as non-interactive.
     for (const cmd of ["", "   ", "graph_add_node", "ask_user_extra"]) {
       expect(isInteractiveCommand(cmd), cmd).toBe(false);
     }
-    expect(midCommandVerifyClause("graph_add_node")).toMatch(/queue action:"list"/);
+    // This used to assert that graph_add_node got the queue/output advice, on the
+    // rationale that it was "merely unhelpful". #646 is the bill for that: the
+    // reporter's interrupted graph_set_widget sent them to the render queue, which
+    // cannot see a canvas edit — the same wrong-remedy defect #952 fixed for
+    // interactive cards, still live for graph writes. Unhelpful advice that names a
+    // specific tool does not read as unhelpful; it reads as the answer.
+    expect(midCommandVerifyClause("graph_add_node")).toMatch(/panel_query_graph/);
+    expect(midCommandVerifyClause("ask_user_extra")).toMatch(/Verify that it applied/);
   });
 });
 
@@ -150,5 +159,221 @@ describe("WIRING: the bridge uses it (#952)", () => {
     expect(src).not.toMatch(
       /OUTCOME UNKNOWN: the command was already sent, so the panel may have applied it/,
     );
+  });
+});
+
+
+// ===========================================================================
+// panel#646 — the check named has to be able to hold the answer.
+//
+// Every non-interactive command got the same sentence: check queue action:"list"
+// / get_image list_outputs. That is RENDER evidence. The reporter's interrupted
+// command was graph_set_widget, and neither of those can say whether a widget
+// edit landed — so an agent following the advice looks somewhere structurally
+// incapable of answering and ends up retrying blindly anyway, which is the exact
+// thing OUTCOME UNKNOWN exists to prevent.
+// ===========================================================================
+describe("#646 the verify clause names evidence that exists for the command", () => {
+  const GRAPH_WRITES = [
+    "graph_set_widget", // the reported one
+    "graph_edit_node",
+    "graph_connect",
+    "graph_add_node",
+    "graph_remove_node",
+    "graph_paste_nodes",
+    "graph_create_subgraph",
+  ];
+
+  it.each(GRAPH_WRITES)("%s is verified with a graph READ, not the render queue", (cmd) => {
+    const text = midCommandVerifyClause(cmd);
+    expect(text).toMatch(/panel_query_graph/);
+    expect(text).toMatch(/graph READ/);
+    // The render tools must NOT be offered here — that is the defect.
+    expect(text).not.toMatch(/queue action:"list"/);
+    expect(text).not.toMatch(/list_outputs/);
+  });
+
+  it("says why the read is safe to run immediately", () => {
+    // A caller who has just lost a socket needs to know the check itself is not
+    // another risky write. Idempotence is the reason it is a better check than
+    // anything the run path offers.
+    expect(midCommandVerifyClause("graph_set_widget")).toMatch(/idempotent/);
+  });
+
+  it("tells the caller NOT to re-issue when the read shows it applied", () => {
+    // Verifying and then retrying anyway is the double-apply this whole message
+    // exists to avoid, and the old text never closed that loop.
+    expect(midCommandVerifyClause("graph_edit_node")).toMatch(/do\s+NOT re-issue/i);
+  });
+
+  it("graph_run KEEPS the queue/output check — it was right for exactly one command", () => {
+    const text = midCommandVerifyClause("graph_run");
+    expect(text).toMatch(/queue action:"list"/);
+    expect(text).toMatch(/list_outputs/);
+    // And it says what a blind retry costs, which is the reason to check.
+    expect(text).toMatch(/GPU time|duplicate output/);
+    expect(text).not.toMatch(/panel_query_graph/);
+  });
+
+  it("a workflow mutator is verified with the workflow list, not a canvas read", () => {
+    // These change which workflows exist or are open — a graph read cannot see it.
+    for (const cmd of ["workflow_save", "workflow_save_as", "workflow_rename", "workflow_close"]) {
+      const text = midCommandVerifyClause(cmd);
+      expect(text).toMatch(/panel_list_workflows/);
+      expect(text).not.toMatch(/panel_query_graph/);
+      expect(text).not.toMatch(/queue action:"list"/);
+    }
+  });
+
+  it("an UNRECOGNISED command names no tool at all", () => {
+    // The defect was a confidently wrong check. The default branch is exactly
+    // where a guess would be wrong again, so it says to verify and stops.
+    const text = midCommandVerifyClause("some_future_command");
+    expect(text).toMatch(/Verify that it applied/);
+    expect(text).not.toMatch(/panel_query_graph|queue action:"list"|list_outputs|panel_list_workflows/);
+    // It still explains WHY, so "verify" is not a bare instruction.
+    expect(text).toMatch(/reached the panel/);
+  });
+
+  it("an interactive card is untouched by all of this", () => {
+    const text = midCommandVerifyClause("ask_user");
+    expect(text).toMatch(/will NOT reach you/);
+    expect(text).not.toMatch(/panel_query_graph/);
+  });
+
+  it("the full message still carries the OUTCOME UNKNOWN framing", () => {
+    const msg = midCommandDisconnectMessage({ short: "wf:12345", cmd: "graph_set_widget" });
+    expect(msg).toMatch(/OUTCOME UNKNOWN/);
+    expect(msg).toMatch(/panel_query_graph/);
+  });
+
+  it("the duplicated workflow-mutator list still matches ui-bridge's", () => {
+    // WORKFLOW_MUTATORS is duplicated because ui-bridge.ts imports this module, so
+    // importing its ACTIVE_WORKFLOW_MUTATORS back would be a cycle. A duplicate is
+    // only honest with a check on it: if ui-bridge gains a fifth mutator, this
+    // module would silently send it to the default branch.
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../services/ui-bridge.ts"),
+      "utf8",
+    );
+    const block = src.slice(src.indexOf("const ACTIVE_WORKFLOW_MUTATORS"));
+    const names = (block.slice(0, block.indexOf("]")).match(/"(\w+)"/g) ?? []).map((s) =>
+      s.replace(/"/g, ""),
+    );
+    expect(names.length).toBeGreaterThan(0);
+    for (const n of names) {
+      expect(midCommandVerifyClause(n)).toMatch(/panel_list_workflows/);
+    }
+  });
+});
+
+describe("#646 a graph_ prefix does not mean the effect is on the canvas", () => {
+  it("graph_save_subgraph is verified with panel_list_subgraphs (codex review, P1)", () => {
+    // It writes to the blueprint LIBRARY. The graph is identical afterwards, so both
+    // graph readers show exactly what they showed before and cannot tell a save that
+    // landed from one that did not — the same shape of wrong answer this fix exists
+    // to remove, one branch further in.
+    const text = midCommandVerifyClause("graph_save_subgraph");
+    expect(text).toMatch(/panel_list_subgraphs/);
+    expect(text).not.toMatch(/panel_query_graph/);
+    expect(text).not.toMatch(/queue action:"list"/);
+    // And the reason a blind retry is bad here is specific: a name collision.
+    expect(text).toMatch(/collides on the name/);
+  });
+
+  it("graph_copy_nodes says nothing can check it — and to just re-issue", () => {
+    // The clipboard is not readable and the graph is unchanged, so no reader is
+    // evidence. This is the ONE interrupted write where retrying is correct: a second
+    // copy of the same nodes is the same clipboard.
+    const text = midCommandVerifyClause("graph_copy_nodes");
+    expect(text).toMatch(/clipboard is not readable/);
+    expect(text).toMatch(/Just re-issue it/);
+    expect(text).not.toMatch(/panel_query_graph/);
+    expect(text).not.toMatch(/panel_list_subgraphs/);
+  });
+
+  it("the two carve-outs are checked BEFORE the generic graph_ branch", () => {
+    // Ordering is the whole mechanism — both names start with "graph_", so a branch
+    // placed after the prefix test would never be reached.
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../services/mid-command-remedy.ts"),
+      "utf8",
+    );
+    const lib = src.indexOf("LIBRARY_COMMANDS.has(cmd)");
+    const clip = src.indexOf("CLIPBOARD_COMMANDS.has(cmd)");
+    const generic = src.indexOf('cmd.startsWith("graph_")');
+    expect(lib).toBeGreaterThan(-1);
+    expect(clip).toBeGreaterThan(-1);
+    expect(lib).toBeLessThan(generic);
+    expect(clip).toBeLessThan(generic);
+  });
+
+  it("an ordinary content edit is unaffected by the carve-outs", () => {
+    expect(midCommandVerifyClause("graph_set_widget")).toMatch(/panel_query_graph/);
+    expect(midCommandVerifyClause("graph_add_subgraph")).toMatch(/panel_query_graph/);
+  });
+});
+
+describe("#646 workflow navigation has a reader too", () => {
+  it("workflow_open / workflow_new name the OPEN RECEIPT, not `active`", () => {
+    // Found by running the LIVE panel's registered command names through the
+    // classifier after the fix merged: these two fell to the default branch, which
+    // names no tool. Not wrong — but a reader that can answer exists, and naming it
+    // is what this module is for. An opened or newly created workflow appears in
+    // panel_list_workflows exactly as a saved or renamed one does; the fence treats
+    // navigation differently, but the EVIDENCE is the same.
+    for (const cmd of ["workflow_open", "workflow_new"]) {
+      const text = midCommandVerifyClause(cmd);
+      // The REPLY KEY is `last_open`. codex round 2: the first version said
+      // `last_open_receipt`, which is the panel's local VARIABLE name and not a field
+      // any reply carries — a confidently named thing that does not exist, which is
+      // the defect this module was written to remove. Both directions asserted.
+      expect(text, cmd).toMatch(/`last_open`/);
+      expect(text, cmd).not.toMatch(/last_open_receipt/);
+      // codex review, P1: the first attempt named panel_list_workflows and stopped
+      // there, on the reasoning that an opened workflow appears in it. The panel had
+      // already written the rebuttal — after a backend reconnect the frontend restores
+      // a tab BY ITSELF, so `active` matching your target is not proof your open ran.
+      // Naming that as the check would have been this module's own defect, for the one
+      // command class that already has a purpose-built correct mechanism.
+      expect(text, cmd).toMatch(/Do NOT conclude anything from `active`/);
+      // The instruction AND the reason. A mutation that kept "restores a tab by
+      // itself" but deleted what it explains survived an earlier version of this —
+      // and the causal half is the part that stops an agent reasoning its way back
+      // to `active` ("but it matched, so surely…").
+      expect(text, cmd).toMatch(/restores a tab by\s+itself/);
+      expect(text, cmd).toMatch(/without your command ever running/);
+      // A receipt is over-readable without the rule that scopes it.
+      expect(text, cmd).toMatch(/answers ONLY for the command whose id equals/);
+      expect(text, cmd).not.toMatch(/panel_query_graph/);
+      expect(text, cmd).not.toMatch(/queue action:"list"/);
+    }
+    // All three applied states, because they demand different actions.
+    const open = midCommandVerifyClause("workflow_open");
+    expect(open).toMatch(/`applied:true`/);
+    expect(open).toMatch(/`applied:false`.*safe to re-issue/);
+    expect(open).toMatch(/must NOT be blindly retried/);
+    // And the specific cost of a blind retry, which differs from the mutators'.
+    // Asserted as a PROPERTY — that the cost of a blind retry is stated, and stated
+    // for workflow_new specifically. A control mutation swapping "empty" for "blank"
+    // killed the literal form, which punishes rewording rather than protecting
+    // behaviour.
+    const nw = midCommandVerifyClause("workflow_new");
+    expect(nw).toMatch(/blind retry costs/);
+    expect(nw).toMatch(/second workflow_new/);
+  });
+
+  it("navigation is still NOT treated as an active-workflow mutator", () => {
+    // The two sets stay separate: ui-bridge deliberately excludes navigation from
+    // ACTIVE_WORKFLOW_MUTATORS, and collapsing them here would blur a real
+    // distinction even though both happen to share a reader.
+    const src = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../../services/mid-command-remedy.ts"),
+      "utf8",
+    );
+    expect(src).toMatch(/const WORKFLOW_NAVIGATION = new Set/);
+    const mutators = src.slice(src.indexOf("const WORKFLOW_MUTATORS"));
+    const block = mutators.slice(0, mutators.indexOf("]"));
+    expect(block).not.toMatch(/workflow_open|workflow_new/);
   });
 });

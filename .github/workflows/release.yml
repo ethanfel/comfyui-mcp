@@ -14,7 +14,12 @@ jobs:
       id-token: write
       contents: write
     steps:
+      # fetch-depth: 0 for the same reason as ci.yml: `npm test` runs check:blog-stale, which
+      # reads git history. On the default depth-1 clone it cannot, and now skips — which would
+      # make it inert on exactly the path this file says must not enforce less than CI.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:

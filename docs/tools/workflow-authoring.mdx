@@ -25,7 +25,7 @@ Author and check ComfyUI workflow JSON. Driven by the `action` parameter:
   Options: `action:"create"`, `action:"modify"`, `action:"validate"`, `action:"node_info"`.
 </ParamField>
 <ParamField path="template" type="enum">
-  action:"create" (REQUIRED) — Template name: txt2img, img2img, upscale, or inpaint
+  action:"create" (REQUIRED) — Template name, one of: txt2img, img2img, upscale, inpaint, controlnet, ip_adapter, ace_step_15, stable_audio_3, remove_background, ltx_video
   Options: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`, `remove_background`, `ltx_video`.
 </ParamField>
 <ParamField path="params" type="object" default="[object Object]">

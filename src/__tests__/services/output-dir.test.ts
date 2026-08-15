@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isAbsolute, join, resolve } from "node:path";
+import { logger } from "../../utils/logger.js";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 let remoteMode = false;
 vi.mock("../../config.js", () => ({
@@ -24,10 +25,47 @@ let modelsDirStat: "dir" | "file" | "enoent" | "eacces" = "dir";
 let statFor: ((p: string) => { isDirectory: () => boolean; isFile: () => boolean }) | undefined;
 /** Canonicalization, for the #851 physical-containment check. Identity by default. */
 let realpathFor: ((p: string) => string) | undefined;
+/** What the BASE's own category dir contains (#1371). A contradiction requires this base
+ *  to hold files of its own — an EMPTY category dir is an extra_model_paths root that
+ *  simply has nothing here yet, which is a working setup and must not be refused. */
+let baseCategoryEntries: string[] = [];
+/** Names inside a SUBDIRECTORY of the category, for the diffusers-style layout (#1371). */
+let baseNestedEntries: string[] = [];
+/** Names one level below a nested directory, for the depth-2 diffusers case (#1371). */
+let baseDeepEntries: string[] = [];
+/** Entries the readdir mock reports as directories rather than files. */
+let baseDirEntries = new Set<string>();
+/** Entries the readdir mock reports as SYMLINKS — `Dirent.isFile()` is false for those,
+ *  which is how counting only isFile() stopped seeing a symlinked model tree (#1371). */
+let baseSymlinkEntries = new Set<string>();
+/** How many readdirs one resolve did — the P2 bound is a number, so assert on the number. */
+let readdirCalls = 0;
+/** How many stats one resolve did — the symlink bound is a number too. */
+let statCalls = 0;
+const direntOf = (name: string) => ({
+  name,
+  isFile: () => !baseDirEntries.has(name) && !baseSymlinkEntries.has(name),
+  isDirectory: () => baseDirEntries.has(name),
+  isSymbolicLink: () => baseSymlinkEntries.has(name),
+});
 vi.mock("node:fs", () => ({
+  readdirSync: (p: string) => {
+    readdirCalls += 1;
+    // Explicit two-level dispatch: the LAST path segment decides. A path ending in a name
+    // we declared to be a directory is the nested read; anything else is the category dir.
+    const last = basename(String(p));
+    // Three levels: category dir → a nested dir → one deeper (the diffusers shape).
+    if (last === "transformer") return baseDeepEntries.map(direntOf);
+    // A SYMLINKED directory reads through to the nested listing too — readdir follows the
+    // link. Dispatching on baseDirEntries alone made the link re-serve the category's own
+    // listing, which is not a filesystem that exists.
+    const nested = baseDirEntries.has(last) || baseSymlinkEntries.has(last);
+    return (nested ? baseNestedEntries : baseCategoryEntries).map(direntOf);
+  },
   realpathSync: (p: string) => (realpathFor ? realpathFor(String(p)) : String(p)),
   existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
   statSync: (p: string) => {
+    statCalls += 1;
     const path = String(p);
     if (/[\\/]models$/.test(path)) {
       if (modelsDirStat === "enoent" || modelsDirStat === "eacces") {
@@ -46,6 +84,31 @@ vi.mock("node:fs", () => ({
     }
     return { isDirectory: () => false, isFile: () => true };
   },
+}));
+
+/** statSync is consulted on MANY paths during resolution, not just the one a test cares
+ *  about. A blanket stub answers the others wrongly — an `isFile: true` fallback made the
+ *  server's listed file look PRESENT, so nothing was missing and the check returned ok
+ *  before reaching the branch under test. Override one path; defer the rest to the mock's
+ *  own default (present per existsFor, ENOENT otherwise). */
+const statExceptFor = (
+  match: (p: string) => boolean,
+  answer: { isDirectory: () => boolean; isFile: () => boolean } | "enoent",
+) => (path: string) => {
+  if (match(path)) {
+    if (answer !== "enoent") return answer;
+    const err = new Error(`stat ${path}`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  }
+  if (existsFor ? existsFor(path) : liveRootExists) return { isDirectory: () => false, isFile: () => true };
+  const err = new Error(`stat ${path}`) as NodeJS.ErrnoException;
+  err.code = "ENOENT";
+  throw err;
+};
+
+vi.mock("../../utils/logger.js", () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
 const getSystemStats = vi.fn();
@@ -156,6 +219,11 @@ beforeEach(() => {
   hasEntrypointFor = undefined;
   existsFor = undefined;
   modelsDirStat = "dir";
+  baseCategoryEntries = [];
+  baseNestedEntries = [];
+  baseDeepEntries = [];
+  baseDirEntries = new Set();
+  baseSymlinkEntries = new Set();
   statFor = undefined;
   realpathFor = undefined;
   serverInventory = undefined;
@@ -1179,5 +1247,344 @@ describe("#1052: I/O dirs follow the CONNECTED server, not a second install", ()
   it("falls back when the live argv identifies no root", async () => {
     getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
     expect(await resolveOutputDir()).toBe(resolve(DESKTOP, "output"));
+  });
+});
+
+describe("#1371 — a configured base the server demonstrably does not read is refused", () => {
+  // The reporter ran TWO local ComfyUIs. Connected to the second, COMFYUI_PATH still
+  // pointed at the first, and a model landed in the install the running server never reads
+  // — while the tool said "destination came from local configuration rather than the
+  // running server; visibility to the connected ComfyUI is unconfirmed". It knew, and wrote
+  // anyway.
+  //
+  // The `else if (base)` fallback took COMFYUI_PATH/models with no corroboration, and it is
+  // reached whenever the live root cannot be derived for any reason other than the
+  // relative-main.py shape the branch above it handles.
+
+  it("REFUSES when the server lists models for the category and NONE are under the base", async () => {
+    config.comfyuiPath = "/stale-install";
+    // A live server we cannot pin to a root: argv names no resolvable entrypoint.
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    // …and it will say what it sees. None of it is in the stale base.
+    serverInventory = { vae: ["h3-only.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    // The stale base holds its OWN models for this category — a second full install. That
+    // is what makes "none of the server's files are here" diagnostic rather than merely
+    // uninformative.
+    baseCategoryEntries = ["something-else.safetensors"];
+
+    await expect(resolveModelsDirWithBases({ targetCategory: "vae" })).rejects.toThrow(
+      /Refusing to download into/,
+    );
+  });
+
+  it("does NOT refuse a multi-root base holding only METADATA (codex P0)", async () => {
+    // "Has files of its own" has to mean MODEL files. Counting any directory entry treats
+    // a .gitkeep or a desktop.ini as proof the base is a populated root, so an
+    // extra_model_paths root with nothing but housekeeping in this category would be
+    // refused — the working install this refinement exists to protect.
+    config.comfyuiPath = "/second-root";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["lives-in-the-other-root.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = [".gitkeep", "desktop.ini", "Thumbs.db"];
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/second-root", "models"));
+  });
+
+  it("a diffusers-style base IS contradicted — a nested model counts (codex P1)", async () => {
+    // The first version treated "no model file at the top level" as "not populated", so a
+    // stale base whose weights live in per-model folders sailed through and the download
+    // went into the wrong install. One level down is enough for the real layout and stops
+    // short of walking a models tree that can hold tens of thousands of files.
+    config.comfyuiPath = "/stale-diffusers";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["some-model-dir"];
+    baseDirEntries = new Set(["some-model-dir"]);
+    baseNestedEntries = ["model.safetensors"];
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("a SYMLINKED model file counts — Dirent.isFile() is false for links (codex P1)", async () => {
+    // Sharing one model tree between installs by symlinking is ordinary practice, and this
+    // file says so elsewhere. Requiring isFile() alone made a stale base whose models are
+    // links read as EMPTY — reintroducing the misplaced write for exactly the users most
+    // likely to be running two installs.
+    config.comfyuiPath = "/stale-symlinked";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["linked-model.safetensors"];
+    baseSymlinkEntries = new Set(["linked-model.safetensors"]);
+
+    await expect(resolveModelsDirWithBases({ targetCategory: "vae" })).rejects.toThrow(
+      /Refusing to download into/,
+    );
+  });
+
+  it("a DEEPER diffusers tree counts too — <repo>/transformer/model.safetensors (codex P1)", async () => {
+    // One level down finds nothing in a real HF repo checkout, and "found nothing" was
+    // read as "this base is empty", permitting the misplaced write.
+    config.comfyuiPath = "/stale-deep";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["repo"];
+    baseDirEntries = new Set(["repo", "transformer"]);
+    baseNestedEntries = ["transformer"];
+    // `transformer` resolves through the same nested list; give it a model at depth 2.
+    baseDeepEntries = ["model.safetensors"];
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("a SYMLINKED model DIRECTORY counts — isDirectory() is false for those too (codex P1)", async () => {
+    // The same trap as isFile(), and it caught the same users. `models/checkpoints/SDXL ->
+    // /mnt/shared/SDXL` is what sharing one model tree between installs looks like, so the
+    // population this gate protects read as empty and the misplaced write went ahead —
+    // the symlinked-FILE fix above did nothing for them.
+    config.comfyuiPath = "/stale-linked-dir";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["linked-dir"];
+    // A link to a directory: isDirectory() FALSE, isSymbolicLink() TRUE — Node's real
+    // Dirent semantics, pinned against the live filesystem in output-dir-symlink-fs.test.ts.
+    baseSymlinkEntries = new Set(["linked-dir"]);
+    baseNestedEntries = ["model.safetensors"];
+    // Scoped to the link. statSync is consulted on other paths during resolution, and a
+    // blanket stub answers those wrongly — the test then fails for an unrelated reason.
+    statFor = statExceptFor((p) => p.endsWith("linked-dir"), {
+      isDirectory: () => true,
+      isFile: () => false,
+    });
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("a BROKEN link does not abort the scan around it", async () => {
+    // statSync on a dangling link throws. Letting it escape does not crash — an outer
+    // catch swallows it — which is exactly why this needed a test that can fail: the
+    // throw ABORTS the scan, so a base holding a stray broken link AND real models is
+    // never contradicted, and the misplaced write proceeds.
+    //
+    // The link is listed FIRST on purpose. Behind it, a model that must still be found.
+    config.comfyuiPath = "/broken-link";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["dangling", "real-model.safetensors"];
+    baseSymlinkEntries = new Set(["dangling"]);
+    statFor = statExceptFor((p) => p.endsWith("dangling"), "enoent");
+
+    await expect(
+      resolveModelsDirWithBases({ targetCategory: "clip_vision" }),
+    ).rejects.toThrow(/Refusing to download into/);
+  });
+
+  it("the scan is bounded — a huge category does not become thousands of readdirs (codex P2)", async () => {
+    // Depth alone bounds nothing: 10k empty subdirectories is 10k synchronous readdirs on
+    // the download path. The bound is generous (512) because a real diffusers layout
+    // answers from the first directory it reads — it exists for the pathological tree, not
+    // the ordinary one.
+    config.comfyuiPath = "/huge";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    const many = Array.from({ length: 5000 }, (_, i) => `dir-${i}`);
+    baseCategoryEntries = many;
+    baseDirEntries = new Set(many);
+    baseNestedEntries = [];
+    readdirCalls = 0;
+    statCalls = 0;
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(modelsDir).toBe(resolve("/huge", "models"));
+    // The bound, asserted as a number rather than a vibe. Without it this is 5001.
+    expect(readdirCalls).toBeLessThanOrEqual(520);
+    // ...and it really did have thousands of chances to exceed it.
+    expect(readdirCalls).toBeGreaterThan(100);
+  });
+
+  it("SYMLINK entries are bounded too — the stat is itself the work (codex P2)", async () => {
+    // Bounding readdirs left this shape exactly as unbounded as before: `.some()` resolves
+    // every link with statSync and only THEN lets the recursion decline for want of
+    // budget. Thousands of symlinks in one category is the tree the symlink fix newly made
+    // reachable, so it is the tree that had to be bounded with it.
+    //
+    // The links point at FILES, deliberately. A link to a DIRECTORY consumes the readdir
+    // budget, so that budget bounds the stats as a side effect and the stat cap could be
+    // deleted with every test still green — mutation testing caught exactly that. A link
+    // to a file consumes nothing, so this shape is bounded by the stat cap alone.
+    config.comfyuiPath = "/huge-links";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    // No model extension, so the entries are not counted as models on their names.
+    const many = Array.from({ length: 20000 }, (_, i) => `link-${i}`);
+    baseCategoryEntries = many;
+    baseSymlinkEntries = new Set(many);
+    baseNestedEntries = [];
+    statFor = statExceptFor((p) => /link-\d+$/.test(p), {
+      isDirectory: () => false,
+      isFile: () => true,
+    });
+    readdirCalls = 0;
+    statCalls = 0;
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(modelsDir).toBe(resolve("/huge-links", "models"));
+    // The cap is 4096; without it this is 20000.
+    expect(statCalls, "every link must not be resolved").toBeLessThanOrEqual(4200);
+    expect(statCalls, "...and it really had 20k chances to exceed it").toBeGreaterThan(1000);
+    // Nothing recursed, so the readdir budget never applied — the stat cap is the only
+    // thing standing between this tree and 20k syscalls.
+    expect(readdirCalls).toBeLessThanOrEqual(3);
+  });
+
+  it("a TRUNCATED scan is reported, not folded into an empty-base finding (codex P1)", async () => {
+    // The dangerous half. A stale base whose only model sits behind the 512th directory
+    // looks exactly like an empty one, so the refusal is skipped and the file lands in an
+    // install the connected server never reads — the silent misplaced write this entire
+    // check exists to stop, reintroduced by its own bound.
+    //
+    // Refusing on an inconclusive scan is worse (it blocks working installs, which was an
+    // earlier P0 here), so the download proceeds — but the user is told the check did not
+    // finish, which is the one thing they cannot otherwise know.
+    const warn = vi.mocked(logger.warn);
+    warn.mockClear();
+    config.comfyuiPath = "/truncated";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    const many = Array.from({ length: 5000 }, (_, i) => `dir-${i}`);
+    baseCategoryEntries = many;
+    baseDirEntries = new Set(many);
+    baseNestedEntries = [];
+
+    await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    const said = warn.mock.calls.map((c) => String(c[0])).join(" ");
+    expect(said).toMatch(/did not finish/);
+    expect(said).toMatch(/NOT a finding that this/);
+  });
+
+  it("...and a scan that COMPLETES says nothing about truncation", async () => {
+    // The over-broad direction: warning on every ordinary resolve would train the user to
+    // ignore the one that matters.
+    const warn = vi.mocked(logger.warn);
+    warn.mockClear();
+    config.comfyuiPath = "/small";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["a", "b"];
+    baseDirEntries = new Set(["a", "b"]);
+    baseNestedEntries = [];
+
+    await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).not.toMatch(/did not finish/);
+  });
+
+  it("…but an EMPTY subfolder is still not evidence", async () => {
+    // The metadata hole in another costume: a folder that holds nothing says nothing.
+    config.comfyuiPath = "/empty-subfolder";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { clip_vision: ["lives-elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["empty-dir"];
+    baseDirEntries = new Set(["empty-dir"]);
+    baseNestedEntries = [];
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "clip_vision" });
+    expect(modelsDir).toBe(resolve("/empty-subfolder", "models"));
+  });
+
+  it("a DIRECTORY named *.safetensors is not a model (codex)", async () => {
+    // Counting it would refuse a working base on the strength of a folder name.
+    config.comfyuiPath = "/folder-named-like-a-model";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["elsewhere.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = ["looks_like.safetensors"];
+    baseDirEntries = new Set(["looks_like.safetensors"]);
+    baseNestedEntries = [];
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/folder-named-like-a-model", "models"));
+  });
+
+
+  it("does NOT refuse a multi-root base that is simply EMPTY for this category", async () => {
+    // THE P0 DIRECTION. An extra_model_paths layout can legitimately have this base as one
+    // of the server's roots with nothing in this category yet — indistinguishable from a
+    // stale base by filename listing alone. Refusing it would block a working install,
+    // which is worse than the wrong-directory write this gate exists to stop.
+    config.comfyuiPath = "/second-root";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["lives-in-the-other-root.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+    baseCategoryEntries = [];
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/second-root", "models"));
+  });
+
+  it("still writes when the server lists NOTHING — absence of evidence is not evidence", async () => {
+    // THE OVER-BROAD DIRECTION, and the reason this gate is contradiction-only. A fresh
+    // install has an empty models dir, corroborates nothing, and must still take its FIRST
+    // download. Refusing here would break every new setup.
+    config.comfyuiPath = "/fresh-install";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: [] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+
+    const { modelsDir, source } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/fresh-install", "models"));
+    expect(source).toBe("configured-base");
+  });
+
+  it("still writes when the server is UNREACHABLE — nothing was established either way", async () => {
+    config.comfyuiPath = "/offline-install";
+    getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    serverInventory = undefined;
+
+    const { modelsDir } = await resolveModelsDirWithBases({ targetCategory: "vae" });
+    expect(modelsDir).toBe(resolve("/offline-install", "models"));
+  });
+
+  it("still writes when NO category was named — the check cannot contradict what it never asked", async () => {
+    config.comfyuiPath = "/unknown-category";
+    getSystemStats.mockResolvedValue({ system: { argv: ["python"] } });
+    serverInventory = { vae: ["something.safetensors"] };
+    modelsDirStat = "dir";
+    existsFor = (p) => p.endsWith("models");
+
+    const { modelsDir } = await resolveModelsDirWithBases();
+    expect(modelsDir).toBe(resolve("/unknown-category", "models"));
   });
 });

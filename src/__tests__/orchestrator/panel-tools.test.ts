@@ -25,11 +25,18 @@ import {
   __panelToolsTestHooks,
   __panelRunTestHooks,
   __panelAskTestHooks,
+  classifyRestartFallbackTarget,
+  restartRefusalHandoffAdvice,
+  restartTimeoutFallbackAdvice,
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
-import { markReplyTimeout } from "../../services/ui-bridge.js";
+import {
+  BRIDGE_DEFAULT_TIMEOUT_MS,
+  BRIDGE_READ_DEFAULT_TIMEOUT_MS,
+  markReplyTimeout,
+} from "../../services/ui-bridge.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
 import { QueueMonitor } from "../../services/queue-monitor.js";
 import { AskAnswers } from "../../orchestrator/ask-answer-journal.js";
@@ -54,8 +61,11 @@ function makeFakeCtx(
     // inspect the panel's reply. Record the forwarded cmd on the same `calls`
     // array and hand back a caller-supplied reply.
     bridge: {
-      send: async (cmd: Forwarded) => {
+      // Record the bound on the same index-aligned `timeouts` array as ctx.call,
+      // so a bound assertion reads the same way for both dispatch paths (#1520).
+      send: async (cmd: Forwarded, opts?: { timeoutMs?: number }) => {
         calls.push(cmd);
+        timeouts.push(opts?.timeoutMs);
         return bridgeReply ?? {};
       },
     } as unknown as PanelToolCtx["bridge"],
@@ -532,10 +542,15 @@ describe("panel-tools: panel_load_workflow path (server-side disk read)", () => 
     const res = await defByName("panel_load_workflow").handler({ path: file }, ctx);
 
     expect(res.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ cmd: "graph_load" });
+    // Counted by COMMAND, not by total calls (#1478): the load now also claims the
+    // workflow-instance fence it just invalidated, and on a fake ctx that cannot
+    // corroborate an identity the rebind rechecks a few times. What this test guards is
+    // that the graph is loaded EXACTLY once — a second graph_load would replace the
+    // user's canvas twice — and that is now asserted directly.
+    const loads = calls.filter((c) => c.cmd === "graph_load");
+    expect(loads).toHaveLength(1);
     // The big JSON was read SERVER-SIDE and handed to graph_load verbatim.
-    expect(calls[0].graph).toMatchObject(graph);
+    expect(loads[0].graph).toMatchObject(graph);
   });
 
   it("rejects a non-existent path WITHOUT firing graph_load", async () => {
@@ -1710,7 +1725,11 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).not.toMatch(/conns/i);
-    expect((res.content[0] as { text: string }).text).toMatch(/multiple|last active|pass tab_id/i);
+    // #971 — the ambiguity error is still produced and still does not guess; it is
+    // now worded so it can be acted on (the old text ended "— pass tab_id", which
+    // this tool has no parameter for). What this test is really about is that the
+    // BOUND isHeadless call worked, so keep pinning "not /conns/" above.
+    expect((res.content[0] as { text: string }).text).toMatch(/Several ComfyUI tabs are connected/i);
   });
 
   // #884 confirming gate 3, P0 — the scope-repin double gate. A SCOPE-bound ctx
@@ -2150,7 +2169,10 @@ describe("panel-tools: session tabId self-heal (#322 reload / #331 workflow-swit
 
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toMatch(/Multiple panel tabs/);
+    // #971 — same refusal, actionable wording. The behavioural assertions (isError,
+    // and tabId untouched below) are what "no guess" actually means here.
+    expect((res.content[0] as { text: string }).text).toMatch(/Several ComfyUI tabs are connected/i);
+    expect((res.content[0] as { text: string }).text).not.toMatch(/pass tab_id/i);
     // tabId is NOT silently changed to some arbitrary tab.
     expect(ctx.tabId).toBe("dead-tab");
   });
@@ -2216,6 +2238,75 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
     ]) {
       expect(names).toContain(expected);
     }
+  });
+
+  // ── #1520: the two commands coupled to CivitAI get the tolerant read bound ──
+  //
+  // Of the six civitai_* commands, exactly two await the in-flight fetch panel
+  // side (`state.activeReloadPromise`): civitai_results and civitai_highlight.
+  // Their reply time is bounded by a third party, not by the tab, so charging
+  // them a bound sized for a local read fails a *healthy* panel.
+  //
+  // This asserts BOTH directions. Raising the coupled pair is the fix; leaving
+  // the local commands alone is the scope, and a test that only checked the pair
+  // would pass just as happily if someone raised all six — which would hide a
+  // genuinely dead tab behind an extra 10 s on commands that answer locally and
+  // immediately.
+  //
+  // The family is NOT uniform, and an earlier version of this comment said it
+  // was ("all six were on 10000; the other four keep the tighter bound"). Both
+  // halves were false. civitai_search dispatches through ctx.bridge.send, not
+  // ctx.call, and already takes BRIDGE_DEFAULT_TIMEOUT_MS — #1468 raised it for
+  // an unrelated reason. So only THREE keep 10 s, and search is pinned below on
+  // its own path so "raise search too" cannot pass unnoticed.
+  describe("civitai bridge bounds (#1520)", () => {
+    const COUPLED = ["panel_civitai_results", "panel_civitai_highlight"] as const;
+    const LOCAL = [
+      "panel_civitai_clear_highlight",
+      "panel_civitai_switch_tab",
+      "panel_civitai_open_lightbox",
+    ] as const;
+    // Minimal valid args per tool — the bound is forwarded before any of these
+    // matter, but the handlers must not reject before reaching ctx.call.
+    const ARGS: Record<string, Record<string, unknown>> = {
+      panel_civitai_results: { limit: 20 },
+      panel_civitai_highlight: { ids: ["1"] },
+      panel_civitai_clear_highlight: {},
+      panel_civitai_switch_tab: { tab: "models" },
+      panel_civitai_open_lightbox: { id: "1" },
+    };
+
+    it("the two fetch-coupled reads forward the 20s read bound, not 10s", async () => {
+      for (const name of COUPLED) {
+        const { ctx, calls, timeouts } = makeFakeCtx();
+        await defByName(name).handler(ARGS[name], ctx);
+        const i = calls.findIndex((c) => String(c.cmd).startsWith("civitai_"));
+        expect(i, `${name} never forwarded a civitai_* command`).toBeGreaterThanOrEqual(0);
+        expect(timeouts[i], `${name} bound`).toBe(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+      }
+    });
+
+    it("the commands that answer locally keep the tighter bound", async () => {
+      for (const name of LOCAL) {
+        const { ctx, calls, timeouts } = makeFakeCtx();
+        await defByName(name).handler(ARGS[name], ctx);
+        const i = calls.findIndex((c) => String(c.cmd).startsWith("civitai_"));
+        expect(i, `${name} never forwarded a civitai_* command`).toBeGreaterThanOrEqual(0);
+        expect(timeouts[i], `${name} bound`).toBe(10000);
+        expect(timeouts[i]).toBeLessThan(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+      }
+    });
+
+    it("civitai_search keeps its own path and bound — it is not part of this change", async () => {
+      // Pinned so the scope assertion above cannot be quietly widened: search is
+      // the sixth command, it does NOT go through ctx.call, and its bound was
+      // already raised by #1468 because driveSearch dispatches without awaiting.
+      const { ctx, calls, timeouts } = makeFakeCtx({ ok: true, results: [] });
+      await defByName("panel_civitai_search").handler({ query: "flux" }, ctx);
+      const i = calls.findIndex((c) => c.cmd === "civitai_search");
+      expect(i, "panel_civitai_search never forwarded civitai_search").toBeGreaterThanOrEqual(0);
+      expect(timeouts[i], "civitai_search bound").toBe(BRIDGE_DEFAULT_TIMEOUT_MS);
+    });
   });
 
   it("panel_open_civitai forwards a dock flag alongside the existing args", async () => {
@@ -6508,6 +6599,12 @@ describe("panel#769 restart refusal names the tunnelled-remote case", () => {
   // local process to account for — because there is none. The refusal was right
   // about what it observed and useless about what to do: the reader goes looking
   // for a local install that does not exist.
+  // BOUNDED BY THE ENCLOSING BLOCK, not by a character count. The original
+  // `slice(i, i + 3000)` broke the moment #1593 made part of this note a function
+  // call: the window is not a unit of anything, so growing the block by a comment
+  // silently moves a real assertion outside it and the test fails for a reason
+  // unrelated to what it checks. Walk to the brace that closes the `ok({ … })`
+  // this note lives in, and the assertion tracks the block instead of its length.
   const refusal = () => {
     const src = readFileSync(
       new URL("../../orchestrator/panel-tools.ts", import.meta.url),
@@ -6515,7 +6612,15 @@ describe("panel#769 restart refusal names the tunnelled-remote case", () => {
     );
     const i = src.indexOf("Refusing to restart ComfyUI: I could not confirm");
     expect(i).toBeGreaterThan(-1);
-    return src.slice(i, i + 3000);
+    let depth = 0;
+    for (let j = i; j < src.length; j++) {
+      if (src[j] === "{") depth++;
+      else if (src[j] === "}") {
+        if (depth === 0) return src.slice(i, j);
+        depth--;
+      }
+    }
+    throw new Error("refusal block is unterminated");
   };
 
   it("names the classification as HOST-based, not instance-based", () => {
@@ -6540,7 +6645,107 @@ describe("panel#769 restart refusal names the tunnelled-remote case", () => {
   it("keeps the original alternative — this is additive", () => {
     // restart_comfyui remains the answer for a genuinely local install that
     // simply could not be identified; the tunnel note must not displace it.
-    const t = refusal();
+    //
+    // #1593 moved this sentence out of the literal and into
+    // restartRefusalHandoffAdvice, because it must no longer be unconditional —
+    // so it is asserted on the RUNTIME message rather than on the source, which
+    // is a stronger check than the one it replaces: source proximity never
+    // proved the sentence was reached, and this does. The "unproven" verdict is
+    // the shape this branch was written for (a local install we could not tie to
+    // the panel's instance).
+    expect(
+      restartRefusalHandoffAdvice({
+        headlessBase: "http://127.0.0.1:8188",
+        panelBase: null,
+        observedOrigin: null,
+      }),
+    ).toMatch(/USE restart_comfyui/);
+  });
+});
+
+// #1593 — the refusal must stop recommending a restart aimed at a DIFFERENT
+// server.
+//
+// The #814 refusal ended "USE restart_comfyui INSTEAD" for every caller. #851 is
+// the record of why that is a defect: restart_comfyui targets COMFYUI_URL, not the
+// ComfyUI the panel is inside, and a reporter who followed exactly that advice
+// restarted a different machine. #851 fixed the confirmation-TIMEOUT branch and
+// left the discriminator unused in the refusal — which fires precisely when the
+// two addresses are most likely to differ.
+describe("#1593 restart refusal checks WHICH server the fallback would hit", () => {
+  const HEADLESS = "http://127.0.0.1:8188";
+
+  it("endorses the handoff when the panel is PROVABLY on the configured target", () => {
+    // A TOTALITY check, not a shipped message. Neither refusal can reach this
+    // verdict — both are guarded by `!bound`, and `bound` is this same predicate,
+    // so a refusal that fires has already ruled `same` out (a tripwire here is not
+    // hit by any handler-driven test). It is asserted so that a future call site
+    // with a different boundness test gets this text rather than falling through
+    // to "unproven" and claiming a check failed that actually succeeded.
+    const t = restartRefusalHandoffAdvice({ headlessBase: HEADLESS, panelBase: HEADLESS });
     expect(t).toMatch(/USE restart_comfyui/);
+    expect(t).toContain(HEADLESS);
+    // The difference from "unproven": this one was checked, and says so.
+    expect(t).toMatch(/PROVABLY/);
+    expect(t).not.toMatch(/could NOT confirm/);
+  });
+
+  it("REFUSES to recommend it when the panel is provably on a different server", () => {
+    const t = restartRefusalHandoffAdvice({
+      headlessBase: HEADLESS,
+      panelBase: null,
+      // Server-observed handshake Origin; page JS cannot forge it.
+      observedOrigin: "http://127.0.0.1:8189",
+    });
+    expect(t).toMatch(/Do NOT reach for restart_comfyui/);
+    // BOTH addresses named — the reporter had to paraphrase one back to us.
+    expect(t).toContain(HEADLESS);
+    expect(t).toContain("http://127.0.0.1:8189");
+    // And it must not also tell them to run it.
+    expect(t).not.toMatch(/USE restart_comfyui/);
+  });
+
+  it("recommends it, naming what was NOT established, when nothing is proven", () => {
+    const t = restartRefusalHandoffAdvice({
+      headlessBase: HEADLESS,
+      panelBase: null,
+      observedOrigin: null,
+    });
+    expect(t).toMatch(/USE restart_comfyui/);
+    expect(t).toMatch(/could NOT confirm/);
+    expect(t).toContain(HEADLESS);
+  });
+
+  it("does NOT call a DNS-ambiguous localhost a different server", () => {
+    // A coordinator P0 that captureRebootHealthBase already honours: `localhost`
+    // can resolve to either family, so it is not proof of difference. Firing the
+    // strong warning here would send a user away from a tool that would have
+    // worked — the cry-wolf failure, which is how the same bug was found in #1233.
+    const t = restartRefusalHandoffAdvice({
+      headlessBase: HEADLESS,
+      panelBase: null,
+      observedOrigin: "http://localhost:8188",
+    });
+    expect(t).not.toMatch(/Do NOT reach for restart_comfyui/);
+    expect(t).toMatch(/USE restart_comfyui/);
+  });
+
+  it("shares ONE comparison with the #851 timeout advice", () => {
+    // Two readers of the same evidence that can disagree is the defect being
+    // fixed, pointed inward. Same inputs, same verdict, different wording.
+    const inputs = [
+      { headlessBase: HEADLESS, panelBase: HEADLESS, observedOrigin: null },
+      { headlessBase: HEADLESS, panelBase: null, observedOrigin: "http://127.0.0.1:8189" },
+      { headlessBase: HEADLESS, panelBase: null, observedOrigin: null },
+    ];
+    for (const args of inputs) {
+      const verdict = classifyRestartFallbackTarget(args);
+      const timeoutAdvice = restartTimeoutFallbackAdvice(args);
+      const refusalAdvice = restartRefusalHandoffAdvice(args);
+      const timeoutWarns = /Do NOT reach for restart_comfyui/.test(timeoutAdvice);
+      const refusalWarns = /Do NOT reach for restart_comfyui/.test(refusalAdvice);
+      expect(timeoutWarns).toBe(verdict.kind === "different");
+      expect(refusalWarns).toBe(verdict.kind === "different");
+    }
   });
 });

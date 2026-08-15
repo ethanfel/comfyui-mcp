@@ -84,23 +84,30 @@ vi.mock("../../services/extra-paths.js", () => ({
 const resolveModelsDirWithBasesMock = vi.hoisted(() =>
   vi.fn(async (): Promise<unknown> => undefined),
 );
-vi.mock("../../services/output-dir.js", () => ({
-  resolveModelsDir: vi.fn(async () => resolve(h.destModelsDir)),
-  resolveModelsDirWithBases: () => resolveModelsDirWithBasesMock(),
-  parseModelsDirFromArgv: vi.fn(() => undefined),
-  hasUnresolvableRelativeModelDirFlag: vi.fn(() => false),
-  // Real behaviour (pure argv parsing): the "empty tree + no extra roots" refusal
-  // only concludes anything when the server's config location is knowable.
-  parseExtraModelPathsConfigsFromArgvRaw: (argv?: string[]) => {
-    const out: string[] = [];
-    for (let i = 0; i < (argv?.length ?? 0); i++) {
-      if (argv![i] === "--extra-model-paths-config" && argv![i + 1]) out.push(argv![i + 1]);
-    }
-    return out;
-  },
-  isLiveAuthoritativeModelsDir: (s: string) =>
-    s === "argv-flag" || s === "live-root" || s === "observed-root",
-}));
+vi.mock("../../services/output-dir.js", async (importOriginal) => {
+  // The provenance predicates come from the REAL module. WHICH sources skip the
+  // disagreement check is the entire subject of #369, so a hand-copied second
+  // definition here could drift from the one production uses — and these tests
+  // would keep passing while the guard changed underneath them.
+  const real = (await importOriginal()) as typeof import("../../services/output-dir.js");
+  return {
+    resolveModelsDir: vi.fn(async () => resolve(h.destModelsDir)),
+    resolveModelsDirWithBases: () => resolveModelsDirWithBasesMock(),
+    parseModelsDirFromArgv: vi.fn(() => undefined),
+    hasUnresolvableRelativeModelDirFlag: vi.fn(() => false),
+    // Real behaviour (pure argv parsing): the "empty tree + no extra roots" refusal
+    // only concludes anything when the server's config location is knowable.
+    parseExtraModelPathsConfigsFromArgvRaw: (argv?: string[]) => {
+      const out: string[] = [];
+      for (let i = 0; i < (argv?.length ?? 0); i++) {
+        if (argv![i] === "--extra-model-paths-config" && argv![i + 1]) out.push(argv![i + 1]);
+      }
+      return out;
+    },
+    isLiveAuthoritativeModelsDir: real.isLiveAuthoritativeModelsDir,
+    modelsDirNamedByServer: real.modelsDirNamedByServer,
+  };
+});
 
 // A live-resolved models root is exempt from the pre-write check ONLY when it
 // exists on this filesystem (a container-side path does not). Default true.
@@ -336,14 +343,68 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
-  it("does NOT second-guess a LIVE-AUTHORITATIVE root that exists locally — no listing call", async () => {
-    h.modelsDirSource = "observed-root";
+  it("does NOT second-guess an --models-directory the server itself passed", async () => {
+    // The other server-named source. Mutation testing found nothing covered it:
+    // dropping `argv-flag` from the exemption killed no test, so the guard could
+    // have started charging a listing call — and refusing — on the strongest
+    // provenance there is, silently.
+    h.modelsDirSource = "argv-flag";
     h.onDisk = { loras: ["stale.safetensors"] };
     h.liveListings["loras"] = ["completely-different.safetensors"];
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
     expect(h.fetchCalls).toEqual([]);
+  });
+
+  it("does NOT second-guess a root the SERVER'S OWN ARGV named, when it exists locally", async () => {
+    // `argv-flag` and `live-root` come from the server stating where it reads.
+    // Nothing this side infers can be better evidence than that, so the listing
+    // call is skipped entirely.
+    h.modelsDirSource = "live-root";
+    h.onDisk = { loras: ["stale.safetensors"] };
+    h.liveListings["loras"] = ["completely-different.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
+    );
+    expect(h.fetchCalls).toEqual([]);
+  });
+
+  // ── #369 recurrence: `observed-root` is INFERRED, not vouched for ──────────
+  //
+  // This test previously asserted the opposite, for `observed-root`, on the
+  // ground that a "live-resolved" root is authoritative and needs no second
+  // opinion. Measured against the anchor, that ground does not hold:
+  // `observed-root` is the relative `main.py` re-anchored on the interpreter the
+  // OS reports, which establishes where the BINARY lives — not where the server
+  // reads models. With a stale bundle's python on PATH, `cd D:\live && python
+  // ComfyUI\main.py` anchors `C:\stale\ComfyUI`, and the download lands in an
+  // install the running server never reads. That is #369's original outcome
+  // reached by a different route, which is why it was reopened.
+  //
+  // So the exemption now covers only the two sources the SERVER ITSELF named.
+  // `observed-root` runs the same cheap, fail-open disagreement check every
+  // configured root runs — it cannot refuse a fresh or shared tree, because the
+  // check needs POSITIVE contradicting evidence (containment, root-wide).
+  it("#369: an INFERRED root IS checked, and a contradicting live listing refuses it", async () => {
+    h.modelsDirSource = "observed-root";
+    h.onDisk = { loras: ["stale.safetensors"] };
+    h.liveListings["loras"] = ["completely-different.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /does not read|not part of its search path|stale/i,
+    );
+    expect(h.fetchCalls.length).toBeGreaterThan(0);
+  });
+
+  it("#369: an inferred root that AGREES with the live server still proceeds", async () => {
+    // The direction that must not regress: the check is fail-open and needs
+    // positive contradiction, so a correct anchor is unaffected.
+    h.modelsDirSource = "observed-root";
+    h.onDisk = { loras: ["shared.safetensors"] };
+    h.liveListings["loras"] = ["shared.safetensors", "other.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
+    );
   });
 
   it("PROCEEDS on a container-side models root that does not exist here (post-write reports it)", async () => {
@@ -432,7 +493,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     // Default to the healthy case: the destination IS the root the running server
     // reported, so a listing hit is decisive. Tests about the non-authoritative
     // ambiguity set `configured-base` explicitly.
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/live/ComfyUI/models";
   });
 
@@ -564,14 +625,53 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     // An unverifiable result must say WHY and how to become verifiable, or the user
     // has nothing to act on.
     expect(res.note).toMatch(/RELATIVE main\.py/);
-    expect(res.note).toMatch(/could not be identified/);
     expect(res.note).toMatch(/list_local_models/);
+    // ...and the remedy has to be actionable: NAME the root.
+    expect(res.note).toMatch(/COMFYUI_PATH/);
+    expect(res.note).toMatch(/--base-directory/);
+    // #1587 — but it must not assert the process could not be identified. That is a
+    // CONJUNCT the code never established: ComfyUI Desktop identifies the process
+    // (python_probe_trusted:true, process-table PID) and the root is unpinnable
+    // anyway, so a user who reads this goes and "fixes" a working probe.
+    expect(res.note).not.toMatch(/main\.py with no working directory AND/);
+    expect(res.note).not.toMatch(/make its process observable/);
+  });
+
+  // #369 review, P1: the pre-write guard fails OPEN on an empty candidate tree —
+  // correctly, since an empty directory contradicts nothing. So a stale INFERRED
+  // root can still receive the write. What must not follow is a confident
+  // "visible": the live server lists that filename because the user already had
+  // the model in the REAL install, and matching on the name alone would report a
+  // download that landed nowhere the server reads as a success. That is #369's
+  // original symptom, reproduced after the pre-write half was fixed.
+  it("#369: an INFERRED root does NOT get a confident 'visible' from a same-named entry", async () => {
+    // The fixture has to put the landed file UNDER the inferred root, or the
+    // membership test answers "outside" and the verdict is unremarkable either
+    // way. (First written with the file in the other tree: it passed with the
+    // narrowing REVERTED, i.e. it pinned nothing. Mutation testing caught that.)
+    //
+    // So: the write landed in the stale tree the inference produced, and the live
+    // server lists that filename because the user already had the model in the
+    // REAL install. Membership says "yes, under the root" — of a root the server
+    // never named — and a name match would then read as success.
+    const staleLanded = resolve("/stale/ComfyUI/models/loras/new.safetensors");
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/stale/ComfyUI/models";
+    h.liveListings["loras"] = ["new.safetensors"]; // the server's own copy elsewhere
+    const res = await verifyLandedModel(staleLanded, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: true,
+    });
+    expect(res.liveVisible).toBe("unknown");
+    expect(res.note).toMatch(/inferred from where the server's interpreter lives/);
+    expect(res.note).toMatch(/already listed that name before this download/);
   });
 
   it("DOES confirm a re-download into a LIVE-AUTHORITATIVE root even though the name pre-existed", async () => {
     // Repairing/replacing an existing model in the server's own tree must stay a
-    // clean success — the ambiguity only exists for locally-configured roots.
-    h.modelsDirSource = "observed-root";
+    // clean success — the ambiguity only exists for roots the server did not name.
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/live/ComfyUI/models"; // the tree `target` lives in
     h.liveListings["loras"] = ["new.safetensors"];
     const res = await verifyLandedModel(target, "loras", {
@@ -586,7 +686,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     // Server A was live when the file landed under A's models root. B replaced it on
     // the same port before verification and happens to list the same filename — that
     // is B's OWN copy, not ours, and ours is outside everything B reads.
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/serverB/models"; // the CURRENT live root
     h.liveListings["loras"] = ["new.safetensors"]; // B's own same-named model
     h.liveExtraRoots = { authoritative: true, roots: [] };
@@ -602,7 +702,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
   it("re-checks membership AFTER the listing — a server swap mid-check is not a success (codex gate r11)", async () => {
     // Server A is live for the membership check; B replaces it before the listing
     // and lists its OWN same-named model. That must not confirm A's file.
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/live/ComfyUI/models"; // A: the landed file IS under this
     h.liveExtraRoots = { authoritative: true, roots: [] };
     h.liveListings["loras"] = ["new.safetensors"];
@@ -628,7 +728,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
   });
 
   it("stamps the live root a VISIBLE verdict was made against", async () => {
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/live/ComfyUI/models";
     h.liveListings["loras"] = ["new.safetensors"];
     const res = await verifyLandedModel(target, "loras", {
@@ -643,7 +743,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
   it("stamps the root the MEMBERSHIP check ran against, not a later observation (codex gate r12)", async () => {
     // The membership re-check sees A; a THIRD observation would see B. The stamp
     // must name A, or a later reader would think the verdict is current for B.
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/live/ComfyUI/models";
     h.liveListings["loras"] = ["new.safetensors"];
     let calls = 0;
@@ -678,7 +778,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
       if (resolve(s) === resolve("/comfy/models")) return resolve("/D/Models");
       return resolve(s);
     });
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/comfy/models";
     h.liveExtraRoots = { authoritative: true, roots: [] };
     h.liveListings["loras"] = ["new.safetensors"];
@@ -698,7 +798,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     realpathMock.mockImplementation(async (p: string) =>
       String(p) === target ? external : resolve(String(p)),
     );
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/serverB/models";
     h.liveExtraRoots = {
       authoritative: true,
@@ -720,7 +820,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     realpathMock.mockImplementation(async (p: string) =>
       String(p) === target ? external : resolve(String(p)),
     );
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/serverB/models";
     h.liveExtraRoots = {
       authoritative: true,
@@ -758,7 +858,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
       }
       return resolve(s);
     });
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/comfy/models";
     h.liveExtraRoots = { authoritative: true, roots: [] };
     h.liveListings["vae"] = ["new.safetensors"];
@@ -785,7 +885,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
       }
       return resolve(s);
     });
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/comfy/models";
     h.liveExtraRoots = { authoritative: true, roots: [] };
     h.liveListings["vae"] = ["vendor/new.safetensors"];
@@ -804,7 +904,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     // from it is the contract speaking, not the server. The verdict must be an
     // honest unconfirmed, not "the server does NOT list it".
     const dTarget = resolve("/live/ComfyUI/models/diffusers/model.safetensors");
-    h.modelsDirSource = "observed-root";
+    h.modelsDirSource = "live-root";
     h.destModelsDir = "/live/ComfyUI/models";
     h.liveListings["diffusers"] = []; // what the real endpoint answers, by contract
     const res = await verifyLandedModel(dTarget, "diffusers", { attempts: 1, retryMs: 0 });

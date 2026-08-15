@@ -1,0 +1,219 @@
+---
+title: "トラブルシューティング"
+description: "実際に寄せられた不具合報告への対処法: ComfyUI-Manager のバージョン不一致（405）、git URL からのインストールが黙ってスキップされる、リモートのブラウザーからパネルに到達できない、npx キャッシュが古い、ポートフォワードしたリモートがローカルと誤検出される、といったケースを扱います。"
+icon: "wrench"
+---
+
+このページの項目はすべて、実際のバグ報告から生まれたものです。お困りの問題がここにない場合は
+[Issue を登録してください](https://github.com/artokun/comfyui-mcp/issues) — おそらくこの
+ページに追加されることになります。
+
+## `install_custom_node` が `/v2/manager/queue/task` で `405 Method Not Allowed` になる
+
+**原因:** ComfyUI-Manager には 2 つの世代が存在します。`/v2/manager/*` API は
+**v4 系**（pip パッケージ `comfyui_manager` ≥ 4.x）のもので、ComfyUI-Manager が既定で
+インストールする**リリース版の Manager 3.x** は、同じキューを別のルートで提供しています。
+
+**対処:** `comfyui-mcp` を **0.24.3** 以上に更新してください — 接続先ごとに Manager の
+世代を自動判別し、どちらの方言も話せます。Manager 側の変更は不要です。
+
+**任意ですが推奨 — Manager v4 へのアップグレード**。3.x がリモートでは実行できない機能
+（特に、3.x がホワイトリストで制限している**任意 URL からのモデルダウンロード**）が使える
+ようになります:
+
+```bash
+# in your ComfyUI python environment
+pip install -U comfyui_manager
+# then remove/disable the old custom_nodes/ComfyUI-Manager clone and restart
+```
+
+[RunPod イメージ](/docs/cloud-deployment)には Manager v4 が同梱済みです。
+
+**`useCmCli: true` についての補足:** cm-cli フォールバックは Manager の CLI をサブ
+プロセスとして実行するため、**ローカルのファイルシステム**が必要です — リモートや
+`--tunnel` の接続先には使えません。また、`python` が PATH にない場合は
+`COMFYUI_PYTHON` に ComfyUI の venv のインタープリターを指定する必要があります。
+リモートの接続先には、Manager の HTTP 経路（既定）が適切な仕組みです。
+
+## git URL からインストールしたカスタムノードがいつまでも表示されない
+
+レジストリ ID でのインストールは動作しますが、GitHub の生の URL によるインストールは
+成功と報告されるのに、パックがいつまでも現れません。
+
+**原因:** Manager は任意の git URL からのインストールを高リスクとみなし、緩いセキュリティ
+レベルに達していない場合は**黙ってスキップします**（それでもキューのタスクは「done」と
+記録されます）。Manager 3.x にはさらに、専用の `allow_git_url_install` 設定フラグが
+あります。
+
+**対処:** Manager の `config.ini`（ComfyUI のユーザーディレクトリ配下）で次のように
+設定します:
+
+```ini
+[default]
+security_level = weak          ; Manager v4: allows git-URL installs
+allow_git_url_install = True   ; Manager 3.x: additionally required
+```
+
+そのあと ComfyUI を再起動してください。RunPod イメージでは、イメージ `1.6` 以降これが
+既定です（環境変数 `COMFY_SECURITY_LEVEL` が優先され、レベルは起動のたびに設定し直され
+ます）。イメージ `1.4`/`1.5` もそう*意図*されていましたが、焼き込まれた
+`COMFY_SECURITY_LEVEL=normal-` の環境変数が起動スクリプトの既定値を上書きしていました —
+これらのイメージではポッドの環境変数に `COMFY_SECURITY_LEVEL=weak` を設定してください。
+緩和するのは自分が管理しているマシンだけにしてください — Manager のインストール時の
+ガードレールを外すことになります。
+
+## RunPod: エージェントパネルのタブが空 — ファイルは存在するのにすべて 0 バイト
+
+ComfyUI には `comfyui-mcp-panel` が表示されるのに、サイドバーのタブがいつまでも
+読み込まれません。`ls -la /workspace/custom_nodes/comfyui-mcp-panel` を実行すると、
+すべてのファイルが **0 バイト**になっています。ユーザーがインストールしたノードも同じ
+ように空になっていることがあります。
+
+**原因:** ネットワークボリュームがどこかの時点で**容量不足**になったのです（小さな
+ボリュームでの初回起動時、約 7 GB のスポットチェックモデルのコピーや、大きなモデルの
+ダウンロードでよく起こります）。ENOSPC の状態でも `cp`/`git` は各ファイルを*作成*だけは
+しますが、中身をまったく書き込みません — そしてボリュームは永続するため、この抜け殻は
+再デプロイのたびに残り続けます。
+
+**対処:** ボリュームの空きを作るか容量を増やしてから、ポッドを再起動してください。
+イメージ `1.6` 以降、起動スクリプトはボリュームの残量が少ない／満杯のときに警告を出し、
+収まらない場合はスポットチェックモデルのコピーをスキップし、0 バイトのパネルを自動的に
+**自己修復**します（GitHub から再クローンし、オフラインならイメージのシードを使います）。
+さらに、他に壊れているノードがあれば `WARN: custom nodes with 0-byte __init__.py` と
+その名前をログに出します — それらは Manager から再インストールしてください。イメージ
+`<= 1.5` では、パネルのフォルダーを削除して再起動してください:
+`rm -rf /workspace/custom_nodes/comfyui-mcp-panel`。
+
+## パネルに「ブリッジ（ws://127.0.0.1:9180）で待ち受けているエージェントがありません」と表示される
+
+オーケストレーターが動いているマシンとは**別のマシンのブラウザー**で ComfyUI を開いて
+います。ブリッジは設計上ループバック専用で、ブラウザーでの `127.0.0.1` はサーバーでは
+なくブラウザー側のマシンを指します。
+
+**対処 — ブラウザーがあるマシンでオーケストレーターを実行してください**（これがサポート
+されている構成です。エージェントは*あなたの*マシンで動き、リモートの ComfyUI を操作
+します）:
+
+```bash
+npx -y comfyui-mcp@latest connect http://<comfyui-host>:8188
+```
+
+そのあとパネルで「接続」をクリックします。ComfyUI 側のマシンでは、ComfyUI とパネルの
+カスタムノード以外に動かすものはありません。**https** の ComfyUI（RunPod のプロキシ）の
+場合、オーケストレーターはブリッジを安全な `wss://` トンネルへ自動的に切り替えます —
+コマンドは同じです。
+
+**あるいはオーケストレーターをサーバー側で実行する（0.24.5 以上）** — エージェントを
+ComfyUI の隣に常駐させ、LAN 上のどこからでもブラウザーで接続したい 24/7 のヘッドレス
+マシン（例: 単独の Ollama/OpenClaw サーバー）向けの構成です:
+
+```bash
+# on the SERVER — bind the bridge on the LAN, token-gated (mandatory)
+COMFYUI_MCP_BRIDGE_HOST=0.0.0.0 \
+COMFYUI_MCP_BRIDGE_TOKEN=<pick-a-long-secret> \
+npx -y comfyui-mcp@latest --panel-orchestrator
+```
+
+そのまま貼り付けられる `ws://<server-ip>:9180/?token=…` が出力されます — これを任意の
+マシンでパネルの**設定 → 詳細設定 → ブリッジ URL** に入力し、「接続」をクリックして
+ください。ループバック以外へのバインドは、トークンがないと**起動を拒否します**。また、
+すべての接続は WebSocket のアップグレード時に検査されます（定数時間比較）。この URL は
+パスワードと同じように扱ってください: 手にした人は誰でもエージェントを操作できます。
+
+## 新しいリリースが出たのに、まだ以前の動作のまま
+
+`npx` はパッケージを積極的にキャッシュします — `npx -y comfyui-mcp@latest` が
+`~/.npm/_npx` にある数週間前のビルドをそのまま使ってしまうことがあります。
+
+```bash
+# clear it, then relaunch
+npx clear-npx-cache
+# or on Windows:
+#   Remove-Item -Recurse -Force "$env:LOCALAPPDATA\npm-cache\_npx"
+```
+
+パネルのカスタムノードも確認してください。以前のインストールで**ネットワークボリューム**
+（RunPod の `/workspace`）に置かれたものが残っていると、そのコピーがイメージ側の自動更新
+されるものを覆い隠します。`git -C <panel-dir> fetch && git -C <panel-dir> reset --hard origin/main`
+を実行するか、ComfyUI-Manager から `comfyui-agent-panel` を再インストールし、そのあと
+ComfyUI を再起動してブラウザーのタブをハードリロード（Ctrl+Shift+R）してください。
+
+## ポートフォワードしたリモートの ComfyUI がローカルと誤検出される（dstack、SSH トンネル）
+
+`localhost:8188` で到達できるリモートの ComfyUI（dstack、`ssh -L`、kubectl
+port-forward）は、ループバックのヒューリスティックを誤作動させます。comfyui-mcp が
+ローカルインストールだと判断し、ComfyUI が存在しないファイルシステムに対してローカル
+専用のツールを有効にしてしまいます。
+
+**対処（0.24.1 以上）:** `--force-remote`（または `COMFYUI_MCP_FORCE_REMOTE=1`）を
+指定してください:
+
+```bash
+npx -y comfyui-mcp@latest connect http://localhost:8188 --force-remote
+```
+
+リモートの接続先の生成履歴は `~/.comfyui-mcp/instances/<host_port>/` の下に保存されます
+（`COMFYUI_MCP_DATA_DIR` で変更できます）。
+
+## Docker: HTTP モードでコンテナがすぐに終了する
+
+認証なしでループバック以外のホストにバインドすると、**設計上その場で失敗します**
+（`0.0.0.0` 上の `/mcp` エンドポイントが無防備に公開されてしまうため）。トークンを渡すか、
+明示的にオプトアウトしてください:
+
+```bash
+docker run --rm -p 9100:9100 -e COMFYUI_MCP_HTTP_TOKEN=changeme comfyui-mcp \
+  --http --host 0.0.0.0 --port 9100
+# or (trusted networks only):
+#   ... --http --host 0.0.0.0 --port 9100 --allow-unauthenticated-non-loopback
+```
+
+stdio モード（既定であり、MCP クライアントが使う方式）には、これらは一切不要です。
+
+## エージェントがツールをまったく呼び出さない — エラーも出ず、ただ話すだけ
+
+ワークフローを読み取る代わりに説明したり、スクリプトを書きましょうかと提案したりします。
+何も失敗していないのでエラーは出ません。原因は、ツールがそもそもクライアントに届いて
+いないか、クライアントが呼び出しを止めているか、その機能が一度も話題に出ていない名前で
+存在しているか、のいずれかです。この 3 つは外から見ると同じに見えるうえ、対処は正反対
+なので、推測するより確認したほうが確実です。
+
+エージェントに 2 つ質問すれば見分けられます —
+[何も言わないとき](/docs/using-tools#when-it-says-nothing)を参照してください。なお、
+クライアント側の権限によるブロックはこのサーバーまで届かないため、以下のどのログにも
+現れません。
+
+## ローカルモデル: ツール呼び出しが失敗する、またはモデルがツールを「認識できない」
+
+- **まず試すこと: [当プロジェクトのファインチューニング済みモデル](/docs/local-llms#our-fine-tuned-local-models-free-recommended)を使う** —
+  `ollama pull artokun/gemma4-comfyui-mcp:e4b`（パネルの Ollama の既定値）。
+  comfyui-mcp のツール群そのもので学習させた Gemma 4 で、「ツールの選択ミス／引数の形式
+  不正」による失敗のほとんどを、そのままの状態で解消します（VRAM 約 2 GB なら `:e2b`、
+  約 8 GB なら `:12b` — どの段もアリーナで素のベースモデルを上回っており、`:e4b` が
+  最適点のままです）。
+- **gemma3 は Ollama でネイティブのツール呼び出しに対応していません** — 非対応です。
+  上のファインチューニング済みモデルか、素の `gemma4`（e4b 以上）、`qwen3`、
+  `llama3.1+` を使ってください。
+- 小さいモデルでは[コンパクトツールモード](/docs/local-llms)を有効にしてください —
+  これは既定では**オフ**なので、サーバーを `--compact`（または
+  `COMFYUI_MCP_TOOL_MODE=compact`）付きで起動します。有効にしないと、スキーマ全体が
+  小さいコンテキストからあふれ、モデルがツール名を作り出し始めます。
+- コールド状態からのモデル読み込みは、最初のトークンが出るまで 30 秒以上かかることが
+  あります — パネルのウォッチドッグはこれを見込んでいますが、リクエストが即座に落ちる
+  場合はたいてい、そのモデルタグをまだ取得していないだけです（`ollama pull <tag>`）。
+- **急にすべてのリクエストが失敗する／11434 で接続が拒否される** — Ollama の
+  アプリ／デーモンが動いていません。トレイのアプリを終了すると API も一緒に止まりますが、
+  これはエージェントの実行中にうっかりやってしまいがちです（ローカルのバックエンドが
+  使われていることをパネルは警告しません）。アプリを起動し直して（または
+  `ollama serve`）、接続し直してください — セッションは再開され、パネルの再起動は
+  不要です。
+
+## ログの確認場所
+
+- **オーケストレーター**: `connect` / `--panel-orchestrator` を実行しているターミナル。
+- **ComfyUI 側**: `get_system_stats (action:"logs")` の MCP ツール、または RunPod では
+  ポッドのログストリーム。
+- **パネルの JS**: ブラウザーの devtools コンソール（ブリッジクライアントが接続／再接続の
+  遷移をログに出します）。
+- **1 回の呼び出しで健全性を確認**: `get_system_stats (action:"health")` ツールが、
+  バージョン/GPU/VRAM/キュー/モデルディレクトリ/最近のエラーをまとめて返します。

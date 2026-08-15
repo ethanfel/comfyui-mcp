@@ -39,6 +39,8 @@ import {
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { waitFor } from "../helpers/wait-for.js";
+import { logger } from "../../utils/logger.js";
 
 /**
  * A real on-disk panel pack under a resolved base. The skew resolver re-reads
@@ -222,7 +224,7 @@ describe("UiBridge (token gate — secure/wss mode)", () => {
       s.on("error", reject);
     });
     ok.send(JSON.stringify({ type: "hello", tab_id: "tab-secure-1", title: "wf" }));
-    await vi.waitFor(() => expect(tbridge.connected()).toBe(true));
+    await waitFor(() => expect(tbridge.connected()).toBe(true));
     ok.close();
     await tbridge.stop();
   });
@@ -279,7 +281,7 @@ describe("UiBridge (LAN bind — panel #54)", () => {
       s.on("error", reject);
     });
     ok.send(JSON.stringify({ type: "hello", tab_id: "tab-lan-1", title: "wf" }));
-    await vi.waitFor(() => expect(lan.connected()).toBe(true));
+    await waitFor(() => expect(lan.connected()).toBe(true));
     ok.close();
     await lan.stop();
   });
@@ -316,11 +318,11 @@ describe("UiBridge (on-demand pairing listener — addListener)", () => {
       s.on("error", reject);
     });
     phone.send(JSON.stringify({ type: "hello", tab_id: "phone-1", title: "mobile" }));
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-1")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-1")).toBe(true));
 
     // The primary loopback listener is STILL token-less (local panel unaffected).
     const local = await connectPanel("local-1");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "local-1")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "local-1")).toBe(true));
 
     phone.close();
     local.close();
@@ -512,7 +514,7 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
     phone.on("message", (buf) => got.push(JSON.parse(buf.toString())));
     phone.send(JSON.stringify({ type: "hello", tab_id: "phone-stable-1", title: "mobile" }));
 
-    await vi.waitFor(() => {
+    await waitFor(() => {
       const media = got.find((m) => m.cmd === "show_media");
       const flush = got.find((m) => m.type === "mailbox_flush");
       expect(media).toMatchObject({ mailbox: true });
@@ -536,7 +538,7 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
     const tab = await connectPanel();
     tab.on("message", (buf) => got.push(JSON.parse(buf.toString())));
     tab.send(JSON.stringify({ type: "hello", tab_id: "wf:foo.json", title: "workflow-b" }));
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:foo.json")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:foo.json")).toBe(true));
     expect(got.find((m) => m.cmd === "show_media")).toBeUndefined();
     expect(got.find((m) => m.type === "mailbox_flush")).toBeUndefined();
     tab.close();
@@ -551,7 +553,7 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
     const phone = await connectPanel();
     phone.on("message", (buf) => got.push(JSON.parse(buf.toString())));
     phone.send(JSON.stringify({ type: "hello", tab_id: "nobody", title: "x" }));
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "nobody")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "nobody")).toBe(true));
     expect(got.find((m) => m.type === "mailbox_flush")).toBeUndefined();
     phone.close();
   });
@@ -563,9 +565,9 @@ describe("UiBridge — revokeTabMigration fences a switched-away workflow's rout
     // same-socket switch) — the bridge installs the A→B migration alias.
     const sock = await connectPanel("wf:A", "workflow-a");
     autoReply(sock, "the-live-canvas");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:A")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:A")).toBe(true));
     sock.send(JSON.stringify({ type: "hello", tab_id: "wf:B", title: "workflow-b" }));
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:B")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:B")).toBe(true));
 
     // BEFORE the fence: a stale call addressed to the OLD id resolves THROUGH the alias
     // to the live socket (now showing B) — the exact wrong-canvas mutation path.
@@ -607,7 +609,7 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
 
   it("lists the actually-connected tabs (not 'none') when OTHER tabs are live — still dispatched:false", async () => {
     const a = await connectPanel("tab-live-1111", "flux-workflow");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     let caught: unknown;
     await bridge.send({ cmd: "graph_set_widget" }, { tabId: "gone-tab" }).catch((e) => (caught = e));
     // Faithful message: the routing error names the live tab, proving the multi-tab
@@ -623,7 +625,7 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
     // this as "nothing applied": the flag is absent, not false.
     const a = await connectPanel("tab-exec-1111");
     replyError(a, 'graph_set_widget failed: stale ref to "no connected tab" in cache');
-    await vi.waitFor(() => expect(bridge.connected()).toBe(true));
+    await waitFor(() => expect(bridge.connected()).toBe(true));
     let caught: unknown;
     await bridge.send({ cmd: "graph_set_widget" }, { tabId: "tab-exec-1111" }).catch((e) => (caught = e));
     expect(caught).toBeInstanceOf(Error);
@@ -645,7 +647,7 @@ describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
   it("a successfully-acked command resolves (no dispatch flag involved)", async () => {
     const a = await connectPanel("tab-ok-1111");
     autoReply(a, "A");
-    await vi.waitFor(() => expect(bridge.connected()).toBe(true));
+    await waitFor(() => expect(bridge.connected()).toBe(true));
     const result = await bridge.send({ cmd: "graph_set_widget" }, { tabId: "tab-ok-1111" });
     expect(result).toMatchObject({ from: "A" });
     a.close();
@@ -656,7 +658,7 @@ describe("UiBridge (multi-tab)", () => {
   it("routes to the single connected tab without tab_id", async () => {
     const a = await connectPanel("tab-aaaa-1111");
     autoReply(a, "A");
-    await vi.waitFor(() => expect(bridge.connected()).toBe(true));
+    await waitFor(() => expect(bridge.connected()).toBe(true));
     const result = await bridge.send({ cmd: "graph_get_state" });
     expect(result).toEqual({ from: "A", cmd: "graph_get_state" });
     a.close();
@@ -665,7 +667,7 @@ describe("UiBridge (multi-tab)", () => {
   it("registers multiple tabs and lists them in status()", async () => {
     const a = await connectPanel("tab-aaaa-1111", "flux-workflow");
     const b = await connectPanel("tab-bbbb-2222", "video-workflow");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
     const status = bridge.status();
     expect(status).toContain("2 panel tab(s) connected");
     expect(status).toContain("flux-workflow");
@@ -679,7 +681,7 @@ describe("UiBridge (multi-tab)", () => {
     const b = await connectPanel("tab-bbbb-2222");
     autoReply(a, "A");
     autoReply(b, "B");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
     const full = await bridge.send({ cmd: "x" }, { tabId: "tab-bbbb-2222" });
     expect(full).toMatchObject({ from: "B" });
@@ -692,7 +694,7 @@ describe("UiBridge (multi-tab)", () => {
   it("errors with the tab list when multiple tabs and no target", async () => {
     const a = await connectPanel("tab-aaaa-1111", "one");
     const b = await connectPanel("tab-bbbb-2222", "two");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
     await expect(bridge.send({ cmd: "x" })).rejects.toThrow(/pass tab_id/);
     a.close();
     b.close();
@@ -703,11 +705,11 @@ describe("UiBridge (multi-tab)", () => {
     const b = await connectPanel("tab-bbbb-2222");
     autoReply(a, "A");
     autoReply(b, "B");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
     // User types in tab B → it becomes the default target.
     b.send(JSON.stringify({ type: "user_message", text: "hi from B" }));
-    await vi.waitFor(async () => {
+    await waitFor(async () => {
       const result = await bridge.send({ cmd: "x" });
       expect(result).toMatchObject({ from: "B" });
     });
@@ -721,9 +723,9 @@ describe("UiBridge (multi-tab)", () => {
       if (e.type === "user_message") received.push(e);
     };
     const a = await connectPanel("tab-aaaa-1111", "my-flux-graph");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     a.send(JSON.stringify({ type: "user_message", text: "make it dreamier" }));
-    await vi.waitFor(() => expect(received).toHaveLength(1));
+    await waitFor(() => expect(received).toHaveLength(1));
     expect(received[0]).toMatchObject({
       text: "make it dreamier",
       tab_id: "tab-aaaa-1111",
@@ -742,7 +744,7 @@ describe("UiBridge (multi-tab)", () => {
         comfyui_url: "http://127.0.0.1:8188",
       }),
     );
-    await vi.waitFor(() => expect(bridge.tabOrigin("tab-origin-1")).toBe("http://127.0.0.1:8188"));
+    await waitFor(() => expect(bridge.tabOrigin("tab-origin-1")).toBe("http://127.0.0.1:8188"));
     // Token-less loopback primary listener → server-trusted local provenance.
     expect(bridge.tabIsLocal("tab-origin-1")).toBe(true);
     // A later re-hello that OMITS comfyui_url must not wipe the stored origin.
@@ -767,11 +769,11 @@ describe("UiBridge (multi-tab)", () => {
       const m = JSON.parse(buf.toString());
       if (m.type === "say") got.B.push(m);
     });
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
     expect(bridge.push({ type: "say", text: "to all" })).toBe(2);
     expect(bridge.push({ type: "say", text: "only B" }, "tab-bbbb")).toBe(1);
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(got.A).toHaveLength(1);
       expect(got.B).toHaveLength(2);
     });
@@ -783,11 +785,11 @@ describe("UiBridge (multi-tab)", () => {
     const a1 = await connectPanel("tab-aaaa-1111");
     const b = await connectPanel("tab-bbbb-2222");
     autoReply(b, "B");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
     const a2 = await connectPanel("tab-aaaa-1111"); // reload of tab A
     autoReply(a2, "A2");
-    await vi.waitFor(() => expect(a1.readyState).toBe(WebSocket.CLOSED));
+    await waitFor(() => expect(a1.readyState).toBe(WebSocket.CLOSED));
     expect(bridge.tabs()).toHaveLength(2);
 
     const viaA = await bridge.send({ cmd: "x" }, { tabId: "tab-aaaa" });
@@ -800,7 +802,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("times out when the target tab never replies", async () => {
     const a = await connectPanel("tab-aaaa-1111");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     await expect(bridge.send({ cmd: "x" }, { timeoutMs: 100 })).rejects.toThrow(/did not reply/);
     a.close();
   });
@@ -815,7 +817,7 @@ describe("UiBridge (multi-tab)", () => {
         a.send(JSON.stringify({ rid: frame.rid, ok: true, result: { ok: true } }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     const observed: string[] = [];
     await expect(
       bridge.send({ cmd: "x" }, { onDispatchedRid: (rid) => observed.push(rid) }),
@@ -826,7 +828,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("rejects in-flight commands when the target tab disconnects", async () => {
     const a = await connectPanel("tab-aaaa-1111");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     const promise = bridge.send({ cmd: "x" }, { timeoutMs: 5000 });
     a.close();
     await expect(promise).rejects.toThrow(/disconnected mid-command/);
@@ -834,7 +836,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("a MUTATING command dropped mid-command reports OUTCOME UNKNOWN, not a clean failure (#450)", async () => {
     const a = await connectPanel("tab-aaaa-1111");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     // graph_run queues a real render — it was already written to the socket before
     // the drop, so the panel may have applied it. A blind retry = double render.
     const promise = bridge.send({ cmd: "graph_run" }, { timeoutMs: 5000 });
@@ -845,7 +847,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("an IDEMPOTENT read dropped mid-command RESUMES when the tab reconnects (#450)", async () => {
     const a1 = await connectPanel("tab-aaaa-1111");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     // No autoReply on a1 → the read stays in-flight (un-acked) when we drop it.
     const promise = bridge.send({ cmd: "graph_get_errors" }, { timeoutMs: 5000 });
     // Ensure the command reached the server (is pending) before dropping the socket.
@@ -860,7 +862,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("dropQueuedDeliveries CANCELS a parked read so it is NOT re-dispatched onto a replacement (#570 P0)", async () => {
     const a1 = await connectPanel("wf:foo.json");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     // Workflow A has an idempotent read in flight (no autoReply → un-acked).
     const promise = bridge.send({ cmd: "graph_get_errors" }, { tabId: "wf:foo.json", timeoutMs: 5000 });
     await new Promise((r) => setTimeout(r, 50));
@@ -884,7 +886,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("dropQueuedDeliveries REJECTS an in-flight command so its late reply can't resolve the prior call (#570 P0)", async () => {
     const a = await connectPanel("wf:foo.json");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     // A command is in flight on the live socket (no autoReply → pending, un-acked).
     const promise = bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:foo.json", timeoutMs: 5000 });
     await new Promise((r) => setTimeout(r, 50));
@@ -897,7 +899,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("resumes a read addressed by tab-id PREFIX after reconnect (canonical key) (#450)", async () => {
     const a1 = await connectPanel("tab-aaaa-1111");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     // Address by prefix — parking must key on the canonical resolved id, not "tab-aaaa".
     const promise = bridge.send({ cmd: "graph_get_errors" }, { tabId: "tab-aaaa", timeoutMs: 5000 });
     await new Promise((r) => setTimeout(r, 50));
@@ -910,7 +912,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("does NOT extend the caller's deadline when a read resumes (#450)", async () => {
     const a1 = await connectPanel("tab-aaaa-1111");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     // Short deadline. Drop, reconnect with a tab that NEVER replies → must reject
     // near the original 300ms deadline, not restart a fresh full timeout.
     const started = Date.now();
@@ -925,7 +927,11 @@ describe("UiBridge (multi-tab)", () => {
 
   it("an idempotent read whose tab never returns fails as genuinely gone (#450)", async () => {
     const a = await connectPanel("tab-aaaa-1111");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // BOUNDED UNDER THIS TEST'S OWN BUDGET (#1325). The helper's 15s default is larger
+    // than the 10s below, so a stuck connect would be killed by the runner and reported as
+    // vitest's generic "test timed out" instead of naming the wait. This connect is local
+    // and takes milliseconds; 3s is slack, not a deadline under test.
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1), { timeout: 3000 });
     const promise = bridge.send({ cmd: "graph_get_errors" }, { timeoutMs: 5000 });
     await new Promise((r) => setTimeout(r, 50));
     a.close();
@@ -939,7 +945,7 @@ describe("UiBridge (multi-tab)", () => {
 
   it("rejects an unknown tab_id with the connected-tab list", async () => {
     const a = await connectPanel("tab-aaaa-1111", "one");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     await expect(bridge.send({ cmd: "x" }, { tabId: "nope" })).rejects.toThrow(/no connected tab/);
     a.close();
   });
@@ -1025,9 +1031,9 @@ describe("UiBridge (multi-tab)", () => {
 
     it("after a tab connected then dropped, tells the user to refresh the browser tab (not install)", async () => {
       const a = await connectPanel("wf:workflows/x.json", "x");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       a.close();
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(0));
       const msg = bridge.status();
       expect(msg).toMatch(/refresh/i);
       expect(msg).toMatch(/browser tab/i);
@@ -1037,9 +1043,9 @@ describe("UiBridge (multi-tab)", () => {
 
     it("a WRITE to the pre-restart id after the drop fails with the refresh guidance appended, keeping 'Connected: none'", async () => {
       const a = await connectPanel("wf:workflows/x.json", "x");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       a.close();
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(0));
       const err = await bridge
         .send({ cmd: "graph_add_node" }, { tabId: "wf:workflows/x.json" })
         .catch((e) => e as Error);
@@ -1064,9 +1070,9 @@ describe("UiBridge (multi-tab)", () => {
         });
         s.on("error", reject);
       });
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       phone.close();
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(0));
       const msg = bridge.status();
       expect(msg).toMatch(/pack installed/);
       expect(msg).not.toMatch(/refresh/i);
@@ -1074,7 +1080,7 @@ describe("UiBridge (multi-tab)", () => {
 
     it("a still-live OTHER tab keeps the exact tab listing (not the refresh guidance)", async () => {
       const a = await connectPanel("tab-aaaa-1111", "one");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       const err = await bridge
         .send({ cmd: "graph_add_node" }, { tabId: "wf:workflows/gone.json" })
         .catch((e) => e as Error);
@@ -1092,9 +1098,9 @@ describe("UiBridge (multi-tab)", () => {
   describe("read/write resolve against the same tab registry (#436.1)", () => {
     it("in the zero-tab window a read and a write to the same id BOTH refuse (dispatched:false)", async () => {
       const a = await connectPanel("wf:workflows/x.json", "x");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       a.close();
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(0));
       const readErr = await bridge
         .send({ cmd: "graph_outline" }, { tabId: "wf:workflows/x.json", timeoutMs: 500 })
         .catch((e) => e as Error);
@@ -1147,7 +1153,7 @@ describe("UiBridge (multi-tab)", () => {
           workflow_uuid: UUID,
         }),
       );
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       stamps.set("tmp:unsaved", UUID);
       const before = await bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" });
       expect(before).toMatchObject({ ok: true });
@@ -1166,7 +1172,7 @@ describe("UiBridge (multi-tab)", () => {
           workflow_uuid: UUID,
         }),
       );
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(bridge.tabs()).toHaveLength(1);
         expect(bridge.tabs()[0].tab_id).toBe("wf:saved.json");
       });
@@ -1250,11 +1256,11 @@ describe("UiBridge (multi-tab)", () => {
       const b = await connectPanel("wf:workflows/b.json", "b");
       autoReply(a, "tab-a");
       autoReply(b, "tab-b");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
       // The user speaks from B → the scope routes there.
       b.send(JSON.stringify({ type: "user_message", text: "hi from b" }));
-      await vi.waitFor(async () => {
+      await waitFor(async () => {
         const r = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
         expect(r).toMatchObject({ from: "tab-b" });
       });
@@ -1262,7 +1268,7 @@ describe("UiBridge (multi-tab)", () => {
       // …then from A → the SAME scope now routes to A (several workflows open,
       // one session; each call still reaches the right canvas).
       a.send(JSON.stringify({ type: "user_message", text: "hi from a" }));
-      await vi.waitFor(async () => {
+      await waitFor(async () => {
         const r = await bridge.send({ cmd: "graph_get_state" }, { tabId: SHARED_SESSION_SCOPE });
         expect(r).toMatchObject({ from: "tab-a" });
       });
@@ -1276,7 +1282,7 @@ describe("UiBridge (multi-tab)", () => {
       // stamp resolves per conversation); routing must treat it as the scope.
       const a = await connectPanel("wf:workflows/a.json", "a");
       autoReply(a, "tab-a");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       const r = await bridge.send({ cmd: "graph_outline" }, { tabId: `${SHARED_SESSION_SCOPE}::claude` });
       expect(r).toMatchObject({ from: "tab-a" });
       a.close();
@@ -1285,14 +1291,14 @@ describe("UiBridge (multi-tab)", () => {
     it("with no last-active tab, the scope prefers the most recent INTERACTIVE conn over a headless viewer", async () => {
       const a = await connectPanel("wf:workflows/a.json", "a");
       autoReply(a, "tab-a");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       // A headless (canvas-less) client connects LAST — it must not steal routing.
       const phone = await connectPanel();
       phone.send(
         JSON.stringify({ type: "hello", tab_id: "mobile-1", title: "phone", headless: true }),
       );
       autoReply(phone, "phone");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
       const r = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
       expect(r).toMatchObject({ from: "tab-a" });
@@ -1306,13 +1312,13 @@ describe("UiBridge (multi-tab)", () => {
       const b = await connectPanel("wf:workflows/b.json", "b");
       autoReply(a, "tab-a");
       autoReply(b, "tab-b");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
       // The orchestrator pins the running turn to its origin tab A…
       let pin: string | null | undefined = "wf:workflows/a.json";
       bridge.setScopeTargetResolver(() => pin);
       // …then tab B sends a message, which moves lastActiveTabId to B immediately.
       b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
-      await vi.waitFor(async () => {
+      await waitFor(async () => {
         // Un-pinned scope resolution now follows B…
         pin = undefined;
         const idle = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
@@ -1331,7 +1337,7 @@ describe("UiBridge (multi-tab)", () => {
       const b = await connectPanel("wf:workflows/b.json", "b");
       autoReply(a, "tab-a");
       autoReply(b, "tab-b");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
       // The REAL production wiring (confirming gate 3, P2: this test used to
       // install a hand-written handler, which could not catch a defect in the
@@ -1342,7 +1348,7 @@ describe("UiBridge (multi-tab)", () => {
       // refuses, and the refusal names panel_set_workflow_target as the way out.
       tracker.recordForMid("m-dead", undefined, "wf:workflows/gone.json");
       tracker.onSeen(SCOPE_KEY, "m-dead");
-      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/gone.json"));
+      await waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/gone.json"));
       await expect(
         bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE }),
       ).rejects.toThrow(/no connected tab/);
@@ -1365,16 +1371,16 @@ describe("UiBridge (multi-tab)", () => {
       const b = await connectPanel("wf:workflows/b.json", "b");
       autoReply(a, "tab-a");
       autoReply(b, "tab-b");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
       const { tracker } = wireRealScopeRouting();
 
       // A turn pinned to LIVE tab A…
       tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
       tracker.onSeen(SCOPE_KEY, "m-a");
-      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      await waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
       // …while tab B becomes last-active (a queued message moves it instantly).
       b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(bridge.resolveActiveScopeTab()).toBe("wf:workflows/b.json");
       });
 
@@ -1407,14 +1413,14 @@ describe("UiBridge (multi-tab)", () => {
       const b = await connectPanel("wf:workflows/b.json", "b");
       autoReply(a, "tab-a");
       autoReply(b, "tab-b");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
       const { tracker } = wireRealScopeRouting();
 
       tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
       tracker.onSeen(SCOPE_KEY, "m-a");
-      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      await waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
       b.send(JSON.stringify({ type: "user_message", text: "queued from b" }));
-      await vi.waitFor(() => expect(bridge.resolveActiveScopeTab()).toBe("wf:workflows/b.json"));
+      await waitFor(() => expect(bridge.resolveActiveScopeTab()).toBe("wf:workflows/b.json"));
 
       const ctx = makePanelToolCtx(bridge, SCOPE_KEY, new WorkflowTargetStore());
       const reload = buildPanelToolDefs().find((d) => d.name === "panel_reload")!;
@@ -1437,15 +1443,15 @@ describe("UiBridge (multi-tab)", () => {
       const b = await connectPanel("wf:workflows/b.json", "b");
       autoReply(a, "tab-a");
       autoReply(b, "tab-b");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
       const { tracker } = wireRealScopeRouting();
 
       // A turn pinned to A… whose tab then disconnects: the pin is DEAD.
       tracker.recordForMid("m-a", undefined, "wf:workflows/a.json");
       tracker.onSeen(SCOPE_KEY, "m-a");
-      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
+      await waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:workflows/a.json"));
       a.close();
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
 
       // panel_reload is NOT a consent path: it fails, names the recovery, and
       // the pin is NOT silently moved.
@@ -1500,7 +1506,7 @@ describe("UiBridge (multi-tab)", () => {
       const got: Array<Record<string, unknown>> = [];
       tab.on("message", (buf) => got.push(JSON.parse(buf.toString())));
       tab.send(JSON.stringify({ type: "hello", tab_id: "wf:workflows/a.json", title: "a" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(got.find((m) => m.cmd === "show_media")).toMatchObject({ mailbox: true });
       });
       tab.close();
@@ -1514,11 +1520,11 @@ describe("UiBridge (multi-tab)", () => {
       // invalidation (TurnOriginTracker.tabChangedBackend) consults.
       const sock = await connectPanel("tmp:hop-a", "a");
       autoReply(sock, "surface");
-      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("tmp:hop-a"));
+      await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("tmp:hop-a"));
       sock.send(JSON.stringify({ type: "hello", tab_id: "wf:hop-b", title: "b" }));
-      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-b"));
+      await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-b"));
       sock.send(JSON.stringify({ type: "hello", tab_id: "wf:hop-c", title: "c" }));
-      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-c"));
+      await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:hop-c"));
 
       expect(bridge.liveTabIdFor("tmp:hop-a")).toBe("wf:hop-c"); // two hops, compressed
       expect(bridge.liveTabIdFor("wf:hop-b")).toBe("wf:hop-c");
@@ -1535,19 +1541,19 @@ describe("UiBridge (multi-tab)", () => {
       // workflow uuid — so only a USE-time ownership check refuses it.
       const a = await connectPanel("wf:revive.json", "a");
       autoReply(a, "old-claude-tab");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       const { tracker, tabBackends } = wireRealScopeRouting();
 
       tracker.recordForMid("m-a", undefined, "wf:revive.json");
       tracker.onSeen(SCOPE_KEY, "m-a");
-      await vi.waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:revive.json"));
+      await waitFor(() => expect(tracker.pinOf(SCOPE_KEY)).toBe("wf:revive.json"));
 
       a.close();
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(0));
       // The revival: a different browser tab, same deterministic id, Codex.
       const revived = await connectPanel("wf:revive.json", "a-again");
       autoReply(revived, "new-codex-tab");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       tabBackends.set("wf:revive.json", "codex");
 
       // The scope command must be REFUSED — never delivered to the revived
@@ -1564,14 +1570,14 @@ describe("UiBridge (multi-tab)", () => {
       const b = await connectPanel("wf:workflows/b.json", "b");
       autoReply(a, "tab-a");
       autoReply(b, "tab-b");
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
       let pin: string | null | undefined = "wf:workflows/a.json";
       bridge.setScopeTargetResolver(() => pin);
 
       // The turn's own tab switches workflow (same socket re-hellos) — the pin
       // follows through the migration alias: same browser surface, same turn.
       a.send(JSON.stringify({ type: "hello", tab_id: "wf:workflows/c.json", title: "c" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(bridge.tabs().map((t) => t.tab_id)).toContain("wf:workflows/c.json");
       });
       const followed = await bridge.send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE });
@@ -1580,7 +1586,7 @@ describe("UiBridge (multi-tab)", () => {
       // The pinned tab disconnects entirely: the scope REFUSES with the standard
       // no-connected-tab error — it must NOT silently fall back to tab B.
       a.close();
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       pin = "wf:workflows/c.json";
       const gone = await bridge
         .send({ cmd: "graph_outline" }, { tabId: SHARED_SESSION_SCOPE, timeoutMs: 300 })
@@ -1611,7 +1617,7 @@ describe("UiBridge (multi-tab)", () => {
       codexSock.send(
         JSON.stringify({ type: "hello", tab_id: "wf:codex.json", title: "cx", backend: "codex" }),
       );
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
       // A CLAUDE tab hellos next: the buffer drains to it.
       const claudeSock = await connectPanel();
       const claudeGot: Array<Record<string, unknown>> = [];
@@ -1619,7 +1625,7 @@ describe("UiBridge (multi-tab)", () => {
       claudeSock.send(
         JSON.stringify({ type: "hello", tab_id: "wf:claude.json", title: "cl", backend: "claude" }),
       );
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(claudeGot.some((f) => f.type === "say" && f.text === "claude while away")).toBe(true);
       });
       expect(codexGot.some((f) => f.type === "say" && f.text === "claude while away")).toBe(false);
@@ -1643,7 +1649,7 @@ describe("UiBridge (multi-tab)", () => {
       const got: Array<Record<string, unknown>> = [];
       sock.on("message", (buf) => got.push(JSON.parse(buf.toString())));
       sock.send(JSON.stringify({ type: "hello", tab_id: "wf:back.json", title: "back" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(got.some((f) => f.type === "say" && f.text === "finished while you were away")).toBe(
           true,
         );
@@ -1659,12 +1665,12 @@ describe("UiBridge (multi-tab)", () => {
     // the OLD id must still resolve to the new connection.
     const sock = await connectPanel(); // open socket, no hello yet
     autoReply(sock, "old-tab");
-    await vi.waitFor(() => expect(bridge.connected()).toBe(false));
+    await waitFor(() => expect(bridge.connected()).toBe(false));
 
     // 1) First hello: old-style random-UUID tab id.
     const oldId = "6eccc826-592e-4abb-b280-35434e00ddd1";
     sock.send(JSON.stringify({ type: "hello", tab_id: oldId, title: "image_flux2_fp8" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
 
     // Verify the old id works.
     const oldResult = await bridge.send({ cmd: "graph_outline" }, { tabId: oldId });
@@ -1673,7 +1679,7 @@ describe("UiBridge (multi-tab)", () => {
     // 2) Same socket re-hellos under a new deterministic tab id (the migration).
     const newId = "wf:workf";
     sock.send(JSON.stringify({ type: "hello", tab_id: newId, title: "image_flux2_fp8" }));
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(bridge.tabs()).toHaveLength(1);
       expect(bridge.tabs()[0].tab_id).toBe(newId);
     });
@@ -1704,12 +1710,12 @@ describe("UiBridge (multi-tab)", () => {
     const oldB = "legacy-b-2222";
     sockA.send(JSON.stringify({ type: "hello", tab_id: oldA, title: "flux-workflow" }));
     sockB.send(JSON.stringify({ type: "hello", tab_id: oldB, title: "video-workflow" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
     // Migrate tab A's socket to a new id, leave tab B unchanged.
     const newA = "wf:flux123";
     sockA.send(JSON.stringify({ type: "hello", tab_id: newA, title: "flux-workflow" }));
-    await vi.waitFor(() => {
+    await waitFor(() => {
       expect(bridge.tabs()).toHaveLength(2);
       expect(bridge.tabs().find((t) => t.tab_id === newA)).toBeTruthy();
       expect(bridge.tabs().find((t) => t.tab_id === oldA)).toBeFalsy();
@@ -1738,7 +1744,7 @@ describe("UiBridge (multi-tab)", () => {
     autoReply(sock, "attacker");
     // Fresh socket, FIRST hello — no migration happened, but the client claims one.
     sock.send(JSON.stringify({ type: "hello", tab_id: "attacker-tab", migrated_from: "victim-tab" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     const hello = seen.find((e) => e.type === "hello" && e.tab_id === "attacker-tab");
     expect(hello).toBeTruthy();
     expect(hello!.migrated_from).toBeUndefined();
@@ -1751,17 +1757,17 @@ describe("UiBridge (multi-tab)", () => {
     const sockA = await connectPanel();
     autoReply(sockA, "A");
     sockA.send(JSON.stringify({ type: "hello", tab_id: "legacy-old-id" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:reused" }));
-    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("wf:reused"));
+    await waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("wf:reused"));
     sockA.close();
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(0));
 
     // sockB: an UNRELATED tab that happens to get the same deterministic wf: id.
     const sockB = await connectPanel();
     autoReply(sockB, "B");
     sockB.send(JSON.stringify({ type: "hello", tab_id: "wf:reused" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
 
     // The old legacy id must NOT resolve to sockB's tab via the stale alias.
     await expect(bridge.send({ cmd: "x" }, { tabId: "legacy-old-id" })).rejects.toThrow(/no connected tab/);
@@ -1774,14 +1780,14 @@ describe("UiBridge (multi-tab)", () => {
     const sockOld = await connectPanel();
     autoReply(sockOld, "old");
     sockOld.send(JSON.stringify({ type: "hello", tab_id: "old-tab" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     sockOld.close();
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(0));
 
     const sockNew = await connectPanel();
     autoReply(sockNew, "new");
     sockNew.send(JSON.stringify({ type: "hello", tab_id: "new-tab" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
 
     // The old id is orphaned (no migration) — canReach is false, and the no-tabId
     // resolution the orchestrator invokes at the explicit rebind lands on the sole
@@ -1801,7 +1807,7 @@ describe("UiBridge (multi-tab)", () => {
     const sockB = await connectPanel();
     autoReply(sockB, "B");
     sockB.send(JSON.stringify({ type: "hello", tab_id: "tab-b" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
 
     expect(() => bridge.resolveActiveTabId()).toThrow(/Multiple panel tabs/);
     sockA.close();
@@ -1823,10 +1829,10 @@ describe("UiBridge (multi-tab)", () => {
       const sockB = await connectPanel();
       autoReply(sockB, "B");
       sockB.send(JSON.stringify({ type: "hello", tab_id: "wf:bbb" }));
-      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
       // The user typed in A — that is what makes A the last-active tab.
       sockA.send(JSON.stringify({ type: "user_message", text: "hi" }));
-      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:aaa"));
+      await waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:aaa"));
       return { sockA, sockB };
     }
 
@@ -1835,7 +1841,7 @@ describe("UiBridge (multi-tab)", () => {
 
       // Save-as: the SAME socket re-hellos under a new wf: id. The retiring id is removed.
       sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
-      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id).sort()).toEqual(["wf:bbb", "wf:ccc"]));
+      await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id).sort()).toEqual(["wf:bbb", "wf:ccc"]));
 
       // The selection followed the SAME BROWSER TAB onto its new id — not a guess among the
       // live tabs, and emphatically not the unrelated wf:bbb. Without the carry this throws.
@@ -1848,7 +1854,7 @@ describe("UiBridge (multi-tab)", () => {
     it("an UNPROVEN switch (revoked migration) REFUSES — it never names the switched-to tab", async () => {
       const { sockA, sockB } = await twoTabsWithAActive();
       sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
-      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id).sort()).toEqual(["wf:bbb", "wf:ccc"]));
+      await waitFor(() => expect(bridge.tabs().map((t) => t.tab_id).sort()).toEqual(["wf:bbb", "wf:ccc"]));
 
       // The orchestrator classified the re-hello as a switch to a DIFFERENT workflow.
       bridge.revokeTabMigration("wf:aaa");
@@ -1873,7 +1879,7 @@ describe("UiBridge (multi-tab)", () => {
     it("does NOT revert a selection the user made in the destination after the migration", async () => {
       const { sockA, sockB } = await twoTabsWithAActive();
       sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
-      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:ccc"));
+      await waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:ccc"));
 
       // The user then typed in the (switched-to) tab: a fresh, genuine selection that
       // happens to hold the SAME value the carry wrote, so only the write SEQUENCE can
@@ -1891,9 +1897,9 @@ describe("UiBridge (multi-tab)", () => {
       const { sockA, sockB } = await twoTabsWithAActive();
       // wf:aaa → tmp:mid → wf:ccc, all on the SAME socket (the reported id-scheme chain).
       sockA.send(JSON.stringify({ type: "hello", tab_id: "tmp:mid" }));
-      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("tmp:mid"));
+      await waitFor(() => expect(bridge.resolveActiveTabId()).toBe("tmp:mid"));
       sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
-      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:ccc"));
+      await waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:ccc"));
 
       // Revoking the FIRST (already superseded) hop must not touch the live selection:
       // the carry it recorded was overwritten by the second hop, and only the write
@@ -1919,13 +1925,13 @@ describe("UiBridge (multi-tab)", () => {
     autoReply(sock, "chained");
     const uuid = "6eccc826-592e-4abb-b280-35434e00ddd1";
     sock.send(JSON.stringify({ type: "hello", tab_id: uuid, title: "image_flux2_fp8" }));
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
 
     sock.send(JSON.stringify({ type: "hello", tab_id: "tmp:7eab1234", title: "image_flux2_fp8" }));
-    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("tmp:7eab1234"));
+    await waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("tmp:7eab1234"));
 
     sock.send(JSON.stringify({ type: "hello", tab_id: "wf:workf", title: "image_flux2_fp8" }));
-    await vi.waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("wf:workf"));
+    await waitFor(() => expect(bridge.tabs()[0]?.tab_id).toBe("wf:workf"));
 
     // Every id along the chain resolves to the live tab.
     for (const id of [uuid, "tmp:7eab1234", "wf:workf"]) {
@@ -1976,7 +1982,7 @@ describe("UiBridge (multi-tab)", () => {
 
     try {
       // Eventually the retried bind succeeds and accepts a panel connection.
-      await vi.waitFor(
+      await waitFor(
         () =>
           new Promise<void>((resolve, reject) => {
             const probe = new WebSocket(`ws://127.0.0.1:${racePort}`);
@@ -2036,7 +2042,44 @@ function nextFrame(
   });
 }
 
-const settle = () => new Promise((r) => setTimeout(r, 60));
+/**
+ * Let queued bridge work flush before asserting on its effect.
+ *
+ * #1325 — this was `setTimeout(60)`: a wall-clock guess that 60ms is "enough". It is,
+ * on an idle machine. Under a fully parallel suite the event loop is contended and
+ * 60ms can elapse with the queued work never scheduled — which is exactly the shape
+ * reported, a file that fails under `vitest run` and passes 206/206 in isolation.
+ *
+ * The wait now SCALES with measured event-loop lag. Note the property that makes this
+ * safe to apply to all 31 call sites at once: it is MONOTONE — always at least the old
+ * 60ms, more only when the loop is already behind. It therefore cannot change the
+ * outcome of a test that passes today; it can only stop a loaded machine from deciding
+ * one. (A shorter wait could have masked a real regression; this direction cannot.)
+ *
+ * WHAT IT DOES AND DOES NOT COVER, measured rather than assumed:
+ *
+ *   idle                       old 63ms   new 63ms   (no cost added)
+ *   in-process loop congestion old 121ms  new 367ms  (adapts — a busy worker)
+ *   other PROCESSES burning CPU old 62ms  new 63ms   (does NOT adapt)
+ *
+ * The last row is the honest limit. Cross-process starvation does not congest THIS
+ * loop, so there is nothing local to measure; a wall-clock sleep and the work it waits
+ * for are descheduled together. So this is not a proven cure for the reported
+ * condition — it removes one real load-sensitivity vector (a busy worker's own queue)
+ * without claiming to remove them all.
+ */
+const settle = async (): Promise<void> => {
+  // Lag is measured with setImmediate, NOT setTimeout(0): Windows' timer resolution is
+  // ~15.6ms, so a setTimeout(0) probe reports that floor as if it were contention and
+  // inflates every one of the 31 waits on an idle machine (measured: 63ms -> 140ms).
+  // setImmediate has no such floor — 0ms idle, and it still grows when the loop is busy.
+  const t0 = Date.now();
+  await new Promise((r) => setImmediate(r));
+  const lag = Date.now() - t0; // ~0 idle, tens of ms under a loaded suite
+  await new Promise((r) => setTimeout(r, 60 + lag * 4));
+  // Drain work those timers queued behind them, which a single sleep never sees.
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+};
 
 describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
   it("lists desktop tabs (excluding headless viewers), attaches, and fans push out to primary + viewer", async () => {
@@ -2261,23 +2304,23 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
 
     // A command issued for workflow A carries A's uuid.
     await bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:A" });
-    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    await waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
     expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
 
     // Same socket switches to workflow B (migration alias tmp:A → tmp:B).
     desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B", enforces_workflow_stamp: true, enforces_workflow_stamp_at_write: true }));
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:B")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:B")).toBe(true));
 
     // A late command still ISSUED FOR A (its agent's tab id) must stamp A's uuid — even though
     // it now resolves onto B's socket — so the panel (showing B) declines to apply it. Stamping
     // B's uuid would let it cross-apply. The resolver reads the ORIGIN tab, so it stays uuid-A.
     frames.length = 0;
     await bridge.send({ cmd: "graph_add_node", node: "y" } as never, { tabId: "tmp:A" });
-    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    await waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
     expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
     desktop.close();
   });
@@ -2303,7 +2346,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:reconnected")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:reconnected")).toBe(true));
 
     await bridge.send({ cmd: "graph_add_node", node: "before-open" } as never, { tabId: "wf:reconnected" });
     expect(frames.at(-1)?.workflow_uuid).toBe(oldUuid);
@@ -2333,13 +2376,13 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
     // Caller tries to smuggle a conflicting workflow_uuid (the would-be destination) in the cmd.
     await bridge.send(
       { cmd: "graph_add_node", node: "x", workflow_uuid: "uuid-FORGED-DESTINATION" } as never,
       { tabId: "tmp:A" },
     );
-    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    await waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
     // The emitted frame carries the TRUSTED origin uuid, not the caller's forged value.
     expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
     desktop.close();
@@ -2358,12 +2401,12 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
     await bridge.send(
       { cmd: "graph_add_node", node: "x", retry_of: "caller-retry-token-1" } as never,
       { tabId: "tmp:A" },
     );
-    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    await waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
     const frame = frames.find((f) => f.cmd === "graph_add_node")!;
     expect(frame.retry_of).toBe("caller-retry-token-1");
     expect(frame.rid).not.toBe("caller-retry-token-1");
@@ -2386,7 +2429,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
     await expect(
       bridge.send({ cmd: "graph_query", rid: "caller-forged-rid" } as never, {
         tabId: "tmp:A",
@@ -2413,13 +2456,13 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:none")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:none")).toBe(true));
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:none" }),
     ).rejects.toThrow(/no trusted identity|cannot be safely targeted/i);
     // A READ still dispatches (unstamped is fine — reads have no side effect).
     await bridge.send({ cmd: "graph_get_state" } as never, { tabId: "tmp:none" });
-    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_get_state")).toBeTruthy());
+    await waitFor(() => expect(frames.find((f) => f.cmd === "graph_get_state")).toBeTruthy());
     desktop.close();
   });
 
@@ -2433,10 +2476,10 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       const m = JSON.parse(buf.toString());
       if (m.rid && m.cmd) desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sA")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sA")).toBe(true));
     // Same-socket switch to a different workflow.
     desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:sB", title: "B", enforces_workflow_stamp: true, enforces_workflow_stamp_at_write: true }));
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sB")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sB")).toBe(true));
     // A late command issued for A resolves onto B's socket — with no trusted uuid it is refused,
     // never written unstamped to B.
     await expect(
@@ -2447,12 +2490,12 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
 
   it("reports graph-mutation capability from the same enforcement and stamp conditions as dispatch (#709)", async () => {
     const desktop = await connectPanel("tmp:capable", "capable");
-    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(true));
+    await waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(true));
 
     // A same-tab re-hello from a stale browser bundle resets capability. It must not
     // inherit the prior modern hello, because dispatch will refuse the unfenced write.
     desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:capable", title: "stale" }));
-    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(false));
+    await waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(false));
 
     // Enforcement without a trusted stamp is still not graph-mutation-ready.
     bridge.setTabWorkflowUuidResolver(() => undefined);
@@ -2465,18 +2508,18 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         enforces_workflow_stamp_at_write: true,
       }),
     );
-    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(false));
+    await waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(false));
     desktop.close();
   });
 
   it("does not report graph-mutation capability after the panel socket closes (#709)", async () => {
     const desktop = await connectPanel("tmp:closing", "closing");
-    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:closing")).toBe(true));
+    await waitFor(() => expect(bridge.tabCanMutateGraph("tmp:closing")).toBe(true));
 
     // Wait for the server-side connection to observe the close; neither readiness
     // accessor may retain capability or a generation after its socket is gone.
     desktop.close();
-    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:closing")).toBe(false));
+    await waitFor(() => expect(bridge.tabCanMutateGraph("tmp:closing")).toBe(false));
     expect(bridge.tabConnectionGeneration("tmp:closing")).toBeUndefined();
   });
 
@@ -2492,7 +2535,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         tab_session_id: "browser-tab-original",
       }),
     );
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabConnectionIdentity("wf:shared.json")).toMatchObject({ tabSessionId: "browser-tab-original" }),
     );
     const before = bridge.tabConnectionIdentity("wf:shared.json");
@@ -2514,7 +2557,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       replacement.on("error", reject);
     });
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabConnectionIdentity("wf:shared.json")).toMatchObject({ tabSessionId: "browser-tab-other" }),
     );
     const after = bridge.tabConnectionIdentity("wf:shared.json");
@@ -2538,7 +2581,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       const m = JSON.parse(buf.toString());
       if (m.rid && m.cmd) old.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:old")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:old")).toBe(true));
 
     // A mutating graph command is refused BEFORE dispatch (never written to the socket).
     await expect(
@@ -2593,7 +2636,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       old.on("error", rej);
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "old-skew")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "old-skew")).toBe(true));
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "old-skew" }),
     ).rejects.toThrow(/reports panel 0\.11\.0.*needs panel 0\.11\.35\+.*install_comfyui\(action:'panel', panel_action:'update'\).*restart ComfyUI.*rebinding cannot/i);
@@ -2623,7 +2666,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         });
         stale.on("error", rej);
       });
-      await vi.waitFor(() =>
+      await waitFor(() =>
         expect(bridge.tabs().some((t) => t.tab_id === "stale-bundle")).toBe(true),
       );
       const err = await bridge
@@ -2671,7 +2714,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       unknown.on("error", rej);
     });
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "disk-unknown")).toBe(true),
     );
     const err = await bridge
@@ -2725,7 +2768,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         });
         behind.on("error", rej);
       });
-      await vi.waitFor(() =>
+      await waitFor(() =>
         expect(bridge.tabs().some((t) => t.tab_id === "really-old")).toBe(true),
       );
       const err = await bridge
@@ -2760,7 +2803,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         });
         stale.on("error", rej);
       });
-      await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "fence-floor")).toBe(true));
+      await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "fence-floor")).toBe(true));
       const err = await bridge
         .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "fence-floor" })
         .catch((e: Error) => e);
@@ -2790,7 +2833,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         });
         sock.on("error", rej);
       });
-      await vi.waitFor(() =>
+      await waitFor(() =>
         expect(bridge.tabs().some((t) => t.tab_id === "no-version-capable")).toBe(true),
       );
       const err = await bridge
@@ -2835,7 +2878,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       old.on("error", rej);
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:workflows/portrait.json")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:workflows/portrait.json")).toBe(true));
     const caught = await bridge
       .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "wf:workflows/portrait.json" })
       .then(
@@ -2861,7 +2904,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // would suppress the retry/rebind wrapper, which IS the right recovery here
     // (a rebind re-resolves the identity; nothing needs a panel update).
     const modern = await connectPanel("tmp:enforcing-unresolved", "M");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tmp:enforcing-unresolved")).toBe(true),
     );
     bridge.setTabWorkflowUuidResolver(() => undefined); // no trusted identity to stamp
@@ -2897,7 +2940,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       old.on("error", rej);
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:pre-write-fence")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:pre-write-fence")).toBe(true));
     expect(bridge.tabCanMutateGraph("tmp:pre-write-fence")).toBe(false);
     await expect(
       bridge.send({ cmd: "graph_set_widget", node_id: 7, widget: "steps", value: 30 } as never, {
@@ -2910,7 +2953,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
   it("ALLOWS active-workflow mutations (graph AND workflow_*) for a panel that DOES enforce the stamp (#570 P0c)", async () => {
     const modern = await connectPanel("tmp:modern", "M"); // connectPanel advertises enforcement + has a resolver stamp
     autoReply(modern, "modern");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:modern")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:modern")).toBe(true));
     // A graph mutator AND each workflow mutator all dispatch (enforcement + trusted stamp present).
     for (const cmd of [
       { cmd: "graph_add_node", node: "x" },
@@ -2962,7 +3005,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
 
   it("keeps auto-sync eligibility on the current socket's pinned kind (#710 P1)", async () => {
     const phone = await connectHeadless("phone-sync-pinned");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(true));
     // This is the exact classification the orchestrator must use after each hello.
     expect(bridge.isCurrentHeadless("phone-sync-pinned")).toBe(true);
 
@@ -2977,15 +3020,15 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // The old mobile client is gone. A fresh desktop socket may reuse its id;
     // stale headless history must not suppress this desktop's legitimate sync.
     phone.close();
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(false));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(false));
     const desktop = await connectPanel("phone-sync-pinned", "G");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(true));
     expect(bridge.isCurrentHeadless("phone-sync-pinned")).toBe(false);
     expect(bridge.isHeadless("phone-sync-pinned")).toBe(false);
 
     // A first-hello desktop is likewise a legitimate sync target.
     const separateDesktop = await connectPanel("desktop-sync-eligible", "G");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "desktop-sync-eligible")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "desktop-sync-eligible")).toBe(true));
     expect(bridge.isHeadless("desktop-sync-eligible")).toBe(false);
     desktop.close();
     separateDesktop.close();
@@ -3064,7 +3107,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         old.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
       }
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:old778")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:old778")).toBe(true));
 
     const reads = [
       "graph_find_nodes",
@@ -3100,7 +3143,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       old.on("error", rej);
     });
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tmp:noversion")).toBe(true),
     );
     const err = await bridge
@@ -3139,7 +3182,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       old.on("error", rej);
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:compact")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:compact")).toBe(true));
     const err = await bridge
       .send({ cmd: "graph_set_widget", node_id: 1 } as never, { tabId: "tmp:compact" })
       .then(() => null)
@@ -3178,7 +3221,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       sock.on("error", rej);
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:inherit")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:inherit")).toBe(true));
 
     // Re-hello WITHOUT a panel_version. The connection inherits 0.11.32 for
     // messaging but records panelVersionAdvertised: false.
@@ -3213,7 +3256,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       sock.on("error", rej);
     });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:blankver")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:blankver")).toBe(true));
     const err = await bridge
       .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:blankver" })
       .then(() => null)
@@ -3246,7 +3289,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       sock.on("error", rej);
     });
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === `tmp:unparse-${raw}`)).toBe(true),
     );
     const err = await bridge
@@ -3278,7 +3321,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         });
         sock.on("error", rej);
       });
-      await vi.waitFor(() =>
+      await waitFor(() =>
         expect(bridge.tabs().some((t) => t.tab_id === "nightly-capable")).toBe(true),
       );
       const err = await bridge
@@ -3313,7 +3356,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       sock.on("error", rej);
     });
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tmp:inherit-reactive")).toBe(true),
     );
     // Re-hello WITHOUT a version: 0.4.5 is inherited for messaging only.
@@ -3355,7 +3398,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       });
       sock.on("error", rej);
     });
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tmp:unclassified")).toBe(true),
     );
     const err = await bridge
@@ -3392,7 +3435,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         });
         old.on("error", rej);
       });
-      await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:notable")).toBe(true));
+      await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:notable")).toBe(true));
       const err = await bridge
         .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:notable" })
         .then(() => null)
@@ -3445,7 +3488,7 @@ describe("tabServerOrigin (server-observed handshake Origin — #509 spoof gate)
     // The hello CLAIMS a different comfyui_url than the real handshake Origin. The trusted
     // server-observed value must be the handshake Origin; the claim only shows in tabOrigin.
     const s = await connectWithOrigin("tab-origin-1", "http://127.0.0.1:8188", "http://evil.example:1");
-    await vi.waitFor(() => expect(bridge.canReach("tab-origin-1")).toBe(true));
+    await waitFor(() => expect(bridge.canReach("tab-origin-1")).toBe(true));
     expect(bridge.tabServerOrigin("tab-origin-1")).toBe("http://127.0.0.1:8188");
     expect(bridge.tabOrigin("tab-origin-1")).toBe("http://evil.example:1"); // spoofable claim
     s.close();
@@ -3453,7 +3496,7 @@ describe("tabServerOrigin (server-observed handshake Origin — #509 spoof gate)
 
   it("is undefined when the handshake carried no Origin (non-browser client)", async () => {
     const s = await connectWithOrigin("tab-origin-2", undefined, "http://127.0.0.1:8188");
-    await vi.waitFor(() => expect(bridge.canReach("tab-origin-2")).toBe(true));
+    await waitFor(() => expect(bridge.canReach("tab-origin-2")).toBe(true));
     expect(bridge.tabServerOrigin("tab-origin-2")).toBeUndefined();
     expect(bridge.tabServerOrigin("nope")).toBeUndefined();
     s.close();
@@ -3463,7 +3506,7 @@ describe("tabServerOrigin (server-observed handshake Origin — #509 spoof gate)
     // Even if a client sends a path-bearing value, the stored origin is authority-only, so
     // a path-mounted boot base is fail-closed (never falsely matched) downstream.
     const s = await connectWithOrigin("tab-origin-3", "http://127.0.0.1:8188/comfy");
-    await vi.waitFor(() => expect(bridge.canReach("tab-origin-3")).toBe(true));
+    await waitFor(() => expect(bridge.canReach("tab-origin-3")).toBe(true));
     expect(bridge.tabServerOrigin("tab-origin-3")).toBe("http://127.0.0.1:8188");
     s.close();
   });
@@ -3536,25 +3579,54 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
 
   it("a no-timeout READ stays alive PAST the old 6s cutoff (end-to-end) (#357)", async () => {
     const a = await connectPanel("tab-aaaa-1111"); // never auto-replies
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
-    let settled = false;
+    // Bounded under this test's 12s budget, for the reason given at the #450 test above.
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1), { timeout: 3000 });
+    // #1325 — this test used to record only a BOOLEAN and discard the reason, so a
+    // failure read `expected true to be false` and named nothing. It was reported as
+    // load-sensitive, and the arithmetic says a slow machine alone cannot be the whole
+    // story: the read default is 20s and this test's budget is 12s, so the deadline
+    // UNDER TEST cannot be reached inside it. If this read settles, something else
+    // rejected it, and that reason is the only thing worth having.
+    let outcome: "resolved" | "rejected" | null = null;
+    let reason: unknown;
     // No explicit timeout → send() applies the tolerant read default (20s). Swallow
     // the eventual late rejection so it never surfaces as an unhandled rejection
     // (the bridge is torn down in afterEach; the pending read settles then).
     void bridge.send({ cmd: "graph_query" }).then(
-      () => { settled = true; },
-      () => { settled = true; },
+      () => { outcome = "resolved"; },
+      (err) => { outcome = "rejected"; reason = err; },
     );
     // Wait comfortably past the OLD 6000ms default: before the fix this would have
-    // already rejected (settled === true); after it, the read is still in-flight.
-    await new Promise((r) => setTimeout(r, 6500));
-    expect(settled).toBe(false);
+    // already rejected; after it, the read is still in-flight.
+    const SLEEP_MS = 6500;
+    const startedAt = Date.now();
+    await new Promise((r) => setTimeout(r, SLEEP_MS));
+    const elapsed = Date.now() - startedAt;
+
+    // Report the two confounds instead of asserting through them. A stall past the
+    // real deadline means this run measured the MACHINE, not the code — and that is
+    // the one thing a bare `toBe(false)` could never say.
+    //
+    // `deadline >= SLEEP_MS` is what separates the two. If the deadline is BELOW this
+    // sleep, reaching it is the regression this test exists to catch, not a stall —
+    // without that clause a genuine regression would be reported as a slow machine,
+    // which is precisely the misdiagnosis #1325 is about. (Verified by lowering the
+    // constant to 6s: it must read as a regression, not as scheduling.)
+    const deadline = BRIDGE_READ_DEFAULT_TIMEOUT_MS;
+    const stalled = elapsed >= deadline && deadline >= SLEEP_MS;
+    const detail =
+      outcome === null
+        ? "still in flight"
+        : `${outcome} after ${elapsed}ms` +
+          (stalled ? ` — THE MACHINE STALLED past the ${deadline}ms read deadline, so this run cannot tell a regression from scheduling` : "") +
+          (outcome === "rejected" ? `: ${reason instanceof Error ? reason.message : String(reason)}` : "");
+    expect(detail).toBe("still in flight");
     a.close();
   }, 12000);
 
   it("an explicit timeout always overrides the read default", async () => {
     const a = await connectPanel("tab-aaaa-1111"); // never replies
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     await expect(bridge.send({ cmd: "graph_query" }, { timeoutMs: 120 })).rejects.toThrow(
       /did not reply to "graph_query" within 120 ms/,
     );
@@ -3569,7 +3641,7 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
   it("names the FULL routing tab id in a no-reply timeout, not an 8-char slice (#803)", async () => {
     const tabId = "wf:workflows/Untitled 2026-08-04 06-15-58.json";
     const a = await connectPanel(tabId); // never replies
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
     await expect(bridge.send({ cmd: "graph_query" }, { timeoutMs: 120 })).rejects.toThrow(
       `Panel tab ${tabId} did not reply to "graph_query" within 120 ms`,
     );
@@ -3589,7 +3661,7 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
   it("tabGraphMutationCapability separates an UNREADABLE probe from an observed 'cannot' (#770)", async () => {
     const tabId = "wf:workflows/cap.json";
     const a = await connectPanel(tabId); // advertises both write fences
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(1));
 
     // A stamp is present and both fences are advertised → observed CAN.
     bridge.setTabWorkflowUuidResolver(() => "11111111-1111-4111-8111-111111111111");
@@ -4443,7 +4515,7 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     // A connected tab that NEVER replies: sock.send() succeeds, then the reply timer fires.
     // The command WAS written, so the rejection must carry the typed dispatched:true flag.
     const sock = await connectPanel("frozen-tab", "wf");
-    await vi.waitFor(() => expect(bridge.canReach("frozen-tab")).toBe(true));
+    await waitFor(() => expect(bridge.canReach("frozen-tab")).toBe(true));
     let caught: unknown;
     try {
       await bridge.send({ cmd: "comfy_reboot" }, { tabId: "frozen-tab", timeoutMs: 40 });
@@ -4462,7 +4534,7 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
 describe("UiBridge (late ask_user answer buffer — #486)", () => {
   it("buffers a valid ask_user reply that arrives after the reply timeout", async () => {
     const sock = await connectPanel("tab-ask", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-ask")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-ask")).toBe(true));
     // The panel validates a pick only AFTER the send's short reply timeout fires.
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
@@ -4481,8 +4553,63 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     ).rejects.toThrow(/did not reply/i);
 
     // The late-but-valid answer must be recoverable via the buffer, then drained.
-    await vi.waitFor(() => expect(bridge.takeLateAskReply("ask-xyz")).toBe("Late Pick"));
+    await waitFor(() => expect(bridge.takeLateAskReply("ask-xyz")).toBe("Late Pick"));
     expect(bridge.takeLateAskReply("ask-xyz")).toBeUndefined(); // drained once
+  });
+
+  // #1352 — the same recovery for a CREDENTIAL, minus the one property that makes it
+  // durable. A secret card's late answer must be claimable in memory, because a user who
+  // finishes typing a moment late should still have their token applied — and it must
+  // NEVER reach the journal, because `panel_request_secret` exists so the value lands
+  // nowhere it can be read back.
+  it("buffers a late request_secret answer but NEVER hands it to the durable sink", async () => {
+    const sock = await connectPanel("tab-secret", "wf");
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-secret")).toBe(true), {
+      timeout: 3000,
+    });
+    const journaled: unknown[] = [];
+    bridge.setLateAskReplySink((askId, result) => journaled.push({ askId, result }));
+    // Capture every log level for the duration — verified against the real bridge with a
+    // canary token, which is how this assertion earned its place.
+    const logged: unknown[] = [];
+    const levels = ["debug", "info", "warn", "error"] as const;
+    const originals = levels.map((l) => [l, logger[l]] as const);
+    for (const l of levels) {
+      (logger as unknown as Record<string, unknown>)[l] = (...args: unknown[]) => {
+        logged.push(args);
+      };
+    }
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "request_secret") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "sk-live-TOKEN" }));
+        }, 80);
+      }
+    });
+
+    await expect(
+      bridge.send(
+        { cmd: "request_secret", ask_id: "secret-1", label: "token" },
+        { tabId: "tab-secret", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+
+    // Recoverable in memory: this is what lets a late token still be applied.
+    await waitFor(() => expect(bridge.takeLateAskReply("secret-1")).toBe("sk-live-TOKEN"), {
+      timeout: 3000,
+    });
+    // …and drained on claim, so it does not linger.
+    expect(bridge.takeLateAskReply("secret-1")).toBeUndefined();
+    // THE POINT: the durable journal never saw it. Asserted on the whole payload, not just
+    // the id — a sink that recorded the value under a different key would still be a leak.
+    expect(journaled).toEqual([]);
+    expect(JSON.stringify(journaled)).not.toContain("sk-live-TOKEN");
+    // …and it reached no LOG LINE either, at any level. A journal is the obvious place a
+    // credential must not land; a debug line is the easy one to add later without noticing.
+    expect(JSON.stringify(logged)).not.toContain("sk-live-TOKEN");
+    for (const [l, fn] of originals) (logger as unknown as Record<string, unknown>)[l] = fn;
+    bridge.setLateAskReplySink(() => {});
   });
 
   // The buffer only helps a caller that is still alive to poll it, and #486 is
@@ -4493,7 +4620,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     const seen: Array<{ askId: string; result: unknown; tabId: string }> = [];
     bridge.setLateAskReplySink((askId, result, tabId) => seen.push({ askId, result, tabId }));
     const sock = await connectPanel("tab-sink", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink")).toBe(true));
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
       if (msg.rid && msg.cmd === "ask_user") {
@@ -4509,7 +4636,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
       ),
     ).rejects.toThrow(/did not reply/i);
     // NOBODY polls takeLateAskReply here — that is the point.
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    await waitFor(() => expect(seen).toHaveLength(1));
     expect(seen[0]).toEqual({ askId: "ask-sink", result: "Sunk Pick", tabId: "tab-sink" });
     bridge.setLateAskReplySink(() => {});
   });
@@ -4523,7 +4650,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     const seen: string[] = [];
     bridge.setLateAskReplySink((askId) => seen.push(askId));
     const sock = await connectPanel("tab-longwait", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-longwait")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-longwait")).toBe(true));
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
       if (msg.rid && msg.cmd === "ask_user") {
@@ -4548,7 +4675,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // mapping has to survive its own TTL rule rather than merely not be swept.
     expect(bridge.takeLateAskReply("nothing-here")).toBeUndefined();
     expect(map.size).toBe(1);
-    await vi.waitFor(() => expect(seen).toEqual(["pa-slow"]), { timeout: 3000 });
+    await waitFor(() => expect(seen).toEqual(["pa-slow"]), { timeout: 3000 });
     bridge.setLateAskReplySink(() => {});
   });
 
@@ -4559,7 +4686,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   // screen, at the moment we know.
   it("tells the USER when an open card can no longer accept an answer", async () => {
     const sock = await connectPanel("tab-overflow", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-overflow")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-overflow")).toBe(true));
     const said: string[] = [];
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
@@ -4575,7 +4702,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // Any take runs a prune pass, which is where the ceiling bites.
     expect(bridge.takeLateAskReply("nothing-here")).toBeUndefined();
     expect(map.size).toBeLessThanOrEqual(1024);
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(said.some((t) => /can no longer accept an answer/i.test(t))).toBe(true),
     );
     expect(said.find((t) => /can no longer accept an answer/i.test(t))).toMatch(
@@ -4600,9 +4727,9 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   const NEVER = 600_000;
   /** The bridge has finished registering `incarnation` on `tabId`. */
   const occupied = (tabId: string, incarnation: string) =>
-    vi.waitFor(() => expect(bridge.tabIncarnation(tabId)).toBe(incarnation));
+    waitFor(() => expect(bridge.tabIncarnation(tabId)).toBe(incarnation));
   const vacant = (tabId: string) =>
-    vi.waitFor(() => expect(bridge.tabIncarnation(tabId)).toBeUndefined());
+    waitFor(() => expect(bridge.tabIncarnation(tabId)).toBeUndefined());
 
   it("an ordinary reload does NOT declare the tab gone", async () => {
     const gone: string[] = [];
@@ -4704,7 +4831,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     const tabB = await connectPanel("wf:takeover", "wf", { tabSessionId: "browser-tab-B" });
     await occupied("wf:takeover", "browser-tab-B");
     // A's close is asynchronous — wait until it has actually armed something.
-    await vi.waitFor(() => {
+    await waitFor(() => {
       bridge.__runTabGoneClocksForTest();
       expect(gone).toEqual(["wf:takeover"]);
     });
@@ -4724,7 +4851,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     expect(takenOver).toEqual([]);
 
     const tabB = await connectPanel("wf:boundary", "wf", { tabSessionId: "browser-tab-B" });
-    await vi.waitFor(() => expect(takenOver).toHaveLength(1));
+    await waitFor(() => expect(takenOver).toHaveLength(1));
     expect(takenOver[0]).toEqual(["wf:boundary", "browser-tab-A"]);
     tabA.close();
     tabB.close();
@@ -4743,7 +4870,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     for (const identity of [{ tabSessionId: "browser-tab-A" }, {}]) {
       const key = identity.tabSessionId ? "wf:rehello" : "wf:rehello-anon";
       const sock = await connectPanel(key, "wf", identity);
-      await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === key)).toBe(true));
+      await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === key)).toBe(true));
       const before = bridge.tabIncarnation(key);
 
       // Re-register on the SAME socket, with no disconnect in between.
@@ -4757,7 +4884,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
           ...(identity.tabSessionId ? { tab_session_id: identity.tabSessionId } : {}),
         }),
       );
-      await vi.waitFor(() =>
+      await waitFor(() =>
         expect(bridge.tabs().some((t) => t.tab_id === key && t.title === "renamed")).toBe(true),
       );
       // Same connection, same incarnation — and therefore not a takeover.
@@ -4777,12 +4904,12 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     const gone: string[] = [];
     bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
     const anonA = await connectPanel("wf:anon", "wf"); // no tab_session_id
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
     anonA.close();
     await vacant("wf:anon");
 
     const anonB = await connectPanel("wf:anon", "wf"); // also anonymous
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
     anonB.close();
     await vacant("wf:anon");
     expect(gone).toEqual([]);
@@ -4801,13 +4928,13 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // can prove which tab returned, and unknown-return must let the disclosure
     // surface.
     const sock = await connectPanel("tab-anonymous", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
     sock.close();
     await vacant("tab-anonymous");
     const back = await connectPanel("tab-anonymous", "wf");
     // The "reconnect" is COMPLETE before the clock runs, so a pass proves the
     // cancel declined rather than that the timer got there first.
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
 
     bridge.__runTabGoneClocksForTest();
     expect(gone).toEqual(["tab-anonymous"]);
@@ -4820,7 +4947,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
       throw new Error("journal exploded");
     });
     const sock = await connectPanel("tab-sink-bad", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink-bad")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink-bad")).toBe(true));
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
       if (msg.rid && msg.cmd === "ask_user") {
@@ -4835,13 +4962,13 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
         { tabId: "tab-sink-bad", timeoutMs: 30 },
       ),
     ).rejects.toThrow(/did not reply/i);
-    await vi.waitFor(() => expect(bridge.takeLateAskReply("ask-bad")).toBe("Still Here"));
+    await waitFor(() => expect(bridge.takeLateAskReply("ask-bad")).toBe("Still Here"));
     bridge.setLateAskReplySink(() => {});
   });
 
   it("does not buffer a non-ask command's late reply (no ask_id → dropped)", async () => {
     const sock = await connectPanel("tab-plain", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-plain")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-plain")).toBe(true));
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
       if (msg.rid && msg.cmd === "graph_outline") {
@@ -4884,7 +5011,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
   it("retains nothing when no filter is installed (fail closed)", async () => {
     bridge.setLateMutationFilter(null);
     const sock = await connectPanel("tab-nofilter", "wf");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tab-nofilter")).toBe(true),
     );
     let rid = "";
@@ -4913,7 +5040,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
     // graph_screenshot is mutating:true AND not retainable — the exact pair that
     // tells the two discriminators apart.
     const sock = await connectPanel("tab-778", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-778")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-778")).toBe(true));
     let rid = "";
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
@@ -4948,7 +5075,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
 
   it("retains a successful late mutation reply so a later call can report it applied", async () => {
     const sock = await connectPanel("tab-late-mut", "wf");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tab-late-mut")).toBe(true),
     );
     const ridP = replyLate(sock, "graph_set_node_mode", 80);
@@ -4963,7 +5090,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
 
     // The write DID land. Today this assertion fails because the reply is
     // dropped on the floor and the bridge keeps no record that it ever arrived.
-    const late = await vi.waitFor(() => {
+    const late = await waitFor(() => {
       const got = bridge.takeLateMutation(rid);
       expect(got, "late mutation outcome should be retained").toBeTruthy();
       return got;
@@ -4976,7 +5103,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
 
   it("drains once — a second reader must not be told the same thing twice", async () => {
     const sock = await connectPanel("tab-late-drain", "wf");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tab-late-drain")).toBe(true),
     );
     const ridP = replyLate(sock, "graph_set_node_mode", 80);
@@ -4988,7 +5115,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
     ).rejects.toThrow(/did not reply/i);
     const rid = await ridP;
 
-    await vi.waitFor(() => expect(bridge.takeLateMutation(rid)).toBeTruthy());
+    await waitFor(() => expect(bridge.takeLateMutation(rid)).toBeTruthy());
     expect(bridge.takeLateMutation(rid)).toBeUndefined();
     sock.close();
   });
@@ -4998,7 +5125,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
     // caller directly, so a retained record would make every write look like a
     // recovered timeout.
     const sock = await connectPanel("tab-on-time", "wf");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tab-on-time")).toBe(true),
     );
     let seen = "";
@@ -5024,7 +5151,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
     // would turn "we never found out" into "it failed", the #796 fold in the
     // opposite direction.
     const sock = await connectPanel("tab-late-fail", "wf");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tab-late-fail")).toBe(true),
     );
     let rid = "";
@@ -5053,7 +5180,7 @@ describe("UiBridge (late MUTATION outcome — #694)", () => {
     // The asymmetry #1154 spells out: an abandoned read costs nothing because
     // you just retry it. Retaining reads would make this buffer unbounded noise.
     const sock = await connectPanel("tab-late-read", "wf");
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tab-late-read")).toBe(true),
     );
     let rid = "";
@@ -5097,7 +5224,7 @@ describe("UiBridge.connectedServerOrigins (#952)", () => {
 
   it("reports the origins connected tabs actually front", async () => {
     const a = await connectWithOrigin("o-1", "http://192.168.1.50:8188");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "o-1")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "o-1")).toBe(true));
     expect(bridge.connectedServerOrigins()).toEqual(["http://192.168.1.50:8188"]);
     a.close();
   });
@@ -5105,7 +5232,7 @@ describe("UiBridge.connectedServerOrigins (#952)", () => {
   it("de-duplicates two tabs on the SAME ComfyUI", async () => {
     const a = await connectWithOrigin("o-1", "http://192.168.1.50:8188");
     const b = await connectWithOrigin("o-2", "http://192.168.1.50:8188");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
     expect(bridge.connectedServerOrigins()).toEqual(["http://192.168.1.50:8188"]);
     a.close();
     b.close();
@@ -5114,7 +5241,7 @@ describe("UiBridge.connectedServerOrigins (#952)", () => {
   it("reports BOTH when tabs front different ComfyUIs", async () => {
     const a = await connectWithOrigin("o-1", "http://192.168.1.50:8188");
     const b = await connectWithOrigin("o-2", "http://10.0.0.9:8188");
-    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+    await waitFor(() => expect(bridge.tabs()).toHaveLength(2));
     expect(bridge.connectedServerOrigins().sort()).toEqual(
       ["http://10.0.0.9:8188", "http://192.168.1.50:8188"].sort(),
     );
@@ -5127,7 +5254,7 @@ describe("UiBridge.connectedServerOrigins (#952)", () => {
   // that does not exist, or rule out drift that does.
   it("omits a tab that supplied no handshake Origin rather than guessing", async () => {
     const a = await connectWithOrigin("o-1"); // no Origin header
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "o-1")).toBe(true));
+    await waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "o-1")).toBe(true));
     expect(bridge.connectedServerOrigins()).toEqual([]);
     a.close();
   });

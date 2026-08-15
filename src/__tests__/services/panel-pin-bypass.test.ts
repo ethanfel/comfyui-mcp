@@ -100,6 +100,7 @@ import {
 } from "../../services/node-management.js";
 import { updateAllCustomNodes } from "../../services/update-comfyui.js";
 import { restoreNodeSnapshot } from "../../services/node-snapshots.js";
+import { waitFor } from "../helpers/wait-for.js";
 import {
   PanelPinnedError,
   withPanelMutationLock,
@@ -238,7 +239,7 @@ describe("a pin written MID-mutation cannot slice through it", () => {
     });
 
     const update = updateCustomNode({ id: "all" });
-    await vi.waitFor(() => expect(managerCalls.length).toBeGreaterThan(0));
+    await waitFor(() => expect(managerCalls.length).toBeGreaterThan(0));
 
     // Commit a pin exactly the way install_comfyui(action:'panel', panel_action:'pin') does — through
     // the shared mutation lock.
@@ -278,7 +279,7 @@ describe("a pin written MID-mutation cannot slice through it", () => {
     });
 
     const update = updateAllCustomNodes();
-    await vi.waitFor(() => expect(managerCalls.length).toBeGreaterThan(0));
+    await waitFor(() => expect(managerCalls.length).toBeGreaterThan(0));
 
     let pinCommitted = false;
     const pinWrite = withPanelMutationLock(async () => {

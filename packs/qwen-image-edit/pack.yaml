@@ -8,7 +8,7 @@ description: >-
   diffusion model as a city96 GGUF with the Qwen2.5-VL-7B-Instruct text encoder and a
   Lightning step-distill LoRA. Workflow ships the Q8_0 tier; Q4_K_S / Q5_K_S tiers are
   commented in manifest.yaml for lower-VRAM GPUs.
-vram: "12GB+ (Q4_K_S < 12GB, Q5_K_S 12-16GB, Q8_0 24GB+)"
+vram: "24GB+ (Q8_0, 20.3GB UNet — the tier this pack installs); Q5_K_S 12-16GB and Q4_K_S <12GB are commented out in manifest.yaml"
 workflow: workflow.json
 skill: qwen-image-edit
 launch_args: []

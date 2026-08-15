@@ -1,5 +1,5 @@
 ---
-title: "WAN 2.2 in ComfyUI: The Open Video King (2026 Guide)"
+title: "WAN 2.2 in ComfyUI: The Open Video King"
 description: "Run WAN 2.2 — the open-source MoE video model — locally in ComfyUI. High/low-noise experts, I2V & T2V, GGUF VRAM tiers, Lightning, one-command install."
 keywords:
   - WAN 2.2 ComfyUI
@@ -10,6 +10,7 @@ keywords:
   - open source video model
   - WAN 2.2 Lightning LoRA
   - WAN 2.2 vs LTX
+verified: 2026-08-14
 ---
 
 _by [artokun](https://github.com/artokun) · June 16, 2026 · wan · video · ComfyUI · model highlight_
@@ -24,7 +25,7 @@ open-weight measures, WAN 2.2 is the cinematic-motion king you can self-host tod
 
 Below: how the high-noise and low-noise experts actually work (the part everyone
 gets wrong), I2V vs T2V vs longer-video stitching, how it stacks up against
-LTX-2.3, the VRAM tiers from a 24 GB 4090 down to under 12 GB, and the fastest way
+LTX-2.3, the VRAM tiers from the pack's 24 GB default down to under 12 GB, and the fastest way
 to run it — a one-command install with
 [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [sidebar Panel](../panel),
 instead of hand-downloading dozens of GB of GGUFs and wiring two samplers by hand.
@@ -80,26 +81,52 @@ resolution, steps, and hardware. Each rival gets its own post:
 [LTX-2.3](./ltx-2.3-comfyui) and [WAN Animate](./wan-animate-comfyui) are
 elsewhere in the series.
 
+## Licensing
+
+**WAN 2.2 is Apache 2.0** — commercial use included, no revenue threshold, no seat
+count, no separate agreement to sign. The
+[Wan-AI/Wan2.2-T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B) model card
+states it directly: the models in the repository are licensed under Apache 2.0. The
+license does carry ordinary use restrictions (no illegal content, no misuse of
+personal information, no targeting vulnerable groups), which is a conduct clause,
+not a commercial gate.
+
+That makes it one of the genuinely permissive open video models — worth contrasting
+with [LTX-2.3](./ltx-2.3-comfyui), which is open-weight but gates commercial use on
+a $10M revenue threshold.
+
+The LoRAs and upscaler the pack pulls are separate projects under their own terms;
+check those before shipping if you redistribute them.
+
 ## System & VRAM requirements
 
 WAN 2.2 A14B is VRAM-hungry — two 14B experts plus a UMT5-XXL encoder, a VAE
 decode, and (in the longer-video chain) RIFE interpolation running back to back.
-The fix is **GGUF quantization**, and the pack's installer is interactive: it
-offers three tiers so you match the quant to your card.
+The fix is **GGUF quantization**. The pack ships one tier and the other two are a
+manual swap:
 
 | GGUF tier | VRAM target | Notes |
 |-----------|-------------|-------|
-| **Q4_K_S** | under 12 GB | **What this pack ships and the workflow references**; smallest quant, some quality trade |
-| **Q5_K_S** | 12–24 GB | Balanced middle tier |
-| **Q8_0** | 24 GB+ | Best quality; what the `-96gb` pack variant ships |
+| **Q4_K_S** | under 12 GB | Smallest quant, some quality trade; a manual swap |
+| **Q5_K_S** | 12–24 GB | Balanced middle tier; a manual swap |
+| **Q8_0** | **24 GB+** | **What this pack ships** — the manifest, both installer scripts, and `workflow.json` all point at `-Q8_0.gguf` |
 
-The pack pins **Q4_K_S** because that's exactly what `workflow.json` points at — it
-keeps the two experts inside entry-GPU VRAM. To go higher-quality on a big card,
-install the **`-96gb` pack variant** (or swap the `unet/Wan2.2-*-Q4_K_S.gguf` files
-for the `-Q5_K_S` or `-Q8_0` variants from the same `Aitrepreneur/FLX` repo and
-re-point the `UnetLoaderGGUF` nodes). To reduce OOM risk, the pack also launches
-ComfyUI with `--reserve-vram 2` so the GGUF UNet, VAE decode, and RIFE pass don't
-collide.
+**Plan for 24 GB.** `wan-longer-videos` pins **Q8_0**: `manifest.yaml` downloads the
+four `-Q8_0.gguf` experts, and `workflow.json` loads them by that exact filename. On
+a 12 GB card this pack will OOM as shipped — that is not a tuning problem, it is the
+wrong tier for the GPU.
+
+To run it smaller, swap the four `unet/Wan2.2-*-Q8_0.gguf` files for the `-Q5_K_S` or
+`-Q4_K_S` builds from the same
+[`Aitrepreneur/FLX`](https://huggingface.co/Aitrepreneur/FLX) repo and re-point the
+`UnetLoaderGGUF` nodes at the new filenames. Nothing else in the graph changes.
+
+The `-96gb` variants are **not** the higher-quality GGUF step — they load
+`wan2.2_*_14B_fp16.safetensors`, full fp16 weights, which is why they are named for a
+96 GB card. Going from Q8_0 to `-96gb` moves *up* in VRAM, not down.
+
+To reduce OOM risk at the shipped tier, the pack launches ComfyUI with
+`--reserve-vram 2` so the GGUF UNet, VAE decode, and RIFE pass don't collide.
 
 ## Install WAN 2.2 in ComfyUI
 
@@ -111,8 +138,8 @@ of files in a lot of exact places.
 
 | File | Folder |
 |------|--------|
-| `Wan2.2-I2V-A14B-HighNoise-Q4_K_S.gguf` / `-LowNoise-Q4_K_S.gguf` | `models/unet/` |
-| `Wan2.2-T2V-A14B-HighNoise-Q4_K_S.gguf` / `-LowNoise-Q4_K_S.gguf` | `models/unet/` |
+| `Wan2.2-I2V-A14B-HighNoise-Q8_0.gguf` / `-LowNoise-Q8_0.gguf` | `models/unet/` |
+| `Wan2.2-T2V-A14B-HighNoise-Q8_0.gguf` / `-LowNoise-Q8_0.gguf` | `models/unet/` |
 | `umt5-xxl-encoder-Q5_K_S.gguf` (text encoder) | `models/text_encoders/` |
 | `wan_2.1_vae.safetensors` | `models/vae/` |
 | `wan2.2_{t2v,i2v}_lightx2v_4steps_lora_*_{high,low}_noise` + `Wan2.1_T2V_14B_FusionX_LoRA` | `models/loras/` |
@@ -131,10 +158,10 @@ the generated installer script:
 # MCP-native (from a Claude Code session, with COMFYUI_PATH set)
 apply_manifest --path packs/wan-longer-videos/manifest.yaml
 
-# or run the generated interactive installer from your ComfyUI root
-# (the folder containing custom_nodes/ and models/) — it offers the
-# Q4_K_S / Q5_K_S / Q8_0 quant choice
-WAN2_2-ULTRA-MODELS-NODES_INSTALL.bat
+# or run the generated installer from your ComfyUI root
+# (the folder containing custom_nodes/ and models/) — it is non-interactive
+# and fetches the Q8_0 tier the workflow expects
+packs\wan-longer-videos\install-windows.bat   # Linux/RunPod: install-runpod.sh
 ```
 
 Then restart ComfyUI and load `packs/wan-longer-videos/workflow.json` (the first
@@ -302,7 +329,7 @@ two-pass sampler chain and must use both.
 **Do I really need both models?** Yes. It was trained split-noise; a single model
 for all steps gives broken output. This is the most common WAN 2.1 → 2.2 mistake.
 
-**How much VRAM do I need?** With GGUF: under 12 GB on Q4_K_S (what the base pack ships), 12–24 GB on Q5_K_S, and 24 GB+ for Q8_0 (the `-96gb` variant).
+**How much VRAM do I need?** **24 GB+** to run the pack as shipped — it pins the Q8_0 GGUFs. Swapping the four UNet files down to Q5_K_S gets you into 12–24 GB, and Q4_K_S under 12 GB. (The `-96gb` variants are fp16 safetensors, not a GGUF tier — they need *more* VRAM, not less.)
 
 **Can I run it locally / offline?** Yes — fully local in ComfyUI, no API key and no
 network call at generation time (after the one-time model download).
@@ -323,8 +350,8 @@ vendor/blog benchmarks, not independently audited.)
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
-2. Apply the **[`wan-longer-videos` pack](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-longer-videos)** — nodes + the four hi/lo GGUFs, encoder, VAE, LoRAs, and upscaler land in the right folders, validated. Pick your quant tier.
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
+2. Apply the **[`wan-longer-videos` pack](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-longer-videos)** — nodes + the four hi/lo GGUFs, encoder, VAE, LoRAs, and upscaler land in the right folders, validated. Ships the Q8_0 tier — plan for 24 GB, or swap the four UNet files down.
 3. Open the [Panel](../panel) and let the panel's agent set the hi/lo split, swap LoRAs, and stitch longer clips for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one

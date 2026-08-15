@@ -16,6 +16,10 @@ vi.mock("../../config.js", () => {
     // downloadModel branches on this; these tests always run with comfyuiPath
     // set (local mode), so it returns false.
     isRemoteMode: () => !config.comfyuiPath,
+    // #1374 — the route decision stamps the target it was made against, so this mock
+    // has to provide it. Faked rather than spread from the real config: these suites
+    // control `config` themselves and a real base URL would not match what they set.
+    getComfyUIBaseUrl: () => `http://127.0.0.1:8188`,
   };
 });
 
@@ -24,6 +28,7 @@ import { downloadCacheFs } from "../../services/download-cache.js";
 import { downloadModel } from "../../services/model-resolver.js";
 import type { ResumeDiagnostic } from "../../services/download-resume-diag.js";
 import { setDownloadRetryPolicyForTests } from "../../services/download-retry.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 /** Capture the resume decision a physical download reports (#467). The decision
  *  is delivered to the CALLER via an onResume callback (no shared map), so a test
@@ -126,7 +131,7 @@ describe("downloadModel cache", () => {
       "two.safetensors",
     );
 
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     resolveFetch(okResponse("one network body"));
 
     const [onePath, twoPath] = await Promise.all([one, two]);
@@ -154,7 +159,7 @@ describe("downloadModel cache", () => {
       "checkpoints",
       "a.safetensors",
     );
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const b = downloadModel(
       "https://example.com/models/coalesce.safetensors",
       "loras",
@@ -1397,7 +1402,7 @@ describe("downloadModel cache", () => {
     const capB = resumeCapture();
     const a = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "a.safetensors"), onResume: capA.onResume });
     const b = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "b.safetensors"), onResume: capB.onResume });
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // coalesced to ONE fetch
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // coalesced to ONE fetch
     release(okResponse("FRESHFULLBODY"));
     await Promise.all([a, b]);
 

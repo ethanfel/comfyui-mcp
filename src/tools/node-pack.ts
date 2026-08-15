@@ -45,7 +45,7 @@ const jsonResult = (result: unknown) => ({
  * publishing is a local filesystem + comfy-cli operation independent of which
  * ComfyUI is targeted, see publishCustomNode). A fold must not narrow that, so
  * the tool's description states the exception rather than claiming a jail it
- * does not have. See docs/design/node-dev-tools.md.
+ * does not have. See design/node-dev-tools.md.
  *
  * A NEW name rather than a survivor: none of the nine is a natural umbrella
  * (the scaffold tool is the first STEP, not the family), so `node_pack` takes

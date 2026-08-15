@@ -1,5 +1,5 @@
 ---
-title: "Z-Image in ComfyUI: The Low-VRAM Speed King (2026)"
+title: "Z-Image in ComfyUI: The Low-VRAM Speed King"
 description: "Run Z-Image Turbo and Base — Alibaba's 6B text-to-image model — locally in ComfyUI under 8 GB VRAM. Install, GGUF tips, LoRA training, and the V2 ULTRA workflow."
 keywords:
   - Z-Image ComfyUI
@@ -75,6 +75,18 @@ it loses: in-image **typography and layout** go to [Ideogram 4](./ideogram-4-com
 **photorealism** still favors Flux.2. The text-and-layout deep-dive lives in the
 [Ideogram 4 post](./ideogram-4-comfyui); Z-Image earns this spotlight for
 flagship-ish output on hardware the others can't touch.
+
+## Licensing
+
+**Z-Image is Apache 2.0** — commercial use included, no revenue threshold, no
+separate agreement.
+[Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) declares
+`apache-2.0`.
+
+Together with its VRAM footprint that is the practical argument for Z-Image: it is
+the model you can both run on a small card and ship commercially without reading a
+threshold table. Compare [Ideogram 4](./ideogram-4-comfyui), which is stronger on
+text layout but **non-commercial**.
 
 ## System & VRAM requirements (GGUF)
 
@@ -268,9 +280,9 @@ The packs ship tuned, but for reference (community-tested presets):
 
 ## FAQ
 
-**Is Z-Image open source?** The weights are openly published by Tongyi-MAI on
-HuggingFace and widely usable locally. Confirm the exact license terms on the model
-card for your use case (*unverified here* — check before commercial use).
+**Is Z-Image open source?** Yes — [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
+declares **Apache 2.0**, so commercial use is permitted with no revenue threshold.
+See [Licensing](#licensing) above.
 
 **Turbo or Base — which should I install?** Turbo for speed and fast iteration under
 8 GB; Base if you want maximum quality, diverse styles, working negative prompts, or
@@ -297,7 +309,7 @@ published on the Aitrepreneur/FLX mirror — use Q5_K_S or Q8_0.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the [`z-image-turbo`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-turbo) pack (fast) or
    [`z-image-base`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-base) pack (trainable) — nodes + GGUF models land
    in the right folders, validated.

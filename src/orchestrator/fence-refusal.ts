@@ -51,6 +51,43 @@ export function noPanelTabReason(tabId: string): string {
  * BEFORE the structural no-Origin case, or it borrows a remedy that cannot help
  * it and is told its problem is permanent.
  */
+/**
+ * The remedy for "this connection has no server-observed Origin" (panel#1065).
+ *
+ * Shared, because it was NOT shared and the two copies drifted. #1077/#1240 gave
+ * the relay path the origin it already knows from COMFYUI_URL, and updated the
+ * refusal below to say so. The OTHER surface rendering this same refusal — the
+ * `rejected` branch of describeFenceRebind in panel-tools.ts — kept the pre-fix
+ * text, which told the user to abandon the relay backend and to "report it: the
+ * relay protocol has to forward the browser's handshake Origin for this path to
+ * work at all".
+ *
+ * A user on 0.50.114 — a version that HAS the fix — followed that instruction and
+ * filed panel#1065 quoting it back. The stale sentence manufactured its own bug
+ * report, and told someone to downgrade a working setup on the way.
+ */
+export const NO_ORIGIN_REMEDY =
+  // The gate's OWN semantics come first, because they dissolve the fear the old
+  // wording created and the reporter's stated obstacle at once. Measured, not
+  // assumed: workflowIdentityParts requires an origin to EXIST, both call sites
+  // take only `.uuid`, and `identity.origin` is never read again — so the value
+  // is a scope, not a claim to be checked against the browser.
+  `What this gate checks is PRESENCE, not agreement: the identity needs SOME origin to be ` +
+  `scoped to, and nothing ever compares it against the browser's — so the value does not have ` +
+  `to match where the panel is served from. ` +
+  // Two causes, named separately (codex review, P1). The predicate that selects this
+  // remedy is generic, and a blanket "set COMFYUI_URL" sends a direct/LAN/pairing or
+  // non-browser caller to a change that CANNOT add a handshake origin, leaving them
+  // fenced with nothing left to try.
+  `On a RELAY connection the origin is derived from COMFYUI_URL, so an unset or unparseable ` +
+  `COMFYUI_URL is the usual cause and setting it to any valid URL supplies one; you do not have ` +
+  `to leave the relay backend, which has supplied its own origin since 0.50.67. ` +
+  `On any other path the connection never presented an Origin header at all — a non-browser ` +
+  `client, or a proxy that strips it — and what fixes that is reaching the orchestrator from the ` +
+  `browser panel itself. ` +
+  `Refreshing the tab will not change either case. Reads and non-graph tools keep working ` +
+  `meanwhile — they do not need the fence.`;
+
 export function identityReason(
   tabId: string,
   origin: string | undefined,
@@ -68,10 +105,9 @@ export function identityReason(
     // reader to change a backend that is no longer the reason (#1077).
     return (
       `this tab's connection carries no server-observed Origin, and the workflow identity is ` +
-      `bound to one — so the fence cannot be adopted for it. Refreshing the tab will not ` +
-      `change it. This means the connection reached the orchestrator by a path that neither ` +
-      `observed nor was told the panel's origin; if COMFYUI_URL is unset or unparseable for ` +
-      `this session, setting it to the URL the panel is served from is what supplies it.`
+      `bound to one — so the fence cannot be adopted for it. This means the connection reached ` +
+      `the orchestrator by a path that neither observed nor was told the panel's origin. ` +
+      NO_ORIGIN_REMEDY
     );
   }
   // #1255 — this used to end "a malformed uuid, or one bound to a different

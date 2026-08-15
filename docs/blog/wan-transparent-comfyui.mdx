@@ -10,6 +10,7 @@ keywords:
   - BiRefNet ComfyUI RMBG
   - animated VTuber overlay
   - transparent WebP GIF AI
+verified: 2026-08-14
 ---
 
 _by [artokun](https://github.com/artokun) · June 16, 2026 · wan · video · ComfyUI · model highlight_
@@ -66,6 +67,26 @@ repeatable little factory for living character sprites.
 > experts work, and see [WAN Animate](./wan-animate-comfyui) for
 > motion-transfer character animation.
 
+## Licensing
+
+Two different licenses meet in this pipeline, and only one of them is stated by the
+repo the pack downloads from:
+
+- **WAN 2.2** (the video model doing the work) is **Apache 2.0** — commercial use
+  included, no revenue threshold. Confirmed on
+  [Wan-AI/Wan2.2-T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B). The GGUF
+  builds this pack pulls are quantizations of those weights, redistributed via a
+  community mirror.
+- **BiRefNet** (the matting model that produces the alpha channel) is **MIT**
+  upstream at
+  [ZhengPeng7/BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet). Note that the
+  mirror the pack fetches from, `1038lab/BiRefNet`, **declares no license of its
+  own** — it has no model card. If licensing provenance matters for your use, pull
+  the weights from the upstream repo instead of relying on the mirror.
+
+Neither is a blocker for commercial work, but "the mirror doesn't say" is a real
+answer, not a shrug — treat the upstream repo as the authority.
+
 ## System & VRAM requirements
 
 This is a *video* workflow, so it's heavier than an image pack — but the GGUF
@@ -114,7 +135,7 @@ drives both an MCP-native install and the generated double-click script:
 apply_manifest --path packs/wan-transparent/manifest.yaml
 
 # or run the generated installer from your ComfyUI root
-WAN2_2-ULTRA-MODELS-NODES_INSTALL.bat
+packs\wan-transparent\install-windows.bat   # Linux/RunPod: install-runpod.sh
 ```
 
 Then load `packs/wan-transparent/workflow.json`. On first run, the
@@ -255,7 +276,7 @@ use the output. SillyTavern is just the cleanest fit.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`wan-transparent` pack** — custom nodes + the WAN 2.2 I2V subset + the BiRefNet matting model land in the right folders, validated.
 3. Open the [Panel](../panel) and let the panel's agent swap input images, tweak motion prompts, and batch out a full expression set for you.
 

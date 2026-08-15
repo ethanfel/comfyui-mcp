@@ -169,7 +169,7 @@ const PANEL_BASELINE_URL = new URL("../../docs/design/panel-surface.txt", import
  * Sorted rather than in registration order: unlike tools/list, the panel surface has
  * no observable ordering, so sorting keeps the diff readable as names are added.
  */
-export const PANEL_BASELINE_SHA256 = "581d56282cc1a9154dd68e78c5607f249b5345261b8b5c3bc07b3fc4b412445d";
+export const PANEL_BASELINE_SHA256 = "b5626775907283aee6e94e408001d4fc6cd8618afac5cb9fecc1a4d17403b8d8";
 
 /** Lazy for the same reason as the core baseline — see readBaseline(). */
 export function panelRetirementBaseline(): readonly string[] {
@@ -1069,7 +1069,7 @@ export const DEAD_NAMES: readonly DeadName[] = [
     replacement: 'get_defaults (action:"get_ui")',
     allowedIn: [
       {
-        path: "docs/design/comfyui-settings-tools.md",
+        path: "design/comfyui-settings-tools.md",
         context: "The read tool shipped as `get_comfyui_settings`",
         why: "The dated design spec for the PR that BUILT these two tools. Its superseded banner records the name each tool shipped under and maps it to today's action — the same mapping-away-from-the-name shape as the docs/using-tools.mdx migration table, never an instruction to call it. The banner's two mentions are on separate lines so each is a single occurrence bound to its own context.",
       },
@@ -1081,7 +1081,7 @@ export const DEAD_NAMES: readonly DeadName[] = [
     replacement: 'get_defaults (action:"set_ui")',
     allowedIn: [
       {
-        path: "docs/design/comfyui-settings-tools.md",
+        path: "design/comfyui-settings-tools.md",
         context: "The write tool shipped as `set_comfyui_setting`",
         why: "Second line of the same superseded banner — see the get_comfyui_settings entry above.",
       },
@@ -1783,6 +1783,23 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "generate_audio",
     since: "0.50.0",
     replacement: 'generate_image (action:"audio")',
+    allowedIn: [
+      {
+        path: "src/__tests__/services/nested-seed-without-phantom.test.ts",
+        context: "//   generate_audio    true       \"default\"",
+        why: "NOT our retired tool — a homonym in a different namespace. This is a WIDGET name on a third-party ComfyUI node (TongzeArkReferenceToVideo), quoted from #1334's measured wrong output to record which value landed in which slot. The gate cannot know the namespace, so the collision is declared here rather than worked around: renaming the widget would make the fixture stop reproducing the reporter's row, which is the only thing that makes the regression provable. Pinned to the measured-output line because that is the part that must not be paraphrased.",
+      },
+      {
+        path: "src/__tests__/services/nested-seed-without-phantom.test.ts",
+        context: "generate_audio: [\"BOOLEAN\", { default: true }],",
+        why: "The same third-party node's object_info spec, reproduced verbatim so the nested widget ORDER matches the reporter's. Order is the entire subject of #1334 — a shifted slot is the defect — so the fixture must carry their names in their positions, not stand-ins.",
+      },
+      {
+        path: "src/__tests__/services/nested-seed-without-phantom.test.ts",
+        context: "expect(inputs[\"model.generate_audio\"]).toBe(true);",
+        why: "The assertion on that same widget's converted value. It reads `model.generate_audio` because that is the dotted key the converter emits for the nested leaf; asserting on a renamed key would assert on something the reporter's workflow does not contain.",
+      },
+    ],
   },
   {
     name: "generate_video",
@@ -1893,7 +1910,11 @@ export const DEAD_NAMES: readonly DeadName[] = [
       },
       {
         path: "docs/tools/workflow-authoring.mdx",
-        context: "ace_step_15, stable_audio_3, remove_background, ltx_video). Pure local generation",
+        // Trimmed to the template-key run itself. It used to carry the trailing prose
+        // ("). Pure local generation"), which broke the moment the description stopped
+        // hand-listing four templates and started interpolating all ten from
+        // TEMPLATE_NAMES — an exception keyed to wording that is not the part being excused.
+        context: "stable_audio_3, remove_background, ltx_video",
         why: "GENERATED from create_workflow's description, which lists the template keys above. Fixing it at the source would mean renaming the template.",
       },
       {
@@ -2151,6 +2172,37 @@ export function retiredToolMessage(name: string): string | undefined {
  * expression. Two copies of a hash rule drift, and a handshake that compares a
  * drifted hash reports a mismatch that is not real — worse than no check.
  */
+/**
+ * The hash of THIS server's vocabulary — the value the panel handshake compares
+ * against (#236).
+ *
+ * The panel tool names arrive as an argument rather than being imported, and that
+ * is load-bearing: `buildPanelToolDefs` lives in orchestrator/panel-tools.ts, which
+ * imports ui-bridge, which would make importing it here a cycle. Passing them in
+ * keeps this module free of the orchestrator entirely.
+ *
+ * ## Why the ASSEMBLY lives here and not at each call site
+ *
+ * `computeVocabularyHash` hashes whatever it is handed; deciding WHAT to hand it —
+ * core names, panel names SORTED, dead names — is a second rule, and it was
+ * previously written out only in scripts/export-vocabulary.mts. A runtime check
+ * that assembled its own copy would agree with the artefact right up until one of
+ * the two changed, and then report a mismatch that is not real. The doc on
+ * `computeVocabularyHash` says two copies of the hash rule must not exist; this is
+ * the same argument applied to its input, which is just as capable of drifting.
+ *
+ * So the exporter calls this too, and `vocabulary-handshake.test.ts` asserts the
+ * value it produces from the live panel defs equals the artefact's own
+ * `vocabularyHash` — the only check that can actually catch drift between them.
+ */
+export function assembleVocabularyHash(panelToolNames: readonly string[]): string {
+  return computeVocabularyHash({
+    core: [...TOOL_NAMES],
+    panel: [...panelToolNames].sort(),
+    dead: DEAD_NAMES.map((d) => d.name),
+  });
+}
+
 export function computeVocabularyHash(input: {
   core: readonly string[];
   panel: readonly string[];

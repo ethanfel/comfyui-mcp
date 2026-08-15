@@ -61,8 +61,10 @@ ws://<desktop-machine-ip>:9182/?token=<PAIR_TOKEN>
   (always-on pairing) or **minted per session** and handed out through the
   panel's QR / pair flow. Your host obtains it the same way the mobile app does:
   the user pairs it once.
-- Bound to the LAN only. There is no built-in public exposure — if a user wants
-  remote reach they front it with their own tunnel, and the token still gates it.
+- **LAN-bound by default**, but public exposure is built in when the user asks for
+  it: the panel's pair modal offers an **Internet** mode that opens an encrypted
+  cloudflared quick tunnel, and enterprises can route it through a self-hosted
+  relay (`COMFYUI_MCP_TUNNEL_BACKEND=relay`). The token gates it either way.
 
 ## Message shapes
 

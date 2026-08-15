@@ -5,8 +5,9 @@ import { homedir, platform } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve as pathResolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import { getSystemStats } from "../comfyui/client.js";
-import { resolveLiveInterpreter } from "./live-interpreter.js";
+import { observeLiveServerProcess, resolveLiveInterpreter } from "./live-interpreter.js";
 import { logger } from "../utils/logger.js";
 import { ValidationError } from "../utils/errors.js";
 
@@ -375,7 +376,9 @@ export async function getWorkspace(): Promise<WorkspaceInfo> {
   let source: WorkspaceInfo["workspace_source"];
   if (config.comfyuiPath) {
     // config.comfyuiPath is COMFYUI_PATH env or auto-detection
-    source = process.env.COMFYUI_PATH ? "env" : "auto-detected";
+    // #1512 — normalized so a whitespace-only value is not reported as "env"
+    // while config.comfyuiPath actually came from auto-detection.
+    source = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path ? "env" : "auto-detected";
   } else if (cfg.defaultWorkspace) {
     source = "default-config";
   } else {
@@ -641,8 +644,29 @@ export interface LiveServerRootResolution {
    *  argv named a relative script. Present even when the root stays unresolved —
    *  callers use it to anchor a corroborated fallback and to explain a refusal. */
   relDir?: string;
-  /** The interpreter the OS reports for the process on our port, when observed. */
+  /** The binary the OS reports for the process on our port, when observed — its
+   *  interpreter (argv[0]), or the OS's own image record when argv[0] was written
+   *  relatively and names no probeable file (#1374). Reported so a refusal can name
+   *  what WAS seen; it is the anchor input, not a runnable interpreter. */
   observedPython?: string;
+  /**
+   * The directory `relDir` was resolved AGAINST to produce `root` — i.e. the
+   * working directory the running server must have had for its relative
+   * `main.py` to name that install (`observed-process` only).
+   *
+   * This is the WINDOWS equivalent of `/proc/<pid>/cwd` (#535). `resolveLiveProcessCwd`
+   * returns undefined on Windows, so the restart path's live-cwd anchor could never
+   * fire there and a relative launch script was refused outright. Recovering the
+   * anchor directory here reconstructs the same fact from the OS process
+   * observation instead of from procfs.
+   *
+   * Only meaningful with `observedPid`: it describes THAT process, and a caller
+   * about to stop a server must confirm it is the same one before trusting it.
+   */
+  anchorDir?: string;
+  /** The PID the observation was made against, so a caller can confirm the
+   *  anchor describes the very process it is acting on (#535). */
+  observedPid?: number;
 }
 
 /** How far up from the observed interpreter we look for the live install root.
@@ -715,14 +739,45 @@ function interpreterBelongsToInstall(python: string, base: string, root: string)
  * interpreter is positioned inside that install (interpreterBelongsToInstall), so
  * an unrelated `main.py` further up the filesystem can never be adopted. Returns
  * undefined when nothing on the bounded path qualifies.
+ *
+ * Returns the accepted install root together with the ancestor it was resolved
+ * AGAINST. That ancestor is the working directory the server must have had for its
+ * relative `main.py` to name this install — the fact `/proc/<pid>/cwd` supplies on
+ * Linux and nothing supplied on Windows (#535). It falls out of the walk for free;
+ * discarding it was why the restart path had no Windows anchor to use.
  */
-function anchorRelDirOnInterpreter(python: string, relDir: string): string | undefined {
+/**
+ * KNOWN GAP, measured and filed rather than implied — this anchors on where the
+ * BINARY lives, which is not proof of where the SCRIPT was resolved from.
+ *
+ * Review raised it against the #1374 image fallback: with a stale portable
+ * bundle's python on PATH, `cd D:\live && python ComfyUI\main.py` reports the
+ * STALE interpreter while the server runs the LIVE script, and the bundle-shape
+ * containment happily accepts `C:\stale\ComfyUI` — the #369 failure mode.
+ *
+ * Measured on this branch, both readings behave IDENTICALLY: an absolute argv[0]
+ * naming that same stale python anchors the stale root exactly as the image does.
+ * So the image fallback does not introduce this; it is a property of anchoring on
+ * the interpreter at all, and it has been reachable via argv[0] since that tier
+ * shipped. What the fallback changes is how many launch shapes reach the tier.
+ *
+ * Not fixed here because the fix is not local to this function: it needs a
+ * corroboration the server itself can supply (the models dir it actually reads),
+ * which is a different change from "make the relative-argv case resolvable".
+ * Tracked separately; do NOT paper over it by tightening the containment test,
+ * which would only shrink the set of installs that work without making any
+ * remaining answer more trustworthy.
+ */
+function anchorRelDirOnInterpreter(
+  python: string,
+  relDir: string,
+): { root: string; anchorDir: string } | undefined {
   if (!isAbsolute(python)) return undefined;
   let dir = dirname(pathResolve(python));
   for (let i = 0; i < OBSERVED_ROOT_MAX_ASCENT; i++) {
     const candidate = pathResolve(dir, relDir);
     if (hasMainPy(candidate) && interpreterBelongsToInstall(python, dir, candidate)) {
-      return candidate;
+      return { root: candidate, anchorDir: dir };
     }
     const parent = dirname(dir);
     if (parent === dir) break;
@@ -732,9 +787,21 @@ function anchorRelDirOnInterpreter(python: string, relDir: string): string | und
 }
 
 /**
- * The interpreter the OS reports for the ComfyUI on our port.
+ * The BINARY the OS reports for the ComfyUI on our port — to anchor its install
+ * root on, which is the only thing this file does with it.
  *
- * DELIBERATELY NOT CACHED. `resolveLiveInterpreter` shells out (netstat/WMI on
+ * Prefers the interpreter (argv[0] of the running process). Falls back to the OS's
+ * own image record when argv[0] is relative or bare (#1374): the stock Windows
+ * portable bundle launches `.\python_embeded\python.exe`, and an activated venv
+ * launches a bare `python`, so on those installs argv[0] names no file to anchor on
+ * — the tier built for the relative-`main.py` shape then failed closed on the very
+ * layouts it exists to serve, and the download bounced to ComfyUI-Manager (a hard
+ * failure wherever Manager is not loaded). The fallback is weaker on purpose: for a
+ * venv Windows reports the BASE interpreter, which sits OUTSIDE the install and is
+ * rejected by anchorRelDirOnInterpreter's containment test — so it can only ever add
+ * a resolution, never move one.
+ *
+ * DELIBERATELY NOT CACHED. `observeLiveServerProcess` shells out (netstat/WMI on
  * Windows, lsof on POSIX), so memoizing it is tempting — but this answer decides
  * WHERE A DOWNLOAD IS WRITTEN. A cache keyed on port+argv cannot tell a restarted
  * server apart from the one it replaced (a relaunch of ComfyUI reports the same
@@ -743,7 +810,9 @@ function anchorRelDirOnInterpreter(python: string, relDir: string): string | und
  * #369 is about (codex gate, round 1). Each resolution re-observes the process
  * that is live right now; correctness here outranks a few hundred milliseconds.
  */
-function observeLivePython(argv: string[] | undefined): string | undefined {
+function observeLivePython(
+  argv: string[] | undefined,
+): { python: string; pid: number } | undefined {
   let statsHost: string | undefined;
   try {
     statsHost = new URL(getComfyUIBaseUrl()).hostname;
@@ -751,12 +820,17 @@ function observeLivePython(argv: string[] | undefined): string | undefined {
     /* unparseable target → no host filter */
   }
   try {
-    return resolveLiveInterpreter({
+    const live = observeLiveServerProcess({
       port: config.resolvedPort,
       host: statsHost,
       remote: false,
       serverArgv: argv,
-    })?.python;
+    });
+    const binary = live?.python ?? live?.image;
+    // The PID travels with the interpreter (#535). A caller that is about to STOP
+    // a process must be able to confirm the anchor describes that very process
+    // and not some other ComfyUI — an interpreter path alone cannot prove it.
+    return live && binary ? { python: binary, pid: live.pid } : undefined;
   } catch {
     return undefined;
   }
@@ -778,10 +852,12 @@ function observeLivePython(argv: string[] | undefined): string | undefined {
  *     both report (`ComfyUI\main.py`), and it is exactly why #369 kept recurring:
  *     with argv unresolvable, the download destination silently fell through to
  *     COMFYUI_PATH — a DIFFERENT, stale install — and the model landed where the
- *     running server never reads. So we ask the OS instead: `resolveLiveInterpreter`
+ *     running server never reads. So we ask the OS instead: `observeLiveServerProcess`
  *     identifies the process listening on our port (correlated against the server's
- *     own argv, so a proxy can't impersonate it) and reports its interpreter; the
- *     relative `main.py` dir is re-anchored on that interpreter's install tree.
+ *     own argv, so a proxy can't impersonate it) and reports the binary it runs — its
+ *     interpreter, or the OS's own image record when the launcher spelled the
+ *     interpreter relatively (#1374); the relative `main.py` dir is re-anchored on
+ *     that binary's install tree.
  *
  * Anything else is `unresolved`. There is deliberately NO layout-guess tier: a
  * COMFYUI_PATH that merely looks plausible is what wrote 4.88 GB into the wrong
@@ -797,6 +873,8 @@ export function resolveLiveServerRoot(
   opts?: {
     /** Test seam / caller-supplied observation, bypassing the process-table probe. */
     observedPython?: string;
+    /** PID the caller-supplied observation belongs to (test seam companion). */
+    observedPid?: number;
     /** Skip the process-table probe entirely (remote server). Defaults to isRemoteMode(). */
     remote?: boolean;
   },
@@ -808,14 +886,26 @@ export function resolveLiveServerRoot(
   if (remote || relDir === undefined) return { source: "unresolved", relDir };
 
   let observedPython = opts?.observedPython;
-  if (!observedPython) observedPython = observeLivePython(argv);
+  let observedPid = opts?.observedPid;
+  if (!observedPython) {
+    const observed = observeLivePython(argv);
+    observedPython = observed?.python;
+    observedPid = observed?.pid;
+  }
   if (!observedPython) return { source: "unresolved", relDir };
 
   const anchored = anchorRelDirOnInterpreter(observedPython, relDir);
   if (anchored) {
-    return { root: anchored, source: "observed-process", relDir, observedPython };
+    return {
+      root: anchored.root,
+      source: "observed-process",
+      relDir,
+      observedPython,
+      observedPid,
+      anchorDir: anchored.anchorDir,
+    };
   }
-  return { source: "unresolved", relDir, observedPython };
+  return { source: "unresolved", relDir, observedPython, observedPid };
 }
 
 /**

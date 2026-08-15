@@ -1,0 +1,147 @@
+---
+title: "설치"
+description: "ComfyUI를 설치하고 MCP 서버에 연결하세요 — 로컬, 원격, 또는 Comfy Cloud."
+icon: "download"
+---
+
+## 1. ComfyUI 설치
+
+<CardGroup cols={2}>
+  <Card title="ComfyUI Desktop" icon="desktop" href="https://www.comfy.org/download">
+    macOS / Windows에서 관리형 설치를 가장 쉽게 마치는 방법입니다.
+  </Card>
+  <Card title="소스에서 설치" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
+    직접 클론해서 수동으로 실행하거나 — [`install_comfyui`](/docs/tools/install-environment) 도구를 사용하세요.
+  </Card>
+</CardGroup>
+
+## 2. MCP 서버 추가
+
+ComfyUI MCP는 npm에 `comfyui-mcp`로 배포되며 `npx`로 실행합니다 — 전역 설치가 필요 없습니다.
+
+<Tabs>
+  <Tab title="로컬 ComfyUI">
+    서버가 로컬 설치와 포트를 자동으로 감지합니다. `~/.claude/settings.json`에 추가하세요:
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="원격 ComfyUI">
+    `--comfyui-url`로 접근 가능한 어떤 인스턴스든 지정할 수 있습니다. HTTP 기반 도구(생성, 대기열,
+    워크플로우, 모델 검색 등)에는 로컬 설치가 필요하지 않습니다. 호스트가 루프백이 아닌 경우 서버는
+    **원격 모드**로 진입해 `COMFYUI_PATH` 자동 감지를 건너뛰므로, 오래된 로컬 설치가 업로드를
+    조용히 가로채는 일을 막습니다.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp", "--comfyui-url", "https://my-comfy.example.com"]
+        }
+      }
+    }
+    ```
+
+    <Note>
+      대부분의 도구는 원격 ComfyUI에서도 문제없이 동작합니다 — ComfyUI-Manager HTTP API를 통한
+      커스텀 노드 설치도 포함됩니다. 진짜로 로컬 설치 경로가 필요한 것은 ComfyUI 자체 설치,
+      comfy-cli 기반 작업, 로그 읽기, 모델 파일 삭제이며, 이들은 원격 모드에서 명확한 오류를
+      반환합니다. [작동 방식](/docs/concepts)을 참고하세요.
+    </Note>
+  </Tab>
+  <Tab title="Comfy Cloud">
+    `COMFYUI_API_KEY`를 설정해 [Comfy Cloud](https://cloud.comfy.org)를 대상으로 지정하세요.
+    서버는 **클라우드 모드**로 진입합니다: HTTP 기본 동작은 `X-API-Key` 인증과 함께
+    `cloud.comfy.org`를 통해 라우팅됩니다. WebSocket에 종속된 도구와 로컬 파일시스템/프로세스
+    도구는 명확한 `CLOUD_UNSUPPORTED` 오류를 던집니다.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "COMFYUI_API_KEY": "your-comfy-cloud-api-key"
+          }
+        }
+      }
+    }
+    ```
+
+    <Note>
+      클라우드 모드는 로컬 `COMFYUI_PATH` 자동 감지를 건너뛰고 클라우드 자체의 모델 라이브러리를
+      사용합니다. 로컬 프로세스나 파일시스템에 접근해야 하는 도구는 `CLOUD_UNSUPPORTED`를 던지고,
+      나머지는 오류 대신 완화된 형태로 동작합니다 — `list_local_models`는 빈 목록을 반환하고,
+      `apply_manifest`는 전체를 오류 처리하는 대신 항목별로 `skipped`/`failed`를 보고합니다.
+      전체 기능 대응표는 [설정](/docs/configuration#deployment-modes) 페이지를 참고하세요.
+    </Note>
+    <Note>
+      **클라우드 전용이신가요?** [Comfy-Org의 Comfy Cloud MCP](https://docs.comfy.org/agent-tools)(퍼블릭 베타)가
+      표준적인 선택입니다 — [로컬 vs. Comfy Cloud](/docs/local-vs-comfy-cloud)를 참고하세요. 로컬 /
+      원격 / 클라우드를 하나의 MCP로 아우르고 싶거나 지금 당장 클라우드 지원이 필요하다면
+      `comfyui-mcp`의 클라우드 모드를 사용하세요.
+    </Note>
+  </Tab>
+</Tabs>
+
+그런 다음 Claude Code에서 `/mcp`를 실행해 연결하세요.
+
+## 3. 패널 오케스트레이터 시작하기
+
+**사이드바 패널**을 사용할 때만 필요합니다. Claude Code나 다른 MCP 클라이언트로 ComfyUI를
+다루고 있다면 이 단계는 건너뛰어도 됩니다 — 그 경로는 위에서 설정한 MCP 서버를 사용합니다.
+
+패널은 순수 프런트엔드 ComfyUI 확장 기능이라 사용자의 컴퓨터에서 프로세스를 직접 시작할 수
+없습니다. 그래서 **오케스트레이터를 직접 시작**해야 하며, 패널은 여기에 연결됩니다.
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+이는 `--panel-orchestrator`의 축약형입니다. 브라우저가 열려 있는 ComfyUI를 자동으로 대상으로
+지정하고, `ws://127.0.0.1:9180`에서 브리지를 제공하며(`COMFYUI_MCP_BRIDGE_PORT`로 재정의
+가능), 패널을 사용하는 동안 계속 실행 중이어야 합니다. 그런 다음 **에이전트** 탭을 열어
+제공자를 고르고 **연결**을 클릭하세요.
+
+**원격** ComfyUI를 다루시나요 — 클라우드 파드나 LAN 상의 다른 컴퓨터인가요? 원격 컴퓨터가
+아니라 **사용자 자신의 컴퓨터**에서 같은 명령을 실행하고 URL을 전달하세요:
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+제공자 로그인과 에이전트는 로컬에 남으며, 원격 호스트에는 아무것도 설치되지 않습니다. 터널
+관련 세부사항은 [클라우드 배포](/docs/cloud-deployment)를 참고하세요.
+
+## 4. (선택) 토큰
+
+일부 도구는 API 토큰을 사용합니다. 서버의 `env` 블록에 설정하세요([설정](/docs/configuration) 참고):
+
+- `CIVITAI_API_TOKEN` — 제한된 CivitAI 다운로드
+- `HUGGINGFACE_TOKEN` — 더 높은 HuggingFace 속도 제한
+- `GITHUB_TOKEN` — 스킬 생성 / 노드 메타데이터 조회
+- `COMFY_API_KEY` — 호스팅된 comfy.org API 노드
+
+## 로컬 개발
+
+이 프로젝트는 `npm link`를 사용하므로 `npx comfyui-mcp`가 로컬 빌드를 가리키게 됩니다:
+
+```bash
+git clone https://github.com/artokun/comfyui-mcp
+cd comfyui-mcp
+npm install
+npm run build
+npm link
+```
+
+코드를 변경한 뒤에는 `npm run build`를 실행하고 `/mcp`로 다시 연결하세요.

@@ -1,0 +1,93 @@
+---
+title: "ComfyUI MCP"
+description: "ComfyUI için yerel öncelikli, ajanlar için tasarlanmış kontrol düzlemi — doğal dille görsel, video ve ses üreten, iş akışları oluşturup çalıştıran, modelleri ve özel düğümleri yöneten bir MCP sunucusu + Claude Code eklentisi. Yerel, uzak ya da Comfy Cloud."
+icon: "house"
+---
+
+**ComfyUI MCP**, [ComfyUI](https://github.com/comfyanonymous/ComfyUI) için **yerel öncelikli,
+ajanlar için tasarlanmış bir kontrol düzlemidir** — bir [MCP](https://modelcontextprotocol.io)
+sunucusu ve Claude Code eklentisi. Yapay zekâ asistanınızı çalışan bir ComfyUI örneğine —
+**yerel**, **uzak** ya da **[Comfy Cloud](https://cloud.comfy.org)** — bağlar; böylece görsel,
+video ve ses üretebilir, iş akışlarını çalıştırıp oluşturabilir, modelleri ve özel düğümleri
+yönetebilir ve sunucuyu denetleyebilirsiniz — hepsi doğal dille. İnce bir istem-görsel köprüsü
+değil; ComfyUI'yi sizin yerinize işleten tam bir ajan.
+
+<Frame caption="Ajan paneli ComfyUI'yi baştan sona sürüyor — yerelde neyin kurulu olduğunu okuyor, grafiği bağlıyor, VRAM'i boşaltıyor ve işlemeyi çalıştırıyor">
+  <video
+    autoPlay
+    muted
+    loop
+    playsInline
+    controls
+    poster="../images/demo-poster.jpg"
+    className="w-full rounded-xl"
+    src="../videos/comfyui-mcp-demo.mp4"
+  />
+</Frame>
+
+<CardGroup cols={2}>
+  <Card title="Hızlı başlangıç" icon="rocket" href="/docs/tr/quickstart">
+    Sunucuyu Claude Code'a ekleyin ve ilk görselinizi ~2 dakikada üretin.
+  </Card>
+  <Card title="Araç referansı" icon="wrench" href="/docs/tools/image-generation">
+    37 araç, canlı şemalarından otomatik belgelendi.
+  </Card>
+  <Card title="Kurulum" icon="download" href="/docs/tr/installation">
+    ComfyUI'yi kurun ve MCP sunucusunu bağlayın (yerel ya da uzak).
+  </Card>
+  <Card title="Yapılandırma" icon="gear" href="/docs/configuration">
+    Ortam değişkenleri, taşıma katmanları, token'lar ve uzak hedefleme.
+  </Card>
+</CardGroup>
+
+## Neler yapabilirsiniz
+
+<CardGroup cols={3}>
+  <Card title="Üret" icon="image">
+    `generate_image` ile metinden görsele, ayrıca ControlNet ve IP-Adapter koşullandırması.
+  </Card>
+  <Card title="İş akışı oluştur" icon="pen-ruler">
+    Şablonlardan oluşturun; değiştirin, doğrulayın, görselleştirin ve derli toplu bir DSL ile
+    gidiş-dönüş yapın.
+  </Card>
+  <Card title="Modelleri yönet" icon="box">
+    HuggingFace/CivitAI'de arayın; modelleri indirin, listeleyin ve kaldırın.
+  </Card>
+  <Card title="Özel düğümler" icon="puzzle">
+    ComfyUI-Manager üzerinden düğüm paketlerini kurun, güncelleyin, anlık görüntüsünü alın ve
+    bisect ile ayıklayın.
+  </Card>
+  <Card title="Kur ve bakımını yap" icon="terminal">
+    ComfyUI'yi kurun/güncelleyin, ortamı inceleyin, sunucuyu başlatın/durdurun.
+  </Card>
+  <Card title="Yerel, uzak ya da bulut" icon="globe">
+    Yerel bir kurulumu otomatik algılar, `--comfyui-url` ile uzak bir sunucuyu hedefler ya da
+    `COMFYUI_API_KEY` ile [Comfy Cloud](https://cloud.comfy.org) ile konuşur — yerel bir ComfyUI
+    gerekmez.
+  </Card>
+</CardGroup>
+
+<Note>
+  **macOS**, **Linux** ve **Windows** üzerinde çalışır; yerel bir ComfyUI kurulumunu ve portunu
+  otomatik algılar. Kaynak kod ve sorunlar [GitHub](https://github.com/artokun/comfyui-mcp)
+  üzerinde.
+</Note>
+
+## Kapsam: yerel, uzak ya da Comfy Cloud
+
+`comfyui-mcp`, **yerel** ve **uzak** ComfyUI için topluluk MCP'sidir — birincil hedefi budur
+(Mac/Linux/Windows kurulumları, RunPod, VPS, LAN vb.).
+
+**Comfy Cloud** kullanıcıları için Comfy-Org, Comfy ekibi tarafından sürdürülen ve Comfy Cloud üzerinde çalışan [resmî ajan araçlarını](https://docs.comfy.org/agent-tools) sunuyor — Comfy Cloud MCP (herkese açık beta) ve Comfy In-App Agent (özel alfa). GPU'nuz yoksa ya da hiç kurulum yapmak istemiyorsanız onu kullanın ([yan yana karşılaştırma](/docs/local-vs-comfy-cloud)). `comfyui-mcp` ayrıca bir topluluk bulut kipi (`COMFYUI_API_KEY`) içerir; böylece tek bir MCP, tek bir yapılandırmadan üç dağıtım biçiminin hepsini hedefleyebilir — çalışma düzeninize hangisi uyuyorsa onu seçin.
+
+---
+
+## Bakımcı
+
+[**@artokun**](https://github.com/artokun) tarafından geliştirildi ve sürdürülüyor —
+[Comfy-Org/ComfyUI_frontend](https://github.com/Comfy-Org/ComfyUI_frontend/pulls?q=is%3Apr+author%3Aartokun)
+(v2 grafik işleyicisi / alt grafik işleme / yükseltilmiş widget'lar) ve
+[ComfyUI Python çekirdeği](https://github.com/Comfy-Org/ComfyUI/pulls?q=is%3Apr+author%3Aartokun)
+projelerine düzenli katkı verir.
+
+**Comfy-Org ekibi** (ya da ComfyUI ekosisteminde işe alım yapan herkes): [art.longbottom.jr@gmail.com](mailto:art.longbottom.jr@gmail.com).

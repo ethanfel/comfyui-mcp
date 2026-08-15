@@ -249,8 +249,9 @@ The effort/model picker is **per-provider**. A chosen effort survives a
 provider switch by mapping to the nearest valid level for the target backend
 (the panel and the orchestrator backends do the same mapping):
 
-- **Claude:** `low` · `medium` · `high` · `max`
-- **ChatGPT (Codex):** `none` · `minimal` · `low` · `medium` · `high` · `xhigh`
+- **Claude:** `low` · `medium` · `high` · `xhigh` · `max`
+- **ChatGPT (Codex):** `none` · `minimal` · `low` · `medium` · `high` · `xhigh` · `max` · `ultra`
+  (`max` / `ultra` on GPT-5.6-class models)
 - **Gemini / Ollama:** no user-facing effort scale — the selector is hidden.
 
 ## Knowledge & cost parity
@@ -268,4 +269,4 @@ local-GPU-vs-paid-API guardrail (`action: "check_runtime"`) and one-shot
 - [Local LLMs & other agents](./local-llms) — the 6-tool router, model requirements, Hermes/OpenClaw/Copilot setup
 - [LLM Arena](./arena) — score YOUR model on real ComfyUI tasks
 - [Skills, Packs & Runtime Cost](./tools/skills-knowledge) — the parity + cost tools
-- Design doc: [`docs/design/agent-backend-injection.md`](https://github.com/artokun/comfyui-mcp/blob/main/docs/design/agent-backend-injection.md)
+- Design doc: [`design/agent-backend-injection.md`](https://github.com/artokun/comfyui-mcp/blob/main/design/agent-backend-injection.md)

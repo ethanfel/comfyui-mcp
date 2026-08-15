@@ -493,6 +493,42 @@ function autogrowParentPath(
  * no entry in def.input), so nested controlled seeds skip their phantom
  * "fixed"/"randomize" slot too instead of shifting every following widget.
  */
+/**
+ * #1334 — the four values a control_after_generate slot can hold.
+ *
+ * The phantom is a frontend-owned combo, not a free field: its serialized value is
+ * always one of these. So the slot's OWN content is the evidence that it is a phantom,
+ * and it is stronger evidence than any inference from the name and type.
+ */
+const CONTROL_AFTER_GENERATE_MODES = new Set(["fixed", "randomize", "increment", "decrement"]);
+
+/**
+ * Is the value sitting in the next serialized slot actually a control mode?
+ *
+ * `specHasControlAfterGenerate` INFERS a phantom from "INT named seed" — which is right
+ * for the frontend's auto-augmented top-level seeds, and wrong for a V3 dynamic-combo
+ * nested `seed` that has no such widget. #1334: `TongzeArkReferenceToVideo` on frontend
+ * 1.48.7 has a nested `seed` with no phantom, the converter skipped the real next value
+ * anyway, and every following widget shifted by one: the watermark flag took the audio
+ * flag's value, the audio flag took `service_tier`'s, and a 172800-second expiry landed
+ * in `priority`. Silently wrong output, from a graph that was correct on disk and
+ * correct in the live panel.
+ *
+ * Checking the value closes that gap without giving up the inference: when a phantom is
+ * really there the slot holds one of four known strings, and when it is not the slot
+ * holds the next real widget's value.
+ *
+ * RESIDUAL RISK, stated rather than hidden: a genuine widget whose value is literally
+ * the string "fixed"/"randomize"/… in exactly that position would still be eaten. That
+ * is far narrower than what it replaces (every nested seed without a phantom, always),
+ * and it fails the same way the old code did rather than a new way.
+ */
+function nextValueIsControlMode(values: readonly unknown[], idx: number): boolean {
+  if (idx >= values.length) return false;
+  const v = values[idx];
+  return typeof v === "string" && CONTROL_AFTER_GENERATE_MODES.has(v);
+}
+
 function specHasControlAfterGenerate(name: string, spec: unknown): boolean {
   if (!Array.isArray(spec)) return false;
   if ((spec[1] as Record<string, unknown> | undefined)?.control_after_generate === true)
@@ -541,7 +577,17 @@ function getOrderedInputNames(def: ComfyUINodeDef): string[] {
 
 // ── De-virtualization (Get/Set/Reroute) pre-pass ────────────────────────────
 
-const WIRING_VIRTUAL_TYPES = new Set([
+/**
+ * The KJNodes-style Get/Set BUS types. Frontend-only: the pre-pass below rewrites
+ * each consumer's link straight to the real upstream source, so none of these ever
+ * appears in a queued prompt.
+ *
+ * EXPORTED (#1400) for the same reason `NON_EXECUTING_NODE_TYPES` is: the runtime
+ * classifier needs to know which types never reach the backend, and a second copy
+ * of that knowledge is how two lists drift. This one is already load-bearing for a
+ * much heavier reason than a verdict — a stale entry here drops links.
+ */
+export const WIRING_VIRTUAL_TYPES: ReadonlySet<string> = new Set([
   "GetNode", "SetNode", "PRO_GetNode", "PRO_SetNode",
   "SetNode_GetNode", "SetNode_SetNode",
 ]);
@@ -2218,6 +2264,50 @@ export function convertApiToUi(
 }
 
 /**
+ * Frontend-only node types that never reach the backend (#1372).
+ *
+ * LiteGraph-native: the ComfyUI frontend registers them, the server's node registry does
+ * not, and they are stripped before a prompt is queued. `panel_add_node`'s own description
+ * says the same — they "legitimately bypass the backend class_type check".
+ *
+ * EXPORTED because a second copy is how two lists drift, and #1372 is what that cost: the
+ * converter knew MarkdownNote does not execute while the runtime classifier called it an
+ * unknown node and refused to say the workflow was free — stopping the paid-API safety
+ * flow to ask a question that already had an answer.
+ */
+export const NON_EXECUTING_NODE_TYPES: ReadonlySet<string> = new Set([
+  "Reroute",
+  "Note",
+  "MarkdownNote",
+  "PrimitiveNode",
+]);
+
+/**
+ * Every type that never reaches the backend — the LiteGraph natives above PLUS the
+ * Get/Set bus virtuals the de-virtualization pre-pass strips (#1400).
+ *
+ * A SEPARATE set from `NON_EXECUTING_NODE_TYPES` because the two answer different
+ * questions, and conflating them would be a silent behaviour change:
+ *
+ *   NON_EXECUTING_NODE_TYPES also drives the converter's own `SKIP_TYPES`. A
+ *     Get/Set node that the pre-pass could NOT resolve (a broken bus, a missing
+ *     Set for a Get) still reaches the main loop, where dedicated logic handles it
+ *     and reports the loss. Adding the bus types there would route those into the
+ *     skip path instead, quietly dropping the diagnostic.
+ *
+ *   FRONTEND_ONLY_NODE_TYPES answers the runtime classifier's question: could this
+ *     class_type be a paid API node the server does not expose? For anything in
+ *     here the answer is no, whether or not this particular graph's bus resolved.
+ *
+ * Callers that mean "does not execute anywhere" want THIS one; callers that mean
+ * "the converter emits nothing for it" want the narrower one above.
+ */
+export const FRONTEND_ONLY_NODE_TYPES: ReadonlySet<string> = new Set([
+  ...NON_EXECUTING_NODE_TYPES,
+  ...WIRING_VIRTUAL_TYPES,
+]);
+
+/**
  * Convert a ComfyUI UI-format workflow to API format.
  * Requires objectInfo from /object_info to map widgets_values to named inputs.
  */
@@ -2258,13 +2348,21 @@ export function convertUiToApi(
   }
 
   // Node types that are purely visual/internal and have no API equivalent
-  const SKIP_TYPES = new Set(["Reroute", "Note", "PrimitiveNode", "MarkdownNote"]);
+  const SKIP_TYPES = NON_EXECUTING_NODE_TYPES;
 
-  // Get/Set node types that need special handling (not in object_info)
-  const GET_SET_TYPES = new Set([
-    "GetNode", "SetNode", "PRO_GetNode", "PRO_SetNode",
-    "SetNode_GetNode", "SetNode_SetNode",
-  ]);
+  // Get/Set node types that need special handling (not in object_info). The SAME
+  // set the de-virtualization pre-pass uses — this was a verbatim second copy, and
+  // two lists of third-party type names in one file is precisely the drift the
+  // exported sets exist to prevent (#1400).
+  //
+  // NOT covered by a test, and mutation testing says so: narrowing this back to a
+  // hand-written `new Set(["GetNode", "SetNode"])` kills nothing, because the
+  // pre-pass strips every RESOLVABLE bus before the main loop runs. What reaches
+  // here is only a bus the pre-pass could not resolve (a Get with no matching Set,
+  // a broken chain), and no fixture builds one. Sharing the set is still strictly
+  // better than a second copy — it just cannot be proven from outside, so it is
+  // written down instead of assumed.
+  const GET_SET_TYPES = WIRING_VIRTUAL_TYPES;
 
   const nodesById = new Map(expanded.nodes.map((n) => [n.id, n]));
 
@@ -2630,8 +2728,12 @@ export function convertUiToApi(
       inputs[name] = value;
       widgetIdx++;
 
-      // If this input has control_after_generate, skip the next widgets_values entry
-      if (hasControlAfterGenerate(name, def) && widgetIdx < widgetValues.length) {
+      // If this input has control_after_generate, skip the next widgets_values entry —
+      // but ONLY when that entry actually holds a control mode (#1334). The reporter's
+      // defect was nested, and the same inference runs here, so the same guard applies:
+      // a node whose object_info flags a phantom the saved row does not contain would
+      // shift every following widget in exactly the same way.
+      if (hasControlAfterGenerate(name, def) && nextValueIsControlMode(widgetValues, widgetIdx)) {
         widgetIdx++;
       }
 
@@ -2870,9 +2972,12 @@ export function convertUiToApi(
           // A nested seed-type / control_after_generate leaf carries a phantom
           // "fixed"/"randomize" value right after it (same as top-level seeds), so
           // skip that slot or every following widget shifts by one.
+          // #1334 — and only when the slot actually HOLDS a control mode. A V3
+          // dynamic-combo nested `seed` need not have a phantom at all; consuming the
+          // slot on the name/type inference alone shifted every following widget.
           if (
             specHasControlAfterGenerate(nName, nSpec) &&
-            widgetIdx < widgetValues.length
+            nextValueIsControlMode(widgetValues, widgetIdx)
           ) {
             widgetIdx++;
           }

@@ -742,7 +742,26 @@ export async function getOutputImage(
   filename: string,
   type: "output" | "input" | "temp" = "output",
   subfolder = "",
-  { allowMedia = false }: { allowMedia?: boolean } = {},
+  {
+    allowMedia = false,
+    /**
+     * Accept a `.json` attachment whose bytes actually PARSE as JSON (#1373).
+     *
+     * A ComfyUI input directory legitimately holds workflow `.json` files, and `get_image`
+     * refused to save them: the reporter's server labelled one `video/json`, which is
+     * neither `image/*` nor a sniffable media format.
+     *
+     * NOT AN ADDITION TO THE ACCEPT LIST. I could not reproduce that header — a stock
+     * ComfyUI 0.31.1 here returns `application/json` for the same request, so `video/json`
+     * comes from something in their stack, and the next install will invent a different
+     * one. Accepting the specific string would fix one machine.
+     *
+     * The declared type is a claim about the payload; parsing is a fact about it. So this
+     * follows the rule the media branch above already applies — bytes must be what they
+     * are said to be — and simply asks the question JSON can answer directly.
+     */
+    allowJson = false,
+  }: { allowMedia?: boolean; allowJson?: boolean } = {},
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
   assertSafeViewRef(filename, subfolder);
   const result = await fetchImage(filename, type, subfolder);
@@ -780,19 +799,152 @@ export async function getOutputImage(
     extOk &&
     (mime === "application/octet-stream" ||
       MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
-  if ((!isImage && !isMedia) || result.base64.length === 0) {
+  // A `.json` request whose bytes parse as JSON is accepted whatever the server called
+  // them (#1373). Gated on the REQUESTED extension so this can never widen the image or
+  // media paths, and on a successful parse so the rejection this function exists for is
+  // untouched: an HTML error page, a login redirect or a truncated body does not parse and
+  // is still refused. ComfyUI answers 200 with an error body often enough that this check
+  // is the only thing standing between the caller and a corrupt "image".
+  const jsonRefusal = allowJson && ext === ".json" ? jsonAttachmentRefusal(result.base64) : null;
+  const isJson = allowJson && ext === ".json" && jsonRefusal === null;
+  // WHICH REFUSAL THIS IS decides the code, the message and the remedy — see
+  // `jsonAttachmentRefusal`. Byte length was the first attempt at this discriminator and it
+  // got the error-envelope case backwards: a `/view` that answers `{"error":"not found"}`
+  // is the server reporting an ABSENT FILE, and calling that a content refusal sends the
+  // caller to inspect a payload when the filename is the thing to look at.
+  const contentRejected = jsonRefusal?.kind === "content";
+
+  if ((!isImage && !isMedia && !isJson) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
-      `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
-        `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
-        `The file may not exist in the ComfyUI ${type} directory — ` +
-        `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
-      "IMAGE_NOT_FOUND",
-      { filename, type, subfolder, mimeType: result.mimeType },
+      contentRejected
+        ? // NAME THE ACTUAL REASON (#1373). "The file may not exist" for a body that
+          // arrived and was rejected on its CONTENT sends the caller to re-check a
+          // filename that is perfectly correct — the wrong-cause failure this issue is
+          // about, reproduced by its own fix.
+          `ComfyUI /view returned ${jsonRefusal?.reason}, for "${filename}" (${where}). ` +
+          `Nothing was saved.`
+        : jsonRefusal
+          ? // A MISSING-kind JSON refusal: say what came back AND point at the name, which
+            // is the part the caller can act on.
+            `ComfyUI /view returned ${jsonRefusal.reason}, for "${filename}" (${where}). ` +
+            `Nothing was saved. The file may not exist in the ComfyUI ${type} directory — ` +
+            `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`
+          : `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
+          `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
+          `The file may not exist in the ComfyUI ${type} directory — ` +
+          `check the filename/subfolder (e.g. via get_image (action:"list_outputs") or get_history).`,
+      // THE CODE HAS TO AGREE WITH THE MESSAGE (codex P2). The message names the real
+      // reason, but a caller that branches on the code — which is the whole point of
+      // having one — still read IMAGE_NOT_FOUND and went off to re-check a filename that
+      // was never wrong. That is the same wrong-cause failure as the prose, one layer
+      // down, and it is the layer that automation reads.
+      contentRejected ? "ATTACHMENT_CONTENT_REJECTED" : "IMAGE_NOT_FOUND",
+      {
+        filename,
+        type,
+        subfolder,
+        mimeType: result.mimeType,
+        // The reason, structured, so a caller does not have to parse the sentence.
+        // The reason rides along on BOTH kinds — a caller should not have to parse a
+        // sentence to learn the server sent an error envelope rather than nothing at all.
+        ...(jsonRefusal ? { rejectedBecause: jsonRefusal.reason } : {}),
+      },
     );
   }
 
   return { ...result, filename };
+}
+
+/**
+ * Byte ceiling for the JSON validation (#1373).
+ *
+ * A workflow is tens to hundreds of kilobytes; ComfyUI's own saves are well under a
+ * megabyte. Parsing is the acceptance test, and parsing means decoding the whole payload
+ * into a string and building an object graph from it — so an enormous body would be paid
+ * for twice in memory before anything could reject it. 32 MB is far above any real
+ * workflow and far below a problem.
+ *
+ * Above the ceiling the answer is REFUSE, not accept-unchecked: a `.json` that large is
+ * not the workflow attachment this path exists to save, and accepting it unverified would
+ * hand back exactly the unvalidated payload the surrounding guard is for.
+ */
+const MAX_JSON_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+
+/** Why a `.json` payload is not savable, and which of the two remedies applies. */
+interface JsonRefusal {
+  kind: "missing" | "content";
+  reason: string;
+}
+
+/**
+ * Why a `.json` payload is not savable, or null when it is (#1373).
+ *
+ * Returns a REASON rather than a boolean so the refusal can say what was actually wrong.
+ * Collapsing "40 MB" and "this is an error envelope" into the generic "the file may not
+ * exist in the ComfyUI input directory" sends the caller to check a filename that is
+ * perfectly correct — which is the same wrong-cause failure this whole issue is about.
+ *
+ * WHAT COUNTS AS AN ERROR ENVELOPE (codex). A top-level `error` key alone was calibrated
+ * wrong in both directions: it missed ComfyUI's other shapes (`node_errors`, `detail`) and
+ * it rejected a legitimate workflow that happens to carry a top-level `error` field. The
+ * test is now "carries an error-ish key AND carries none of the markers a workflow always
+ * has" — so an error body is caught whatever it is called, and a real workflow is kept even
+ * if it has an `error` extension of its own.
+ */
+function jsonAttachmentRefusal(base64: string): JsonRefusal | null {
+  // WHY THE KIND EXISTS (codex round 3). "Nothing was saved" is one outcome with two
+  // different remedies, and the remedy is the whole value of the answer:
+  //
+  //   missing — the server says it has no such file (an error envelope, or nothing at
+  //             all). CHECK THE FILENAME. This is what IMAGE_NOT_FOUND means and what
+  //             #385 added it for.
+  //   content — a body arrived and it is not the attachment: an HTML login page from a
+  //             proxy, a truncated stream, something over the ceiling. Checking the
+  //             filename is useless here; the name was right and the payload was wrong.
+  //
+  // Deciding this on emptiness alone got the error-envelope case backwards: a `/view`
+  // answering `{"error":"not found"}` for a file that is genuinely absent is the server
+  // TELLING us it is absent, and routing that to "the payload was unusable" sends the
+  // caller to inspect content instead of the name.
+  if (base64.length === 0) return { kind: "missing", reason: "an empty response" };
+  // Decoded size from the base64 LENGTH, minus padding, so the ceiling costs nothing to
+  // enforce and does not overestimate a padded payload by a byte or two at the boundary.
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  const approxBytes = Math.floor((base64.length * 3) / 4) - padding;
+  if (approxBytes > MAX_JSON_ATTACHMENT_BYTES) {
+    return {
+      kind: "content",
+      reason:
+        `a ${(approxBytes / 1024 ** 2).toFixed(1)} MB JSON body, over the ` +
+        `${MAX_JSON_ATTACHMENT_BYTES / 1024 ** 2} MB ceiling for a workflow attachment — ` +
+        `parsing it to check it would cost that much again in memory, so it was refused unread`,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+  } catch {
+    return { kind: "content", reason: "a body that is not valid JSON" };
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const rec = parsed as Record<string, unknown>;
+    const errorish = ["error", "node_errors", "detail"].filter((k) => k in rec);
+    const workflowMarkers = ["nodes", "links", "last_node_id", "extra", "prompt", "workflow"];
+    const looksLikeAWorkflow = workflowMarkers.some((k) => k in rec);
+    if (errorish.length > 0 && !looksLikeAWorkflow) {
+      return {
+        // MISSING, not content. The server answered the request by saying it could not
+        // serve it; the actionable fact is the name, not the bytes.
+        kind: "missing",
+        reason:
+          `a JSON ERROR body (it carries "${errorish[0]}" and none of the keys a workflow has), ` +
+          `not the attachment you asked for — saving it would write a failure to disk under ` +
+          `the name of the thing that failed`,
+      };
+    }
+  }
+  return null;
 }
 
 /**

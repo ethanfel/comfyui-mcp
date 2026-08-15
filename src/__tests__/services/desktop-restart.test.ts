@@ -6,6 +6,9 @@
 // spawn; no real process/port/network is touched.
 
 import { describe, expect, it, afterEach, beforeEach, vi } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { join } from "node:path";
 
 const hoisted = vi.hoisted(() => ({
   remoteMode: { value: false },
@@ -24,16 +27,36 @@ const hoisted = vi.hoisted(() => ({
   getSystemStats: vi.fn(),
   execSync: vi.fn(() => ""),
   spawn: vi.fn(),
+  comfyuiPath: { value: "/fake/comfy" },
 }));
 
 vi.mock("../../config.js", () => ({
-  config: { resolvedPort: 8188, comfyuiPath: "/fake/comfy", comfyuiBasePath: "" },
+  config: {
+    resolvedPort: 8188,
+    // MUTABLE, so a test can point it at the Desktop layout it wrote (#848). A getter
+    // rather than a fixed string: the module is imported once and the value is read at
+    // call time.
+    get comfyuiPath() {
+      return hoisted.comfyuiPath.value;
+    },
+    comfyuiBasePath: "",
+  },
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
   // #848 instance fence: the argv comparison is only spent while the configured
   // target has not moved. Driven from the fixture so a retarget can be modelled.
   getComfyuiTargetGeneration: () => hoisted.targetGeneration.value,
   isRemoteMode: () => hoisted.remoteMode.value,
 }));
+
+/** A temp HOME holding a real Desktop installations.json for the #848 cases. Real files,
+ *  not a mocked reader: the format belongs to Comfy Desktop, and a hand-built double
+ *  agrees with whatever I believed it was — which was wrong twice. */
+let desktopHome = "";
+vi.mock("node:os", async (orig) => {
+  const real = await orig<typeof import("node:os")>();
+  const home = () => desktopHome || real.homedir();
+  return { ...real, homedir: home, default: { ...real, homedir: home } };
+});
 
 vi.mock("../../comfyui/fetch.js", () => ({
   comfyuiFetch: (url: string, init?: RequestInit) => hoisted.fetchMock(url, init),
@@ -97,6 +120,10 @@ const findCall = (pred: (path: string) => boolean): FetchCall | undefined =>
   (hoisted.fetchMock.mock.calls as FetchCall[]).find(([u]) => pred(pathOf(u)));
 
 beforeEach(() => {
+
+  desktopHome = mkdtempSync(join(tmpdir(), "cmcp-desktop-restart-"));
+
+  hoisted.comfyuiPath.value = "/fake/comfy";
   hoisted.remoteMode.value = false;
   hoisted.targetGeneration.value = 0;
   hoisted.fetchMock.mockReset();
@@ -158,6 +185,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+
+  if (desktopHome) rmSync(desktopHome, { recursive: true, force: true });
+
+  desktopHome = "";
   __portOwnerTestHooks.reset();
   __processControlTestHooks.reset();
 });
@@ -273,6 +304,100 @@ describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]",
     expect(res.message).not.toMatch(/re-exec/i);
     // And it never contradicts the restart that genuinely happened.
     expect(res.message).toContain("ComfyUI is healthy now");
+  });
+
+  it("NAMES the saved Desktop argument that is not in force (#848)", async () => {
+    // The behavioural half of the fix. The UNCHANGED sentence above has to hedge — "if you
+    // were expecting different arguments" — because nothing had opened the user's settings.
+    // #848 is exactly the case where they HAD changed them, so reading Desktop's saved
+    // launchArgs turns that hint into the answer they came for.
+    //
+    // Driven through the real restart rather than by calling the helper: a source-text
+    // wiring assertion passed with the call site's Desktop gate replaced by `false`, which
+    // is a test of spelling, not of reachability.
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    // Desktop's own file, in a temp HOME, recording a flag the running server lacks.
+    const root = join(desktopHome, "ComfyUI-Installs", "ComfyUI");
+    const cfgDir = join(desktopHome, "AppData", "Roaming", "Comfy Desktop");
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(
+      join(cfgDir, "installations.json"),
+      JSON.stringify([
+        {
+          id: "inst-1",
+          name: "My Desktop Install",
+          installPath: root,
+          sourceId: "standalone",
+          launchArgs: "--disable-dynamic-vram",
+        },
+      ]),
+      "utf8",
+    );
+    // …and the configured path is the main.py directory one level down, which is the
+    // layout Desktop's installer actually produces.
+    hoisted.comfyuiPath.value = join(root, "ComfyUI");
+
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") return new Response("", { status: 200 });
+      if (path === "/system_stats") return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    expect(res.message).toContain("--disable-dynamic-vram");
+    expect(res.message).toContain("do NOT contain");
+    expect(res.message).toContain("My Desktop Install");
+    // The remedy is the only thing that applies it, and it is not this tool.
+    expect(res.message).toContain("quit the ComfyUI Desktop app and relaunch");
+  });
+
+  it("says nothing extra when the saved arguments ARE in force (#848)", async () => {
+    // The over-broad direction. A sentence on every healthy Desktop restart would train
+    // the user to skip the one that matters.
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    const root = join(desktopHome, "ComfyUI-Installs", "ComfyUI");
+    const cfgDir = join(desktopHome, "AppData", "Roaming", "Comfy Desktop");
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(
+      join(cfgDir, "installations.json"),
+      JSON.stringify([
+        {
+          id: "inst-1",
+          name: "My Desktop Install",
+          installPath: root,
+          // Every one of these is in the fixture argv.
+          launchArgs: "--listen --port",
+          sourceId: "standalone",
+        },
+      ]),
+      "utf8",
+    );
+    hoisted.comfyuiPath.value = join(root, "ComfyUI");
+
+    hoisted.fetchMock.mockImplementation(async (url: string) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") return new Response("", { status: 200 });
+      if (path === "/system_stats") return new Response(JSON.stringify({ system: {} }), { status: 200 });
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.ready).toBe(true);
+    expect(res.message).not.toContain("do NOT contain");
+    // …and the existing conditional remedy still stands on its own.
+    expect(res.message).toContain("launch arguments are UNCHANGED");
   });
 
   it("says the launch arguments CHANGED when they actually did (#848)", async () => {

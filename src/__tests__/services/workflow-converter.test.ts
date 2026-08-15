@@ -283,6 +283,56 @@ describe("convertUiToApi — bypass / mute resolution", () => {
     expect(workflow["3"]).toBeUndefined(); // GetNode dropped
     expect(workflow["4"].inputs.images).toEqual(["1", 0]); // resolved through the bus
   });
+
+  // #1400 — the SAME bus, spelled with the PRO_ variants. The de-virtualizer and the
+  // main loop used to keep separate copies of this type list; they now share one, and
+  // this is what notices if that list is narrowed back to the two common names.
+  it("a PRO_Set/PRO_Get bus resolves identically — the whole type list is live", () => {
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [1] }],
+          widgets_values: ["in.png"],
+        },
+        {
+          id: 2,
+          type: "PRO_SetNode",
+          mode: 0,
+          inputs: [{ name: "IMAGE", type: "IMAGE", link: 1 }],
+          outputs: [],
+          widgets_values: ["BUS"],
+        },
+        {
+          id: 3,
+          type: "PRO_GetNode",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [2] }],
+          widgets_values: ["BUS"],
+        },
+        {
+          id: 4,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: 2 }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [
+        [1, 1, 0, 2, 0, "IMAGE"],
+        [2, 3, 0, 4, 0, "IMAGE"],
+      ],
+    } as never;
+    const { workflow } = convertUiToApi(ui, OBJECT_INFO);
+    expect(workflow["2"]).toBeUndefined();
+    expect(workflow["3"]).toBeUndefined();
+    expect(workflow["4"].inputs.images).toEqual(["1", 0]);
+  });
 });
 
 describe("convertUiToApi — serialized-widget nodes (has_serialized_properties)", () => {

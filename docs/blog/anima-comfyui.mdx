@@ -66,7 +66,9 @@ the ControlNet stack exist precisely to address the first two. If you want
 maximum out-of-the-box polish on a big GPU, an Illustrious/NoobAI/Animagine
 fine-tune may still edge it — see [the comparison below](#anima-vs-the-sdxl-anime-giants).
 
-> **License — read this before commercial work.** The **weights** ship under the
+## Licensing
+
+> **Read this before commercial work.** The **weights** ship under the
 > **CircleStone Labs Non-Commercial License** (with NVIDIA Open Model License
 > terms on derivatives) — you can't host them in a paid generation service or
 > embed them in a monetized product without a separate commercial license. But
@@ -318,7 +320,7 @@ isn't tuned for photorealistic output.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — then start the agent with `npx -y comfyui-mcp@latest connect` and click **Connect** in the panel (no API keys; sign in with `claude` once).
 2. Apply the **`anima` pack** — nodes + every model land in the right folders,
    CI-validated, with the Anima-LLLite inpainting node included.
 3. Open the [Panel](../panel) and let the panel's agent wire the graph, swap

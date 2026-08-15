@@ -671,3 +671,229 @@ describe("listOutputImages — remote mode keyed off isRemoteMode (issue #2 regr
     expect(results.map((r) => r.filename)).toEqual(["remote.png"]);
   });
 });
+
+describe("#1373 — a .json attachment is accepted by PARSING it, not by its content-type", () => {
+  // get_image refused a valid ComfyUI workflow attachment because the reporter's server
+  // labelled it `video/json` — neither image/* nor a sniffable media format. The input
+  // directory legitimately holds workflow .json files, so they could not be saved at all.
+  //
+  // I could not reproduce that header: a stock ComfyUI 0.31.1 on this machine returns
+  // `application/json` for the same request, and ComfyUI's own source has no `video/<ext>`
+  // branch. So the label is install-specific, which is exactly why the fix cannot key on
+  // it — the next install will invent a different one.
+  //
+  // The rule this follows is already in the file, one branch up: media payloads must SNIFF
+  // as media, because "the declared content-type alone is no proof". JSON can answer that
+  // question directly.
+
+  const jsonBody = (text: string) => ({
+    base64: Buffer.from(text, "utf8").toString("base64"),
+    mimeType: "video/json",
+  });
+
+  it("accepts valid JSON however the server labelled it", async () => {
+    fetchImageMock.mockResolvedValue(jsonBody('{"nodes":[],"links":[]}'));
+    await expect(
+      getOutputImage("08_SAM2_Rotoscope.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toMatchObject({ filename: "08_SAM2_Rotoscope.json" });
+  });
+
+  it("…including the application/json a stock server actually sends", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"a":1}', "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toBeDefined();
+  });
+
+  it("REFUSES a 200 JSON ERROR ENVELOPE — valid JSON is not the file they asked for", async () => {
+    // ComfyUI answers 200 with a JSON error body in several cases, and {"error":"..."}
+    // parses perfectly. Saving it as my_workflow.json is this issue's own bug in a new
+    // costume: a failure written to disk under the name of the thing that failed.
+    fetchImageMock.mockResolvedValue(jsonBody('{"error":"not found"}'));
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/JSON ERROR body/);
+  });
+
+  it("…but a workflow that merely CONTAINS the word error is still saved", async () => {
+    // The refusal is a top-level `error` KEY on an object, not a substring search. A node
+    // titled "error handler" or a widget value mentioning errors is an ordinary workflow.
+    fetchImageMock.mockResolvedValue(
+      jsonBody('{"nodes":[{"title":"error handler","widgets_values":["error"]}]}'),
+    );
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toBeDefined();
+  });
+
+  it("REFUSES an implausibly large .json rather than parsing it unchecked", async () => {
+    // Parsing is the acceptance test, and parsing means decoding the whole body and
+    // building an object graph — paid twice in memory before anything could reject it. A
+    // workflow is kilobytes; 32 MB is far above any real one. Above the ceiling the answer
+    // is REFUSE, because accepting unverified is exactly what this guard exists to prevent.
+    // VALID JSON, deliberately — an invalid blob would be refused by the parse regardless,
+    // so the test would pass with the ceiling removed and prove nothing. Mutation testing
+    // caught exactly that: my first version used 45 MB of "A".
+    const huge = JSON.stringify({ pad: "A".repeat(40 * 1024 * 1024) });
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from(huge, "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
+    // …and the message names the SIZE, not "the file may not exist" — the caller's
+    // filename is perfectly correct and sending them to re-check it wastes the trip.
+    await expect(
+      getOutputImage("huge.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/over the 32 MB ceiling/);
+  });
+
+  it("REFUSES an HTML error page served as .json — the rejection this check exists for", async () => {
+    // ComfyUI answers 200 with an error body often enough that this is the whole point.
+    // A permissive "it was requested as .json, save it" would hand back a login page as a
+    // workflow.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("<html><body>404 Not Found</body></html>", "utf8").toString("base64"),
+      mimeType: "video/json",
+    });
+    await expect(
+      getOutputImage("missing.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/not valid JSON/);
+  });
+
+  it("REFUSES truncated JSON", async () => {
+    fetchImageMock.mockResolvedValue(jsonBody('{"nodes":[],"li'));
+    await expect(
+      getOutputImage("truncated.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/not valid JSON/);
+  });
+
+  it("REFUSES an empty body — and it is still a MISSING FILE, not a content refusal", async () => {
+    // codex P2. An empty 200 is what an unresolved `input` reference looks like; that is
+    // why #385 made it a structured not-found. Giving it the content-refusal code takes
+    // the missing-file branch away from callers for `.json` alone — the same wrong-cause
+    // failure this issue is about, pointed the other way.
+    fetchImageMock.mockResolvedValue({ base64: "", mimeType: "application/json" });
+    const err = await getOutputImage("empty.json", "input", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err.message).toMatch(/an empty response/);
+    expect(err.code).toBe("IMAGE_NOT_FOUND");
+    // ...and it must say the file may not exist, which is the actionable part.
+    expect(err.message).toMatch(/may not exist/);
+    // The reason rides along on both kinds: a caller should not have to parse a sentence
+    // to learn whether the server sent an error envelope or nothing at all.
+    expect(err.details?.rejectedBecause).toBe("an empty response");
+  });
+
+  it("catches the OTHER ComfyUI error shapes, not just a top-level `error` (codex)", async () => {
+    // A single-key heuristic was calibrated wrong in both directions. These are error
+    // bodies whatever they are called.
+    for (const body of ['{"node_errors":{}}', '{"detail":"Not Found"}']) {
+      fetchImageMock.mockResolvedValue(jsonBody(body));
+      await expect(
+        getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+      ).rejects.toThrow(/JSON ERROR body/);
+    }
+  });
+
+  it("a content refusal carries its OWN error code, not IMAGE_NOT_FOUND (codex P2)", async () => {
+    // The prose named the real reason; the CODE still said the file was missing — and the
+    // code is the part automation reads. A caller branching on it retried, re-listed the
+    // directory, and asked the user to check a filename that was never wrong.
+    //
+    // An HTML page from a proxy is the clean example of this kind: the name was right and
+    // the payload was wrong, so checking the filename is useless.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("<html><body>login required</body></html>", "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
+    const err = await getOutputImage("wf.json", "input", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(ComfyUIError);
+    expect(err.code).toBe("ATTACHMENT_CONTENT_REJECTED");
+    // The reason, structured, so a caller need not parse the sentence to act on it.
+    expect(err.details?.rejectedBecause).toMatch(/not valid JSON/);
+    // …and it must NOT send them off to re-check a filename that was never the problem.
+    expect(err.message).not.toMatch(/may not exist/);
+  });
+
+  it("a JSON ERROR ENVELOPE is the server saying the file is ABSENT (codex round 3)", async () => {
+    // Byte length was the first discriminator and it got this backwards. `/view` answering
+    // `{"error":"not found"}` for a file that is genuinely gone is the server REPORTING
+    // that — so the remedy is the filename, and calling it a content refusal sends the
+    // caller to inspect a payload instead.
+    fetchImageMock.mockResolvedValue(jsonBody('{"error":"not found"}'));
+    const err = await getOutputImage("wf.json", "input", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err.code).toBe("IMAGE_NOT_FOUND");
+    // Both halves: what came back, and the part the caller can act on.
+    expect(err.details?.rejectedBecause).toMatch(/JSON ERROR body/);
+    expect(err.message).toMatch(/JSON ERROR body/);
+    expect(err.message).toMatch(/check the filename/);
+  });
+
+  it("…and a genuinely absent file still says IMAGE_NOT_FOUND", async () => {
+    // The over-broad direction of the same change, which the test above cannot see:
+    // relabelling every rejection would erase the missing-file signal that #385 added.
+    //
+    // The FIRST version of this test used `gone.png`, which never reaches the JSON gate at
+    // all — so it asserted a branch the change could not affect and would have shipped the
+    // P2 above unnoticed (codex). A `.json` request whose body never arrived is the case
+    // that actually distinguishes the two codes.
+    fetchImageMock.mockResolvedValue({ base64: "", mimeType: "application/json" });
+    const missingJson = await getOutputImage("gone.json", "output", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(missingJson.code).toBe("IMAGE_NOT_FOUND");
+    expect(missingJson.details?.rejectedBecause).toBe("an empty response");
+
+    // …and the non-JSON path, unchanged.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("<html>404</html>", "utf8").toString("base64"),
+      mimeType: "text/html",
+    });
+    const err = await getOutputImage("gone.png", "output", "", {
+      allowMedia: true,
+      allowJson: true,
+    }).catch((e) => e);
+    expect(err.code).toBe("IMAGE_NOT_FOUND");
+    expect(err.details?.rejectedBecause).toBeUndefined();
+  });
+
+  it("…and KEEPS a real workflow that carries its own top-level `error` field (codex)", async () => {
+    // The other direction of the same miscalibration: rejecting a legitimate attachment
+    // because a key name collided. A body with workflow markers is a workflow.
+    fetchImageMock.mockResolvedValue(
+      jsonBody('{"nodes":[],"links":[],"last_node_id":3,"error":"captured during the run"}'),
+    );
+    await expect(
+      getOutputImage("wf.json", "input", "", { allowMedia: true, allowJson: true }),
+    ).resolves.toBeDefined();
+  });
+
+  it("does NOT widen anything when allowJson is off", async () => {
+    // The default path must be unchanged: this is opt-in from get_image(action:"get").
+    fetchImageMock.mockResolvedValue(jsonBody('{"nodes":[]}'));
+    await expect(getOutputImage("wf.json", "input", "")).rejects.toThrow(/did not return an image/);
+  });
+
+  it("does NOT accept JSON bytes requested under an IMAGE extension", async () => {
+    // Gated on the requested extension, so a JSON body cannot arrive as a .png and be
+    // saved as a working image.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"nodes":[]}', "utf8").toString("base64"),
+      mimeType: "application/json",
+    });
+    await expect(
+      getOutputImage("actually.png", "input", "", { allowMedia: true, allowJson: true }),
+    ).rejects.toThrow(/did not return an image/);
+  });
+});

@@ -26,7 +26,7 @@ import { logger } from "../utils/logger.js";
 // Windows symlink/junction/ADS safety and the seam-injected deps pattern used
 // by node-authoring.ts. LOCAL-ONLY: every tool needs config.comfyuiPath.
 //
-// Design + rationale: docs/design/node-dev-tools.md.
+// Design + rationale: design/node-dev-tools.md.
 // ---------------------------------------------------------------------------
 
 export class NodeDevError extends ComfyUIError {
@@ -39,7 +39,7 @@ export class NodeDevError extends ComfyUIError {
 /**
  * Refusal returned when a git write (commit/push) is attempted while the
  * COMFYUI_MCP_ALLOW_GIT_WRITES flag is off. Structured so an agent can
- * self-correct (see docs/design/node-dev-tools.md). The gates framework is
+ * self-correct (see design/node-dev-tools.md). The gates framework is
  * deferred to ROADMAP Theme G; this narrow flag is what Theme G will absorb.
  */
 export class GitWritesDisabledError extends ComfyUIError {

@@ -23,12 +23,16 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
+import { COMPLETION_DISAGREEMENT_NOTE } from "./download-done-guard.js";
+import { downloadsAtRiskOfRespawn } from "../services/download-jobs.js";
+import { orphanedByDeferredRespawnNote } from "../services/panel-secrets.js";
 import { errorText, promptText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
 import { type AudioRef, dedupeAudioRefs, noAudioPartText } from "./audio-attachment.js";
 import { runErrorNotice } from "./cli-remedy.js";
 import { runCompletionDirective } from "./todo-state.js";
+import { retargetIsWorthNudging, staleTargetNudge } from "./retarget-nudge.js";
 import {
   ClaudeBackend,
   fetchSupportedModels,
@@ -106,6 +110,51 @@ function runIdentityPreamble(ev: {
  *  tool work is slow but still streams progress) and overridable for tests via
  *  COMFYUI_MCP_TURN_IDLE_MS. Default 3.5 min. */
 const TURN_IDLE_MS = Number(process.env.COMFYUI_MCP_TURN_IDLE_MS) || 210_000;
+
+/** Automatic render previews are context, not the user's explicit attachment
+ * request. Keep them from turning a turn into an unbounded multimodal one (a
+ * seven-way comparison can expose dozens of PreviewImage outputs). The panel
+ * already shows every output; the agent only needs a representative bounded set.
+ * Foreign/unidentified completions get no pixels at all because their own
+ * correlation preamble forbids the agent from treating them as its awaited run.
+ *
+ * PER TURN, NOT PER EVENT — and that distinction is the whole budget. channel()
+ * drains the WHOLE queue into one turn and flatMaps the attachments, so a
+ * per-event cap of 8 delivers 8N for N completions that land while the agent is
+ * busy. Measured before this was fixed: four matched completions queued during
+ * one turn put 32 images on the next one, which is exactly #1516's compounding
+ * shape. Enforced in two places doing DIFFERENT jobs: injectEvent spends the
+ * remaining budget, which is what lets a notice state a count true of the turn
+ * it EXPECTS to land in; the drain caps the assembled batch, and is the only
+ * place that knows the turn that actually happened.
+ *
+ * The gap between those two is real and measured, not theoretical. An in-flight
+ * batch is not on `queue`, so injectEvent cannot see it: with 8 previews in
+ * flight, a completion arriving behind them is told the budget is untouched and
+ * commits its own 8. An interrupt then requeues the in-flight items beside it and
+ * one drain sees 16. The ceiling holds (8 delivered), but the second completion's
+ * notice already claimed "attached below" for images that no longer ride the
+ * turn — so the drain has to CORRECT that claim, not merely enforce the number.
+ * Counting in-flight items at inject time is not the fix: a turn that ends
+ * normally never comes back, so charging for it would starve every sequential
+ * render of its preview. */
+const MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS = 8;
+
+/** Name outputs so `get_image action:"get"` can actually fetch them.
+ *
+ *  Filename alone is not a coordinate: `type` defaults to "output" and a
+ *  PreviewImage lives in `temp`, so a bare name sends the agent looking in the
+ *  wrong directory. Only the parts that differ from the default are spelled out,
+ *  to keep an ordinary output list readable. */
+function describeImageRefs(refs: ImageRef[]): string {
+  return refs
+    .map((i) => {
+      const type = i.type ?? "output";
+      const sub = i.subfolder ? `, subfolder:"${i.subfolder}"` : "";
+      return type === "output" && !i.subfolder ? i.filename : `${i.filename} (type:"${type}"${sub})`;
+    })
+    .join(", ");
+}
 
 /** Longest a single tool call may hold the idle watchdog off before it's treated
  *  as genuinely stuck rather than legitimately slow. An MCP tool call streams NO
@@ -208,6 +257,20 @@ export interface QueueItem {
    *  (see PanelAgent.inFlight), so this stays accurate across an interrupt or a
    *  crash re-queue. */
   completionOnly?: boolean;
+  /** #1489 — this item is an injected RUN-ERROR notice. Marked so a burst of them
+   *  coalesces into one turn instead of nesting: each `injectRunError` used to
+   *  interrupt the live turn and RE-QUEUE it, and after the first error that live turn
+   *  is itself an error turn — so error N re-queued errors 1..N-1 and the drain batched
+   *  them. Measured on a cancelled 27-scene batch: turn lengths 419 → 827 → 1237 chars
+   *  for three prompts, carrying the user's original message along at the bottom. */
+  runError?: boolean;
+  /** #1489 — the TAB this run-error notice came from. Coalescing is scoped to it: the
+   *  item keeps ONE `mid`, and that mid is what pins the error-handling turn to the
+   *  erroring workflow's tab (#884 P0 — "a render error on A silently editing B"). Folding
+   *  a notice from tab B into tab A's item would discard B's origin and route "diagnose and
+   *  fix it" at A's graph, which is that exact P0 reintroduced (codex). Same tab, same pin,
+   *  safe to merge; different tab, keep them apart. */
+  runErrorOriginTab?: string;
 }
 
 /** The turn currently in flight, captured at dispatch so an interrupt or a
@@ -612,6 +675,18 @@ export class PanelAgent {
     return true;
   }
 
+  /** How many AUTOMATIC preview images are already queued for the next turn.
+   *
+   *  Keyed on `completionOnly`, which marks an injected panel event, so a user's
+   *  explicit attachment never spends the preview budget — #1516 asks for those
+   *  to have their own reviewed policy rather than sharing this one implicitly. */
+  private queuedPreviewImageCount(): number {
+    return this.queue.reduce(
+      (n, it) => n + (it.completionOnly ? (it.images?.length ?? 0) : 0),
+      0,
+    );
+  }
+
   /** Drop a still-queued message (the user cancelled/edited it before the agent
    *  got to it). Returns true if it was found and removed; false if it was
    *  already dequeued (the turn started — too late to cancel). */
@@ -647,7 +722,14 @@ export class PanelAgent {
       images?: ImageRef[];
       error?: string;
       note?: string;
-      downloads?: Array<{ name: string; status: string; supersededByLive?: boolean }>;
+      // #1574 — set by the orchestrator when the job RECORD still reads "downloading" for
+      // a row claiming done. Disclosed on the event; never used to suppress it.
+      downloads?: Array<{
+        name: string;
+        status: string;
+        supersededByLive?: boolean;
+        recordDisagrees?: boolean;
+      }>;
       /** #468 — run identity + how it correlates to a run this session queued. */
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
@@ -682,6 +764,51 @@ export class PanelAgent {
     let images: ImageRef[] | undefined;
     if (ev.kind === "executed") {
       const imgs = ev.images ?? [];
+      const correlationIsUntrusted =
+        ev.run_correlation === "foreign" || ev.run_correlation === "unidentified";
+      // Bound the SAME list that becomes the attachment. An entry with no
+      // filename has never been attachable — this filter used to sit down at the
+      // `images =` assignment, long before any bound existed — so counting one
+      // here would make the sentence below claim a number of pixels the turn does
+      // not carry, and blame the bound for a drop it did not cause. `filename:
+      // string` is the TYPE; the payload arrives over the wire, which is why
+      // `names` still needs its own "(unnamed)" fallback.
+      const attachableImgs = imgs.filter((i) => i.filename);
+      // Spend what is LEFT of this turn's budget, not a fresh 8. Everything
+      // already queued is drained into the same turn as this event, so a per-
+      // event cap is not a cap at all. Synchronous from here to `queue.push`
+      // below, so nothing drains in between — but this counts the QUEUE only. A
+      // batch already in flight is invisible here and can be requeued back onto
+      // this one, which is why the drain corrects the count rather than trusting
+      // it (see MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS).
+      const previewBudgetLeft = Math.max(
+        0,
+        MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS - this.queuedPreviewImageCount(),
+      );
+      const attachedImgs = correlationIsUntrusted
+        ? []
+        : attachableImgs.slice(0, previewBudgetLeft);
+      const omittedImgs = attachableImgs.length - attachedImgs.length;
+      // The unnamed remainder. Every sentence below counts outputs with
+      // `imgs.length` but attaches and names from `attachableImgs`, so on a MIXED
+      // event — one output with a filename, one without — the two disagree and
+      // nothing said so: the turn reported 2 outputs, attached 1, and closed with
+      // "The image(s) are attached below". The all-unnamed case has its own branch;
+      // this is the case where a named sibling kept the generic wording alive, and
+      // it also makes `omittedImgs` understate the drop above 8. Unnamed outputs
+      // have no coordinates, so the honest remedy here is get_history, not
+      // get_image — offering a fetch we cannot address is the false remedy the
+      // sibling branches already refuse.
+      const unnamedImgs = imgs.length - attachableImgs.length;
+      // What the agent is NOT being shown, in coordinates it can actually call
+      // get_image with. `names` is filenames only and a `note` replaces it
+      // outright, so neither can carry a withheld PreviewImage that lives in
+      // `temp` or a subfolder — get_image would default to type "output" and
+      // miss it. Withholding pixels is only honest if the pointer works.
+      const withheldImgs = correlationIsUntrusted
+        ? attachableImgs
+        : attachableImgs.slice(attachedImgs.length);
+      const withheldRefs = describeImageRefs(withheldImgs);
       const names = imgs.map((i) => i.filename).filter(Boolean).join(", ") || "(unnamed)";
       // A custom `note` (e.g. the panel's video-storyboard summary) replaces the
       // default image-acknowledgement wording so the agent is told accurately
@@ -713,10 +840,43 @@ export class PanelAgent {
         // e.g. a video that produced no storyboard — has none), and only when this
         // backend can actually see them — a text-only backend told "attached below"
         // would confabulate having viewed the render.
+        // Withheld pixels are disclosed WITH their coordinates, so the remedy is
+        // callable rather than reassuring (#1516). Deliberately not "nothing was
+        // lost": preview outputs live in ComfyUI's temp folder and a restart
+        // clears it, so the honest claim is that a fetch is the way to look — not
+        // that the fetch is guaranteed to succeed.
         (imgs.length
           ? this.backend.capabilities.vision
-            ? `The image(s) are attached below and already shown to the user in the panel. `
+            ? correlationIsUntrusted
+              ? // An UNDETERMINED run can also arrive with no usable filename —
+                // this is the id-less case, so that pairing is ordinary, not
+                // exotic. Offering "fetch it with get_image:" followed by an
+                // empty list would be the exact false remedy this branch exists
+                // to avoid.
+                withheldRefs
+                ? `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED. Fetch one with get_image action:"get" if you need to look: ${withheldRefs}. `
+                : `The outputs are already shown to the user in the panel, but their pixels are NOT attached to this agent turn because the run's origin is UNDETERMINED — and the panel reported no usable filename for them, so they cannot be fetched by name either. Check get_history (action:"list") if you need to know what ran. `
+              : // Nothing had a usable filename, so nothing COULD be attached —
+                // and there are no coordinates to offer either. Say that rather
+                // than the default "attached below", which would promise pixels
+                // this turn does not carry.
+                attachableImgs.length === 0
+                ? `The panel reported no usable filename for ${imgs.length === 1 ? "it" : "them"}, so ${imgs.length === 1 ? "it is" : "they are"} NOT attached to this agent turn and cannot be fetched by name — check get_history (action:"list") if you need to see what this run produced. `
+                : attachedImgs.length === 0
+                  ? `NONE of these outputs are attached to this agent turn: earlier completion(s) in this same turn already spent its ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS}-image preview budget. All ${imgs.length} are shown to the user in the panel — fetch one with get_image action:"get" if you need to look: ${withheldRefs}. `
+                  : omittedImgs > 0
+                    ? `The first ${attachedImgs.length} image(s) are attached below; all ${imgs.length} outputs are already shown to the user in the panel. ${omittedImgs} further preview(s) were omitted to keep this TURN's image context bounded — fetch one with get_image action:"get" if you need it: ${withheldRefs}. `
+                    : `The image(s) are attached below and already shown to the user in the panel. `
             : `You cannot view images on this provider, but they are already shown to the user in the panel. `
+          : ``) +
+        // Said on TOP of whichever branch fired, because every one of them is
+        // arithmetically incomplete while an unnamed output is in the event: the
+        // counts above are over `imgs.length` and the attachments are not. Only
+        // reached when something WAS attachable — the all-unnamed case already
+        // says this in its own words, and a text-only backend attaches nothing to
+        // contradict.
+        (imgs.length && this.backend.capabilities.vision && attachableImgs.length && unnamedImgs > 0
+          ? `${unnamedImgs} of those ${imgs.length} output(s) arrived with no usable filename, so ${unnamedImgs === 1 ? "it is" : "they are"} NOT attached to this agent turn and cannot be fetched by name — check get_history (action:"list") if you need to see ${unnamedImgs === 1 ? "it" : "them"}. `
           : ``) +
         // #977 — this used to be a FIXED "you do NOT need to call any tools",
         // i.e. "stop now", sent after every render. Paired with panel_run's own
@@ -732,9 +892,11 @@ export class PanelAgent {
         // evidence only — no checklist, or one that is finished, keeps the
         // acknowledge-and-stop wording, so nothing changes for a single render.
         runCompletionDirective(this.tabId);
-      // Attach the outputs inline so the agent SEES the render (no fetch needed).
+      // Attach the outputs inline so the agent SEES the render without a fetch —
+      // up to the bound above. Past it (or for an UNDETERMINED origin) the text
+      // says so and points at get_image, so a fetch is needed but never a guess.
       if (this.backend.capabilities.vision) {
-        images = imgs.filter((i) => i.filename).map((i) => ({ ...i, type: i.type ?? "output" }));
+        images = attachedImgs.map((i) => ({ ...i, type: i.type ?? "output" }));
       }
     } else if (ev.kind === "ask_answer") {
       // #486 — the user ANSWERED a question card, but no tool call was alive to
@@ -810,6 +972,14 @@ export class PanelAgent {
       // install the running server never reads — so the wording says only what the
       // event actually proves and points at download_model action:"status" for the verdict.
       if (done.length) parts.push(`transfer completed: ${done.join(", ")}`);
+      // #1574 — the completion is built from the progress ROW; `download_model
+      // action:"status"` answers from the job RECORD. When the record still says the bytes
+      // are moving, say so ON the event rather than announcing a bare completion: a reporter
+      // got "transfer completed" for an 11.46GB file minutes before it existed on disk, and
+      // acted on it. Disclosed, never suppressed — see download-done-guard.ts for why
+      // dropping the event would be the worse failure.
+      const disagrees = dl.some((d) => d.status === "done" && d.recordDisagrees);
+      if (disagrees) parts.push(COMPLETION_DISAGREEMENT_NOTE);
       if (failedDead.length) parts.push(`FAILED: ${failedDead.map((d) => d.name).join(", ")}`);
       if (failedRetried.length) {
         parts.push(
@@ -826,7 +996,15 @@ export class PanelAgent {
         // transfer completed while the file was still streaming (#1150). It is
         // only ever a statement about the `done` entries.
         (done.length
-          ? `The bytes finished transferring for the completed one${done.length > 1 ? "s" : ""}; ` +
+          ? // #1574 — this sentence ASSERTS the bytes finished. When the job record still
+            // says they are moving, that is precisely the claim we cannot make, and stating
+            // it right after the caveat argues against our own disclosure — the same defect
+            // #1150 fixed here for the FAILED case, in the other direction. Report what the
+            // tray said instead of asserting it happened.
+            (disagrees
+              ? `The tray reported the bytes finished for the completed one${done.length > 1 ? "s" : ""}, ` +
+                `but see the caveat above before relying on that; `
+              : `The bytes finished transferring for the completed one${done.length > 1 ? "s" : ""}; `) +
             `whether the connected ComfyUI can actually LOAD ${plural} is confirmed separately. `
           : `NOTHING is claimed to have transferred here. `) +
         `If you were waiting on ${plural} to continue a task, ` +
@@ -864,7 +1042,10 @@ export class PanelAgent {
    *  run succeeded. INTERRUPT any live turn (re-queued so it resumes AFTER the
    *  error), then put the error at the FRONT of the queue so the agent addresses
    *  it before anything else. */
-  async injectRunError(error: string, opts?: { mid?: string }): Promise<void> {
+  async injectRunError(
+    error: string,
+    opts?: { mid?: string; originTab?: string },
+  ): Promise<void> {
     if (this.closed) return;
     // #889 — "the workflow run YOU JUST QUEUED" was a fixed template, sent to a
     // session whose agent had never called panel_run at all. It then burned a
@@ -872,7 +1053,46 @@ export class PanelAgent {
     // imperative made that costly rather than cosmetic: told to STOP and to
     // relate the error to its work, an agent will find a relation.
     const text = runErrorNotice(error);
-    if (this.inFlight) {
+
+    // #1489 — A BURST MUST COALESCE, NOT NEST.
+    //
+    // One error interrupting a user turn is the intended behaviour and stays. The defect
+    // is what happens to the SECOND one: the interrupt re-queues the turn it stopped, and
+    // after the first error that turn is an error turn — so error N re-queued errors
+    // 1..N-1 and the drain batched them into one message. A cancelled 27-scene batch
+    // therefore produced a block that grew by one prompt every turn and dragged the user's
+    // original message along at the bottom. Reproduced against this method: three prompts
+    // gave turns of 419 → 827 → 1237 chars, the last carrying all three plus the user's.
+    //
+    // Note this is NOT a deduplication problem and a dedupe would not have helped — each
+    // notice names a different prompt id, so all N texts are distinct.
+    //
+    // Two cases, both of which avoid a second interrupt:
+    //   • an error turn is already QUEUED and has not started — fold this notice into it,
+    //     so N errors arrive as one turn listing N prompts;
+    //   • an error turn is already IN FLIGHT — queue normally and let it be picked up
+    //     next. Interrupting the agent's error handling to hand it another error just
+    //     restarts the work with more text.
+    // ORIGIN-SCOPED (codex P0). Not keyed on `mid`: `mintInjectionOrigin` returns a fresh
+    // `evt-<uuid>` per event, so mid equality is never true and would disable coalescing
+    // outright. The tab is the thing that must match, because the tab is what the pin
+    // resolves to.
+    const originTab = opts?.originTab;
+    const queuedError = originTab
+      ? this.queue.find((item) => item.runError && item.runErrorOriginTab === originTab)
+      : undefined;
+    if (queuedError) {
+      queuedError.text = `${queuedError.text}\n\n${text}`;
+      return;
+    }
+    // `some`, NOT `every` — and that distinction is the whole fix. The in-flight turn is a
+    // BATCH: the drain merges the re-queued user message with the error notice, so an
+    // error turn's items are [error, USER_PROMPT] and `every` is false. Written with
+    // `every` first, this branch never fired and the measured turn lengths were
+    // byte-identical to the bug (419 → 827 → 1237). The question worth asking is "is the
+    // agent already being told about an error", and `some` asks it.
+    const inFlightIsError = !!this.inFlight && this.inFlight.items.some((i) => i.runError);
+    if (this.inFlight && !inFlightIsError) {
       // Stop the live turn and re-queue it so the agent handles the error FIRST,
       // then resumes whatever it was doing.
       await this.interrupt({ requeueInFlight: true });
@@ -882,7 +1102,14 @@ export class PanelAgent {
     // #884 P0 — the synthetic origin mid pins the error-handling turn to the
     // ERRORING workflow's tab (via onSeen at dequeue), so "diagnose and fix it"
     // edits the graph that failed — never whichever tab happens to be active.
-    this.queue.unshift({ text, ...(opts?.mid ? { mid: opts.mid } : {}) }); // front: ahead of any re-queued interrupted turn
+    // `runError` marks this as an error notice so a following burst folds into it
+    // (#1489) instead of interrupting again and re-queueing this turn.
+    this.queue.unshift({
+      text,
+      runError: true,
+      ...(originTab ? { runErrorOriginTab: originTab } : {}),
+      ...(opts?.mid ? { mid: opts.mid } : {}),
+    }); // front: ahead of any re-queued interrupted turn
     const wake = this.waiting;
     this.waiting = null;
     wake?.();
@@ -1166,7 +1393,52 @@ export class PanelAgent {
       // Coerce each part before joining: a structured payload that slipped past
       // ingress would otherwise stringify to "[object Object]" here (#175).
       let text = batch.map((it) => promptText(it.text)).join("\n\n");
-      let images = batch.flatMap((it) => it.images ?? []);
+      // #1516 — THE PER-TURN CEILING ON AUTOMATIC PREVIEWS, and the reason it
+      // lives here rather than only at injectEvent: this line is where N
+      // completions become ONE turn. A per-event cap of 8 measured 32 images on
+      // one turn for four queued completions.
+      //
+      // injectEvent's budget is the ESTIMATE — true when written, and blind to
+      // any batch already in flight. This is the FACT. The two diverge on a
+      // measured path (in-flight previews requeued beside a completion that
+      // budgeted as if the queue were empty), which is why the block below
+      // corrects the notices instead of assuming they agree with the outcome.
+      // A user's own attachment is never touched — only `completionOnly` items,
+      // which are the injected panel events.
+      let previewBudget = MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS;
+      const trimmedPreviews: ImageRef[] = [];
+      let images = batch.flatMap((it) => {
+        const refs = it.images ?? [];
+        if (!it.completionOnly) return refs;
+        const take = refs.slice(0, Math.max(0, previewBudget));
+        previewBudget -= take.length;
+        trimmedPreviews.push(...refs.slice(take.length));
+        return take;
+      });
+      // A trim here means a notice ABOVE is now wrong: it was composed when its
+      // images were going to ride this turn, and they are not. Measured sequence
+      // — 8 previews in flight, a second completion queued behind them (its own
+      // budget reads as untouched, because in-flight items are not on `queue`),
+      // then an interrupt requeues the first batch: one drain sees 16, delivers
+      // 8, and the second completion's "attached below" describes nothing.
+      //
+      // So this cannot be a log line. The agent is the one being misled, the
+      // agent is the one that has to be told, and it needs the coordinates
+      // because the trimmed completion may have carried a custom `note` — in
+      // which case its filenames appear NOWHERE else in this turn and get_image
+      // is otherwise impossible. Suppressed only for a text-only backend, which
+      // has its own notice below and no attachments to contradict.
+      if (trimmedPreviews.length && this.backend.capabilities.vision) {
+        text +=
+          `\n\n[panel note: ${trimmedPreviews.length} automatic preview image(s) were NOT attached to this turn. ` +
+          `Several run completions were merged into one turn and they SHARE a single ${MAX_RUN_COMPLETION_IMAGE_ATTACHMENTS}-image budget, ` +
+          `so a notice above may say its images are "attached below" when they are not — where they disagree, THIS note is the accurate one. ` +
+          `They are outputs on the ComfyUI side that this turn does not carry — fetch any of them with get_image action:"get" — ${describeImageRefs(trimmedPreviews)}.]`;
+        logger.info(
+          `[panel-agent ${this.short()}] trimmed ${trimmedPreviews.length} automatic preview image(s) at the drain ` +
+            `(completions merged into one turn); the turn says so and names them (#1516)`,
+        );
+      }
       // Deduped across the BATCH, not just within one message: two queued
       // messages that each carried the same file become one turn here, and the
       // duplicate would spend a second of the turn's two audio slots on bytes
@@ -2033,6 +2305,12 @@ export class PanelAgentManager {
    *  an optional nudge to enqueue after the resumed agent comes back (e.g. "retry
    *  the download"). Applied at the next idle so the saving turn finishes first. */
   private pendingMcpRestart = new Map<string, string | null>();
+  /** #1429 — tabs whose queued MCP-restart nudge is a RETARGET nudge, mapped to
+   *  the EARLIEST address they were stranded on. Two jobs: it tells a retarget
+   *  nudge apart from a per-request retry nudge (#164, which must never be
+   *  overwritten), and it makes A→B→C inside one turn report A→C rather than the
+   *  obsolete A→B. Cleared wherever pendingMcpRestart is. */
+  private pendingRetargetFrom = new Map<string, string>();
   /** Default model/effort for newly-spawned agents (the env/config defaults). */
   private model: string;
   private effort?: Effort;
@@ -2193,9 +2471,87 @@ export class PanelAgentManager {
         continue;
       }
       this.pendingMcpRestart.set(tabId, nudge ?? null);
+      // Whatever is queued now is not a retarget nudge any more (#1429) — leaving
+      // the marker set lets the NEXT retarget claim this one as its own.
+      this.pendingRetargetFrom.delete(tabId);
       // Apply immediately when the tab is already idle; otherwise it fires on the
       // next turn-done via applyPendingRestarts().
       tallyRestart(tally, this.applyPendingRestarts(tabId));
+    }
+    return tally;
+  }
+
+  /**
+   * #1429 — the ComfyUI target moved, so every tab's comfyui MCP child must be
+   * respawned to learn the new address. Identical to restartAllForMcpEnv() except
+   * for what a MID-TURN tab is told afterwards.
+   *
+   * A tab that is busy cannot have its child replaced now, so it goes on serving
+   * `from` for the rest of that turn. It gets a nudge naming both addresses. A
+   * tab that is IDLE respawns before it can run anything and gets NOTHING: a
+   * nudge is a real agent turn (restartAgentResume delivers it as one), not a log
+   * line, so a false one costs the user a response about nothing.
+   *
+   * Two orderings this has to get right, both found in adversarial review:
+   *
+   *   * A per-request retry nudge (#164, "the download you just tried can be
+   *     retried now") is MORE SPECIFIC than a retarget nudge and must never be
+   *     overwritten by one — hence pendingRetargetFrom, which is what tells the
+   *     two apart when a nudge is already queued.
+   *   * Two retargets inside one turn (A→B then B→C) must tell the agent A→C.
+   *     Keeping the first message would state a target the respawned child is
+   *     NOT on, which is worse than saying nothing — so the ORIGIN is what
+   *     persists, and the message is recomposed against the current target.
+   */
+  retargetAllForMcpEnv(from: string | null | undefined, to: string): McpEnvRestartTally {
+    // A startup seed (no previous target) or a same-address reaffirmation is not
+    // a move: nothing ever ran against a different address, so there is nothing
+    // to report and this degrades to the ordinary silent respawn.
+    if (!retargetIsWorthNudging(from, to)) return this.restartAllForMcpEnv();
+
+    const keys = [...this.agents.keys()];
+    const tally: McpEnvRestartTally = { live: 0, applied: 0, scheduled: 0 };
+    for (const tabId of keys) {
+      const queued = this.pendingMcpRestart.get(tabId);
+      const queuedIsRetarget = this.pendingRetargetFrom.has(tabId);
+      // #164: a queued PER-REQUEST nudge wins outright. (A queued `null` is a
+      // silent pending respawn — no payload to protect — so it falls through.)
+      if (queued && !queuedIsRetarget) {
+        tallyRestart(tally, this.applyPendingRestarts(tabId));
+        continue;
+      }
+      // The EARLIEST address this tab was stranded on is the true `from`.
+      const origin = this.pendingRetargetFrom.get(tabId) ?? (from as string);
+      // #1443 — ASK THE QUESTION ABOUT THE PAIR THAT GETS REPORTED.
+      //
+      // Whether this call is a move was decided from the INCOMING from→to, which is
+      // the right question for the caller and the wrong one for this tab: the
+      // message is composed from its PRESERVED origin. A tab held mid-turn across
+      // A→B→A has origin A and to A — it never left A — and was told, in a real
+      // agent turn, that its target changed from A to A. A→B→C, the case preserving
+      // the origin exists for, is correct; this is its degenerate sibling.
+      const stranded = retargetIsWorthNudging(origin, to);
+      // Recompose BEFORE applying, not after: if the tab went idle in between,
+      // applyPendingRestarts delivers whatever is queued right now, and a stale
+      // A→B message would go out while the child is being respawned onto C.
+      this.pendingMcpRestart.set(
+        tabId,
+        queuedIsRetarget && stranded ? staleTargetNudge(origin, to) : null,
+      );
+      const outcome = this.applyPendingRestarts(tabId);
+      if (outcome === "scheduled" && stranded) {
+        // Mid-turn: the tab is stranded on `origin` until the turn ends. Record
+        // the origin so a further retarget in the same turn keeps it, and queue
+        // the message the deferred respawn will carry.
+        this.pendingRetargetFrom.set(tabId, origin);
+        this.pendingMcpRestart.set(tabId, staleTargetNudge(origin, to));
+      } else {
+        // Applied, no agent, or a ROUND TRIP that landed back on `origin`: either
+        // way this tab has nothing to be told. The respawn still happens — it is
+        // the same env, so it is harmless — but it goes out silently.
+        this.pendingRetargetFrom.delete(tabId);
+      }
+      tallyRestart(tally, outcome);
     }
     return tally;
   }
@@ -2212,6 +2568,10 @@ export class PanelAgentManager {
       return this.applyPendingRestarts(key);
     }
     this.pendingMcpRestart.set(key, nudge ?? null);
+    // Whatever is queued now, it is no longer a retarget nudge (#1429). Leaving
+    // the marker set would make the NEXT retarget classify this per-request nudge
+    // as its own and overwrite it — the exact #164 erasure, one step removed.
+    this.pendingRetargetFrom.delete(key);
     return this.applyPendingRestarts(key);
   }
 
@@ -2239,6 +2599,89 @@ export class PanelAgentManager {
    *
    * No-op unless something is pending and the agent has fully settled (idle).
    */
+  /**
+   * #1567 — ARM the orphan check for the next respawn, for ONE tab.
+   *
+   * Only a comfyui CREDENTIAL change may arm this, and the caller says which tab it
+   * belongs to. Both restrictions come from review, and each fixes a real defect in the
+   * first version, which hooked every restart unconditionally:
+   *
+   *  - `applyPendingRestarts` also serves retargets (#1429) and the base_path recovery
+   *    respawn. Those are not credential saves, so a note saying one "was saved earlier"
+   *    would have been false — and `retargetAllForMcpEnv` deliberately gives an IDLE tab
+   *    NO turn, which an unconditional note broke for any tab while a download ran.
+   *  - `restartAllForMcpEnv` applies each tab separately and the download list is global,
+   *    so every restarted tab would have reported the SAME transfers. The credential
+   *    respawn does replace every tab's comfyui child, so the global list is the right
+   *    set — it just has to be told once, exactly like the retry nudge it travels with.
+   *
+   * `null` means "no particular tab" (a Settings-slot save): the first tab to restart
+   * carries it. Either way it is consumed once.
+   */
+  /**
+   * The credential-save respawn: restart every tab's comfyui child AND watch for what that
+   * kills. One call rather than arm-then-restart, deliberately.
+   *
+   * Arming separately left a window that review's leak finding lives in: a watch created by
+   * one call and bound by a LATER `restartAllForMcpEnv` would attach itself to whatever
+   * tabs that later, unrelated respawn happened to queue. Creating and binding it in the
+   * same call means a watch can never outlive the save that made it — if this save queues
+   * nothing, it dies here.
+   */
+  restartAllForMcpEnvAfterCredentialChange(tabId: string | null): McpEnvRestartTally {
+    this.credentialOrphanWatch = { tab: tabId, awaiting: new Set() };
+    const tally = this.restartAllForMcpEnv();
+    // An idle tab consumed it inside that call; otherwise bind it to exactly the tabs that
+    // still owe a restart, and drop it when there are none.
+    if (this.credentialOrphanWatch) {
+      const awaiting = this.liveKeys().filter((k) => this.pendingMcpRestart.has(k));
+      if (awaiting.length === 0) this.credentialOrphanWatch = null;
+      else this.credentialOrphanWatch.awaiting = new Set(awaiting);
+    }
+    return tally;
+  }
+  /**
+   * `tab` is who it is for; `awaiting` is what keeps it from LEAKING (review, P1).
+   *
+   * Consuming it only on delivery is not enough: a save that queues no restart at all — no
+   * managed tabs — or whose named tab disappears before its restart runs would leave this
+   * armed forever, and the next unrelated mcp-env respawn would then present a stale
+   * "a credential was saved earlier" note. `awaiting` is the exact set of tabs this save
+   * queued; the watch dies when that set empties, whether or not anything was delivered.
+   */
+  private credentialOrphanWatch: { tab: string | null; awaiting: Set<string> } | null = null;
+
+  /** #1567 — this tab will never deliver the armed watch (its restart is being dropped).
+   *  When nothing is left that could, the watch dies rather than waiting for a respawn it
+   *  has no relationship to. */
+  private releaseOrphanWatch(tabId: string): void {
+    const watch = this.credentialOrphanWatch;
+    if (!watch) return;
+    watch.awaiting.delete(tabId);
+    if (watch.awaiting.size === 0) this.credentialOrphanWatch = null;
+  }
+
+  /** #1567 — what this respawn is about to orphan, enumerated NOW rather than at save
+   *  time. Never throws: a rebuild that fails because its warning failed is strictly
+   *  worse than a rebuild with no warning.
+   *
+   *  It is NOT non-blocking, and the earlier comment claiming otherwise was wrong
+   *  (review): this reads job records and each active download's progress with sync IO,
+   *  so a stalled filesystem stalls here. That is tolerated because it now runs at most
+   *  once per credential save rather than on every restart — the same IO the save path
+   *  already performs, moved to where it can see the right answer. A try/catch cannot
+   *  time-bound a blocking syscall and is not pretended to. */
+  private deferredRespawnOrphanNote(): string | null {
+    try {
+      return orphanedByDeferredRespawnNote(downloadsAtRiskOfRespawn());
+    } catch (err) {
+      logger.debug("[panel-orchestrator] could not enumerate downloads a respawn will orphan", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
   private applyPendingRestarts(tabId: string): McpEnvRestartOutcome {
     const wantEffort = this.pendingEffortRestart.has(tabId);
     const wantMcp = this.pendingMcpRestart.has(tabId);
@@ -2247,6 +2690,9 @@ export class PanelAgentManager {
     if (!agent || agent.isStopped) {
       this.pendingEffortRestart.delete(tabId);
       this.pendingMcpRestart.delete(tabId);
+      this.pendingRetargetFrom.delete(tabId);
+      // #1567 — this restart is being dropped, so it will never deliver an armed watch.
+      this.releaseOrphanWatch(tabId);
       return "no-agent";
     }
     // Still mid-work (a queued message will start the next turn) — wait for the
@@ -2254,9 +2700,38 @@ export class PanelAgentManager {
     if (agent.isBusy || agent.hasPending) return "scheduled";
     // Only the MCP respawn carries a retry nudge.
     const nudge = wantMcp ? (this.pendingMcpRestart.get(tabId) ?? undefined) : undefined;
+    // #1567 — RE-TAKE the at-risk snapshot HERE. The save-time one (#1378) is taken
+    // before the emit because for an APPLIED respawn the emit is the damage. For a
+    // QUEUED one the damage is this line, arbitrarily many turns later, so a save-time
+    // snapshot cannot see a transfer that started in between — which is exactly what
+    // happened: nothing in flight at save, nine downloads started over the next two
+    // turns, all killed here with no warning at any point.
+    //
+    // ONLY for an armed credential respawn, and ONLY once — see
+    // armCredentialRespawnOrphanWatch. A note on any other restart would be both untrue
+    // and a spurious agent TURN, which is a response the user did not ask for.
+    const watch = this.credentialOrphanWatch;
+    const watched = wantMcp && watch !== null && (watch.tab === null || watch.tab === tabId);
+    // A tab leaves `awaiting` when its queued restart RESOLVES, whichever way — delivery
+    // retires the whole watch, and anything else just means this tab can no longer be the
+    // one to deliver it (review, round 3).
+    //
+    // Releasing only on the dropped path was not enough. A save on tab A with B also busy
+    // leaves awaiting={A,B}; retiring A trims it to {B}; B then restarts successfully,
+    // matches nothing, and releases nothing — so the set never empties. The watch sits
+    // there until a recreated A restarts and collects a warning about a save from long
+    // before it existed.
+    //
+    // The busy early-return above is deliberately upstream of this: "scheduled" means the
+    // tab still owes a restart, so it has not resolved and must stay in the set.
+    if (watched) this.credentialOrphanWatch = null;
+    else this.releaseOrphanWatch(tabId);
+    const orphanNote = watched ? this.deferredRespawnOrphanNote() : null;
+    const finalNudge = orphanNote ? [nudge, orphanNote].filter(Boolean).join("\n\n") : nudge;
     this.pendingEffortRestart.delete(tabId);
     this.pendingMcpRestart.delete(tabId);
-    const carried = this.restartAgentResume(tabId, agent, nudge);
+    this.pendingRetargetFrom.delete(tabId);
+    const carried = this.restartAgentResume(tabId, agent, finalNudge);
     const reasons = [wantEffort ? "effort" : null, wantMcp ? "comfyui-mcp-env" : null]
       .filter(Boolean)
       .join("+");
@@ -2333,7 +2808,14 @@ export class PanelAgentManager {
       images?: ImageRef[];
       error?: string;
       note?: string;
-      downloads?: Array<{ name: string; status: string; supersededByLive?: boolean }>;
+      // #1574 — set by the orchestrator when the job RECORD still reads "downloading" for
+      // a row claiming done. Disclosed on the event; never used to suppress it.
+      downloads?: Array<{
+        name: string;
+        status: string;
+        supersededByLive?: boolean;
+        recordDisagrees?: boolean;
+      }>;
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
       run_correlation_prior?: boolean;
@@ -2391,7 +2873,11 @@ export class PanelAgentManager {
 
   /** Push a ComfyUI execution error to a tab's agent — interrupt the live turn
    *  and front-queue the error so the agent stops and addresses it. */
-  async injectRunError(tabId: string, error: string, opts?: { mid?: string }): Promise<boolean> {
+  async injectRunError(
+    tabId: string,
+    error: string,
+    opts?: { mid?: string; originTab?: string },
+  ): Promise<boolean> {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false;
     await agent.injectRunError(error, opts);
@@ -2605,6 +3091,13 @@ export class PanelAgentManager {
       this.pendingMcpRestart.set(newKey, this.pendingMcpRestart.get(oldKey)!);
       this.pendingMcpRestart.delete(oldKey);
     }
+    // The marker classifies that value (#1429), so it has to travel with it: left
+    // behind, the renamed tab's queued retarget nudge reads as a per-request one
+    // and the next retarget preserves an obsolete target instead of recomposing.
+    if (this.pendingRetargetFrom.has(oldKey)) {
+      this.pendingRetargetFrom.set(newKey, this.pendingRetargetFrom.get(oldKey)!);
+      this.pendingRetargetFrom.delete(oldKey);
+    }
     if (this.modelByKey.has(oldKey)) {
       this.modelByKey.set(newKey, this.modelByKey.get(oldKey)!);
       this.modelByKey.delete(oldKey);
@@ -2749,6 +3242,9 @@ export class PanelAgentManager {
   private unbindAgent(key: string, opts: { dropHeldMail: boolean; reason: string }): PanelAgent | undefined {
     const agent = this.agents.get(key);
     this.agents.delete(key);
+    // #1567 — this tab can no longer deliver an armed orphan watch. The single choke point
+    // for removal, so a retire/reset cannot strand one waiting on a tab that is gone.
+    this.releaseOrphanWatch(key);
     this.detachHeldCompletions(key, opts.reason);
     if (opts.dropHeldMail) this.heldMessages.delete(key);
     return agent;
@@ -2862,6 +3358,7 @@ export class PanelAgentManager {
     const durableCleared = this.opts.sessionStore ? this.opts.sessionStore.clear(tabId) : true;
     this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     this.pendingMcpRestart.delete(tabId);
+    this.pendingRetargetFrom.delete(tabId); // #1429 — nothing queued, nothing to classify
     // Drop this key's picker override so a provider switch (which reset()s the old
     // key) can't carry the old provider's model/effort into the new backend's spawn.
     this.modelByKey.delete(tabId);

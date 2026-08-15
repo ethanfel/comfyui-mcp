@@ -1,0 +1,149 @@
+---
+title: "Installation"
+description: "Installez ComfyUI et connectez le serveur MCP — en local, à distance ou sur Comfy Cloud."
+icon: "download"
+---
+
+## 1. Installer ComfyUI
+
+<CardGroup cols={2}>
+  <Card title="ComfyUI Desktop" icon="desktop" href="https://www.comfy.org/download">
+    La façon la plus simple d'obtenir une installation gérée sur macOS / Windows.
+  </Card>
+  <Card title="Depuis les sources" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
+    Clonez et lancez manuellement — ou utilisez l'outil [`install_comfyui`](/docs/tools/install-environment).
+  </Card>
+</CardGroup>
+
+## 2. Ajouter le serveur MCP
+
+ComfyUI MCP est publié sur npm sous le nom `comfyui-mcp` et s'exécute via `npx` — aucune installation globale n'est nécessaire.
+
+<Tabs>
+  <Tab title="ComfyUI local">
+    Le serveur détecte automatiquement une installation locale et son port. Ajoutez-le à `~/.claude/settings.json` :
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="ComfyUI distant">
+    Pointez vers n'importe quelle instance accessible avec `--comfyui-url`. Aucune installation
+    locale n'est requise pour les outils basés sur HTTP (génération, file d'attente, workflows,
+    recherche de modèles, etc.). Lorsque l'hôte n'est pas en loopback, le serveur passe en
+    **mode distant** et ignore la détection automatique de `COMFYUI_PATH`, afin qu'une
+    installation locale obsolète ne puisse pas absorber silencieusement les envois.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp", "--comfyui-url", "https://my-comfy.example.com"]
+        }
+      }
+    }
+    ```
+
+    <Note>
+      La plupart des outils fonctionnent très bien avec un ComfyUI distant — l'installation de
+      nœuds personnalisés comprise, via l'API HTTP de ComfyUI-Manager. Ce qui exige réellement un
+      chemin d'installation local, c'est l'installation de ComfyUI lui-même, les opérations
+      reposant sur comfy-cli, la lecture des logs et la suppression de fichiers de modèles ; ces
+      outils renvoient une erreur explicite en mode distant. Voir [Comment ça marche](/docs/concepts).
+    </Note>
+  </Tab>
+  <Tab title="Comfy Cloud">
+    Ciblez [Comfy Cloud](https://cloud.comfy.org) en définissant `COMFYUI_API_KEY`. Le serveur
+    passe en **mode cloud** : les primitives HTTP sont routées via `cloud.comfy.org` avec
+    l'authentification `X-API-Key`. Les outils liés au WebSocket et ceux qui touchent au système
+    de fichiers local ou aux processus lèvent une erreur `CLOUD_UNSUPPORTED` explicite.
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "COMFYUI_API_KEY": "your-comfy-cloud-api-key"
+          }
+        }
+      }
+    }
+    ```
+
+    <Note>
+      Le mode cloud ignore la détection automatique de `COMFYUI_PATH` en local et utilise la
+      bibliothèque de modèles propre au cloud. Les outils qui font appel à un processus local ou
+      au système de fichiers lèvent `CLOUD_UNSUPPORTED` ; les autres se dégradent au lieu de lever
+      une erreur — `list_local_models` renvoie une liste vide, et `apply_manifest` signale
+      `skipped`/`failed` par élément plutôt que d'échouer d'un bloc. Voir la page
+      [Configuration](/docs/configuration#deployment-modes) pour la matrice complète de parité
+      fonctionnelle.
+    </Note>
+    <Note>
+      **Uniquement dans le cloud ?** [Le Comfy Cloud MCP de Comfy-Org](https://docs.comfy.org/agent-tools) (bêta publique) est le choix canonique — voir [Local vs. Comfy Cloud](/docs/local-vs-comfy-cloud). Utilisez le mode cloud de `comfyui-mcp` si vous voulez un seul MCP pour le local / le distant / le cloud, ou s'il vous faut la prise en charge du cloud dès aujourd'hui.
+    </Note>
+  </Tab>
+</Tabs>
+
+Lancez ensuite `/mcp` dans Claude Code pour vous connecter.
+
+## 3. Démarrer l'orchestrateur du panneau
+
+Nécessaire uniquement pour le **panneau latéral**. Passez cette étape si vous pilotez ComfyUI
+depuis Claude Code ou un autre client MCP — ce chemin utilise le serveur MCP configuré ci-dessus.
+
+Le panneau est une extension ComfyUI purement frontend : il ne peut pas démarrer de processus sur
+votre machine, c'est donc **à vous de démarrer l'orchestrateur**, et le panneau s'y connecte.
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+C'est un raccourci pour `--panel-orchestrator`. Il cible automatiquement le ComfyUI sur lequel se
+trouve votre navigateur, sert le pont sur `ws://127.0.0.1:9180` (remplaçable par
+`COMFYUI_MCP_BRIDGE_PORT`), et doit rester en cours d'exécution tant que vous utilisez le panneau.
+Ouvrez ensuite l'onglet **Agent**, choisissez un fournisseur et cliquez sur **Connecter**.
+
+Vous pilotez un ComfyUI **distant** — un pod cloud ou une autre machine sur votre réseau local ?
+Lancez la même commande sur **votre propre machine**, pas sur la machine distante, et passez-lui
+l'URL :
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+Votre connexion au fournisseur et l'agent restent en local ; rien n'est installé sur l'hôte
+distant. Voir [Déploiement cloud](/docs/cloud-deployment) pour les détails du tunnel.
+
+## 4. (Facultatif) Jetons
+
+Certains outils utilisent des jetons d'API. Définissez-les dans le bloc `env` du serveur (voir [Configuration](/docs/configuration)) :
+
+- `CIVITAI_API_TOKEN` — téléchargements CivitAI à accès restreint
+- `HUGGINGFACE_TOKEN` — limites de débit HuggingFace plus élevées
+- `GITHUB_TOKEN` — génération de skills / récupération des métadonnées de nœuds
+- `COMFY_API_KEY` — nœuds API hébergés de comfy.org
+
+## Développement local
+
+Le projet utilise `npm link` pour que `npx comfyui-mcp` pointe vers votre build local :
+
+```bash
+git clone https://github.com/artokun/comfyui-mcp
+cd comfyui-mcp
+npm install
+npm run build
+npm link
+```
+
+Après une modification du code : `npm run build`, puis `/mcp` pour vous reconnecter.

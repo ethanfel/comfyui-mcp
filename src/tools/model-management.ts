@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { emptyDownloadListingNote } from "../services/empty-download-listing.js";
+import { describeRecordStore } from "../services/download-progress.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
@@ -8,7 +10,6 @@ import {
   describeManagerDestination,
   managerJobFilename,
   currentLiveModelsRoot,
-  verifyManagerVisibility,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
 import type { ModelListingCoverage } from "../services/model-resolver.js";
@@ -26,6 +27,7 @@ import {
   type DownloadJob,
 } from "../services/download-jobs.js";
 import { readDownloadProgress } from "../services/download-progress.js";
+import { findResumablePartial } from "../services/download-cache.js";
 import { errorToToolResult, ModelError } from "../utils/errors.js";
 import {
   downloadCivitaiModelAction,
@@ -40,6 +42,10 @@ import {
 } from "./extra-paths.js";
 import { resolveMissingModelsAction } from "./missing-models.js";
 import { getEmbeddingsAction } from "./memory-management.js";
+import {
+  inflightNoteKind,
+  provenDeadStatusNote,
+} from "../services/download-status-proven-dead.js";
 
 /**
  * The fourteen model tools collapsed into two action-parameterized tools
@@ -222,6 +228,39 @@ function stillWritingClause(route: DownloadRoute): string {
  * re-issue, while the stale note said doing that corrupts the file (codex
  * review). One function, so they cannot drift again.
  */
+/**
+ * What is ACTUALLY on disk for a cancelled download (#1370).
+ *
+ * The row this replaces said "the partial was left on disk and can be resumed by
+ * re-issuing the download (it picks up where it left off)" on the strength of
+ * `status === "cancelled"` alone. A reporter paused a 33 GB download because of that
+ * sentence, found nothing on disk, and restarted from zero. The sentence was not stale —
+ * it was never checked.
+ *
+ * Both answers are useful and neither is a failure: a partial means "re-issue and you keep
+ * these bytes", and no partial means "re-issue and you start over" — which is exactly the
+ * fact someone needs BEFORE spending the bandwidth, not after. The size is included
+ * because "resumable" without a number is not something you can weigh against restarting.
+ */
+function describePartial(partial: { path: string; bytes: number } | null): string {
+  if (!partial) {
+    return (
+      `no resumable partial was found for this URL, so re-issuing very likely starts from ` +
+      `the beginning. That is not an error — but it is worth knowing before you re-spend ` +
+      `the bandwidth on a large file. (The staged file is keyed by the download's cache ` +
+      `identity, which folds in auth headers this record deliberately does not keep, so ` +
+      `for an AUTHENTICATED download this means "none found under the unauthenticated ` +
+      `key", not "none exists".)`
+    );
+  }
+  const gb = partial.bytes / 1024 ** 3;
+  const size = gb >= 1 ? `${gb.toFixed(2)} GB` : `${(partial.bytes / 1024 ** 2).toFixed(1)} MB`;
+  return (
+    `a partial of ${size} is on disk (${partial.path}) and re-issuing the same download ` +
+    `resumes from it.`
+  );
+}
+
 function afterCancelAdvice(route: DownloadRoute): string {
   switch (route) {
     case "manager":
@@ -772,24 +811,25 @@ async function downloadAction(args: {
           // branch could only ever say "confirm with list_local_models yourself",
           // and a reporter who did not lost a multi-GB model to an ephemeral
           // overlay. The listing question IS answerable remotely, so answer it.
-          // "not-listed" is deliberately not rendered as failure: the dispatch
-          // returns on ACCEPTANCE, so a large file may still be arriving.
-          // unknown-ok: undefined is the COULD-NOT-VERIFY state, and it is kept
-          // distinct from both "visible" and "not-listed" below — the render
-          // appends the note only when one exists, and never upgrades a missing
-          // verification into a confirmation. (verifyManagerVisibility documents
-          // that it never throws, so this catch is belt-and-braces.)
-          const managerSeen = job.viaManager
-            ? await verifyManagerVisibility(
-                job.target_subfolder,
-                // #1086 (codex review) — was `job.filename ?? path.split(…).pop()`.
-                // For a Manager dispatch `job.path` is a DESCRIPTOR, not a path, so
-                // that returned the whole trailing note and made every URL-only
-                // download unverifiable. Pre-existing; exposed by the review.
-                managerJobFilename(job),
-                { attempts: 1 },
-              ).catch(() => undefined)
-            : undefined;
+          //
+          // #1374 review, P1-3 — THE ANSWER IS READ OFF THE RECORD, NOT RE-ASKED.
+          //
+          // This used to call verifyManagerVisibility a SECOND time, right here,
+          // and prefer its result. Two things were wrong with that. It could not
+          // pass `listedBefore` — the pre-dispatch baseline lives inside
+          // startDownloadJob and is unreachable from a tool — so this call was
+          // structurally incapable of telling "the dispatch landed it" from "a
+          // file of that name was already there", and preferring it DEFEATED the
+          // baselined verdict the job had just recorded. And it spent a second
+          // Manager-only network round trip re-asking a question already answered
+          // on the record.
+          //
+          // `startDownloadJob` now writes the verdict onto the job (and marks it
+          // "pending" in the same synchronous step it publishes "done"), so
+          // describePlacement below reads one baselined answer. When the grace
+          // window expires before the check concludes, that reads "pending" and
+          // renders as the honest unverified caveat — which is the truth at that
+          // instant, and re-probing here could not have made it otherwise.
           // #1086 — the destination is unknowable only until we LOOK.
           //
           // The standing caveat says we cannot know where a Manager dispatch
@@ -828,10 +868,9 @@ async function downloadAction(args: {
               // The word stays out of the Manager branch entirely. LISTED is the
               // observation; validity is not established here and must not be
               // implied by the label.
-              (managerSeen?.visibility === "visible"
-                ? `LISTED (placement only, NOT validity): ${managerSeen.note}`
-                : `NOTE: ${placement.warning}` +
-                  (managerSeen ? `\n\n${managerSeen.note}` : "")) +
+              (job.live_visible === "visible"
+                ? `LISTED (placement only, NOT validity): ${placement.warning}`
+                : `NOTE: ${placement.warning}`) +
               // Appended to BOTH Manager arms: a listed file whose destination is
               // outside the live root is exactly the #1086 shape, so the "LISTED"
               // arm needs this every bit as much as the unverified one.
@@ -951,8 +990,13 @@ async function statusAction(args: {
                 text: unresolvedLive
                   ? unresolvedLive
                   : (args.id || args.url)
-                  ? `No download matching ${selector}. Several causes reach this same message and it does not distinguish them — treat it as "not found", NOT as "finished": it may have finished long ago (settled records are pruned after a while), never started, been interrupted by an orchestrator restart with the carry-over that records that (#1148) not having run (it is best-effort by design), been given a valid \`id\` with a \`tray_id\` that does not match it, been looked up by a \`url\` that does not match BYTE FOR BYTE (matching includes the query, so a re-signed CDN link or a dropped query misses a record that is still there — retry by \`id\`), or named a \`url\` that TWO live downloads share, which declines rather than guessing: omit the selector to list them both. Check the panel download tray before re-downloading. Within the SAME session, re-issuing an identical in-flight download adopts it rather than duplicating; across a reconnect, confirm via the tray first.`
-                  : "No downloads are being tracked.",
+                  ? `No download matching ${selector}. Several causes reach this same message and it does not distinguish them — treat it as "not found", NOT as "finished": it may have finished long ago (settled records are pruned after a while), never started, been interrupted by an orchestrator restart with the carry-over that records that (#1148) not having run (it is best-effort by design), been given a valid \`id\` with a \`tray_id\` that does not match it, been looked up by a \`url\` that does not match BYTE FOR BYTE (matching includes the query, so a re-signed CDN link or a dropped query misses a record that is still there — retry by \`id\`), or named a \`url\` that TWO live downloads share, which declines rather than guessing: omit the selector to list them both. If this session has the ComfyUI sidebar panel, check its download tray before re-downloading; without a panel there is no equivalent read, so wait and re-check rather than act. Within the SAME session, re-issuing an identical in-flight LOCAL download adopts it rather than duplicating; across a reconnect, confirm first — via the tray if this session has the panel, otherwise by waiting and re-checking. Do NOT re-issue a transfer that was dispatched to ComfyUI-Manager: it runs server-side, so a re-issue is a SECOND dispatch to the same destination and can corrupt the file (#1197) — check whether the file landed instead. If you cannot tell which route was used, ask before re-issuing.`
+                  // #1420 — an empty listing is not proof that nothing is
+                  // running. The store is nonced per orchestrator start, so a
+                  // reconnect empties it while transfers keep streaming.
+                  : emptyDownloadListingNote({
+                      storeCreatedMs: describeRecordStore().createdMs,
+                    }),
               },
             ],
           };
@@ -968,6 +1012,31 @@ async function statusAction(args: {
         // listing actually contains a collision (two writers, one file).
         const idCounts = new Map<string, number>();
         for (const j of list) idCounts.set(j.id, (idCounts.get(j.id) ?? 0) + 1);
+        // #1370 — LOOK, then say. The cancelled row claimed "the partial was left on disk
+        // and can be resumed by re-issuing the download" purely from `status === "cancelled"`;
+        // nothing stat'd the file. A reporter paused a 33 GB download BECAUSE of that
+        // sentence, found no partial anywhere, and restarted from zero.
+        //
+        // Stat'd up front because the row builder below is synchronous, and only for rows
+        // that could have one: a Manager dispatch never writes a local partial and already
+        // says so.
+        //
+        // Keyed by the job's URL, because that is what the WRITER keys the staged file on
+        // (cachePathForUrl). My first version searched for `.<destination filename>.partial`
+        // — what "the partial for this download" sounds like, and not what is on disk. It
+        // would have reported "no partial" for every download that had one: the same false
+        // claim inverted, and pointing the more damaging way, since the original at least
+        // erred toward "your bytes are safe".
+        const partials = new Map<string, { path: string; bytes: number } | null>();
+        await Promise.all(
+          list
+            .filter((j) => j.status === "cancelled" && !j.viaManager)
+            .map(async (j) => {
+              partials.set(`${j.id}\n${j.trayId}`, await findResumablePartial(j.url));
+            }),
+        );
+        const partialFor = (j: DownloadJob): { path: string; bytes: number } | null =>
+          partials.get(`${j.id}\n${j.trayId}`) ?? null;
         const collidingIds = [...idCounts.entries()].filter(([, n]) => n > 1).map(([k]) => k);
         const lines = list.map((j) => {
           const p = readDownloadProgress(j.progressId ?? j.trayId);
@@ -1027,18 +1096,38 @@ async function statusAction(args: {
                         // left by a cancel (none may exist).
                         (j.viaManager
                           ? `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. This was a remote ComfyUI-Manager dispatch: the host MAY still be fetching server-side (no Manager recall API) and there is NO local partial to resume — check list_local_models to see whether the file landed; re-issuing starts a NEW dispatch.`
-                          : `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. Any .partial the dead writer left was untouched — re-issue the download to resume from it, or to restart cleanly if there is none.`)
+                          : `\n    cancelled — the previous session's writer was confirmed GONE (its process no longer exists), so a later session closed its stale record; no live transfer was aborted. ${describePartial(partialFor(j))}`)
                       : j.viaManager
                         ? `\n    cancelled — this was a remote ComfyUI-Manager dispatch, so there is NO local partial to resume, and the host MAY still be fetching server-side (there's no Manager recall API). Re-issuing starts a NEW server-side dispatch (a duplicate, not a resume). Check list_local_models to see whether the file landed before deciding.`
-                        : `\n    cancelled — the partial was left on disk and can be resumed by re-issuing the download (it picks up where it left off)`) +
+                        : `\n    cancelled — ${describePartial(partialFor(j))}`) +
                     // A recovery-critical note from cancellation cleanup (e.g. a previous
                     // destination file preserved under a .bak path because it couldn't be
                     // restored) — surface it so the user can recover, not mask it.
                     (j.error ? `\n    IMPORTANT: ${j.error}` : "")
-                  : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
+                  : // #1479 — do not say "still streaming" about a transfer whose writer is
+                    // PROVEN gone. The note below explains it, but the STATUS LINE is what a
+                    // reader takes at a glance, and leaving it would have this reply
+                    // contradict itself in consecutive sentences.
+                    j.writerProvenGone === true
+                    ? (j.viaManager
+                        ? `\n    local owner gone — this was a ComfyUI-Manager dispatch, so the server-side fetch may still be running; started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`
+                        : `\n    NOT running — the owning process is gone; started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`)
+                    : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
           const route = downloadRoute(j);
+          // #1479 — a PROVEN-dead writer must not be reported as "still streaming".
+          // The pid probe that settles it was already being run on the cancel path;
+          // status branched on heartbeat AGE alone and so told callers not to act on a
+          // transfer that had died with its session. A merely-stale record keeps the
+          // cautious wording, because a missed heartbeat still proves nothing (#761).
+          const noteKind = inflightNoteKind({
+            status: j.status,
+            staleInflight: j.staleInflight,
+            provenGone: j.writerProvenGone,
+          });
           const staleNote =
-            j.status === "downloading" && j.staleInflight
+            noteKind === "proven-dead"
+              ? provenDeadStatusNote({ staleForMs: j.staleForMs, viaManager: j.viaManager })
+              : noteKind === "stale"
               ? `\n    NOTE: heartbeat stale for ${Math.round((j.staleForMs ?? 0) / 1000)}s. The owning session may have reconnected, and the transfer may still be running. Do NOT re-issue download_model action:"download" while this warning remains: ${stillWritingClause(route)}. To recover, call download_model \`action:"cancel"\` with this id and tray_id — it closes the stale record once the writer is PROVEN gone (its process no longer exists) and refuses while that cannot be proven. ONCE THAT CANCEL SUCCEEDS: ${afterCancelAdvice(route)} Do not report this download as failed or missing.`
               : "";
           // Surface a declined resume so the agent/user knows a pre-existing

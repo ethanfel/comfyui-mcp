@@ -1,0 +1,139 @@
+---
+title: "安装"
+description: "安装 ComfyUI 并连接 MCP 服务器 —— 本地、远程或 Comfy Cloud。"
+icon: "download"
+---
+
+## 1. 安装 ComfyUI
+
+<CardGroup cols={2}>
+  <Card title="ComfyUI Desktop" icon="desktop" href="https://www.comfy.org/download">
+    在 macOS / Windows 上获得托管安装最省事的方式。
+  </Card>
+  <Card title="从源码安装" icon="github" href="https://github.com/comfyanonymous/ComfyUI">
+    自行克隆并手动运行 —— 或者使用 [`install_comfyui`](/docs/tools/install-environment) 工具。
+  </Card>
+</CardGroup>
+
+## 2. 添加 MCP 服务器
+
+ComfyUI MCP 以 `comfyui-mcp` 发布在 npm 上，通过 `npx` 运行 —— 无需全局安装。
+
+<Tabs>
+  <Tab title="本地 ComfyUI">
+    服务器会自动检测本地安装及其端口。把它加到 `~/.claude/settings.json`：
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="远程 ComfyUI">
+    用 `--comfyui-url` 指向任意可访问的实例。HTTP 类工具（生成、队列、工作流、模型搜索等）
+    不需要本地安装。当主机不是回环地址时，服务器会进入**远程模式**并跳过 `COMFYUI_PATH`
+    自动检测，这样过时的本地安装就不会悄悄把上传内容接收过去。
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp", "--comfyui-url", "https://my-comfy.example.com"]
+        }
+      }
+    }
+    ```
+
+    <Note>
+      大多数工具在远程 ComfyUI 上都能正常工作 —— 包括通过 ComfyUI-Manager 的 HTTP API 安装
+      自定义节点。真正需要本地安装路径的是安装 ComfyUI 本身、基于 comfy-cli 的操作、读取日志
+      以及删除模型文件；它们在远程模式下会返回明确的错误。参见[工作原理](/docs/concepts)。
+    </Note>
+  </Tab>
+  <Tab title="Comfy Cloud">
+    设置 `COMFYUI_API_KEY` 即可指向 [Comfy Cloud](https://cloud.comfy.org)。服务器会进入
+    **云端模式**：HTTP 原语通过 `cloud.comfy.org` 路由，并使用 `X-API-Key` 认证。依赖
+    WebSocket 的工具，以及访问本地文件系统/进程的工具，会抛出明确的 `CLOUD_UNSUPPORTED` 错误。
+
+    ```json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "COMFYUI_API_KEY": "your-comfy-cloud-api-key"
+          }
+        }
+      }
+    }
+    ```
+
+    <Note>
+      云端模式会跳过本地 `COMFYUI_PATH` 自动检测，改用云端自己的模型库。需要访问本地进程或
+      文件系统的工具会抛出 `CLOUD_UNSUPPORTED`；其他工具则是降级而不是直接报错 ——
+      `list_local_models` 返回空列表，`apply_manifest` 会逐项报告 `skipped`/`failed`，
+      而不是整体出错。完整的功能对照表参见[配置](/docs/configuration#deployment-modes)页面。
+    </Note>
+    <Note>
+      **只用云端？**那么 [Comfy-Org 的 Comfy Cloud MCP](https://docs.comfy.org/agent-tools)（公开测试版）是标准选择 —— 参见[本地 vs. Comfy Cloud](/docs/local-vs-comfy-cloud)。如果你想用一个 MCP 同时覆盖本地 / 远程 / 云端，或者现在就需要云端支持，那就用 `comfyui-mcp` 的云端模式。
+    </Note>
+  </Tab>
+</Tabs>
+
+然后在 Claude Code 中运行 `/mcp` 进行连接。
+
+## 3. 启动面板编排器
+
+只有使用**侧边栏面板**时才需要。如果你是从 Claude Code 或其他 MCP 客户端驱动 ComfyUI，
+可以跳过这一步 —— 那条路径用的是上面配置的 MCP 服务器。
+
+面板是纯前端的 ComfyUI 扩展：它无法在你的机器上启动进程，所以**由你自己启动编排器**，
+面板再连接到它。
+
+```bash
+npx -y comfyui-mcp@latest connect
+```
+
+这是 `--panel-orchestrator` 的简写形式。它会自动以你浏览器当前所在的 ComfyUI 为目标，在
+`ws://127.0.0.1:9180` 上提供桥接（可用 `COMFYUI_MCP_BRIDGE_PORT` 覆盖），并且在你使用面板
+期间必须保持运行。然后打开**智能体**标签页，选择一个服务商，点击**连接**。
+
+要驱动**远程** ComfyUI —— 云端实例，或者局域网里的另一台机器？请在**你自己的机器上**运行
+同样的命令，而不是在远程那台上，并传入 URL：
+
+```bash
+npx -y comfyui-mcp@latest connect https://your-pod-url
+```
+
+你的服务商登录状态和智能体都留在本地，远程主机上不会安装任何东西。隧道相关的细节参见
+[云端部署](/docs/cloud-deployment)。
+
+## 4.（可选）令牌
+
+有些工具会用到 API 令牌。请在服务器的 `env` 块中设置（参见[配置](/docs/configuration)）：
+
+- `CIVITAI_API_TOKEN` —— 有访问限制的 CivitAI 下载
+- `HUGGINGFACE_TOKEN` —— 更高的 HuggingFace 速率限制
+- `GITHUB_TOKEN` —— 技能生成 / 节点元数据获取
+- `COMFY_API_KEY` —— 托管的 comfy.org API 节点
+
+## 本地开发
+
+本项目使用 `npm link`，因此 `npx comfyui-mcp` 会解析到你的本地构建：
+
+```bash
+git clone https://github.com/artokun/comfyui-mcp
+cd comfyui-mcp
+npm install
+npm run build
+npm link
+```
+
+修改代码之后：运行 `npm run build`，然后用 `/mcp` 重新连接。

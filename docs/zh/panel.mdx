@@ -1,0 +1,335 @@
+---
+title: "侧边栏面板"
+description: "ComfyUI 智能体面板 —— 位于 ComfyUI 侧边栏的自主 AI 智能体，可以用任意 LLM 驱动你的画布：用订阅账号跑 Claude、ChatGPT 或 Gemini（无需 API 密钥），用 Ollama 跑免费的本地模型（连账号都不用），或通过任何兼容 OpenAI 的端点接入云端模型。已上架 Comfy Registry，包名 comfyui-agent-panel。"
+icon: "comments"
+---
+
+<Note>
+  **现已上架 Comfy Registry。** 在 ComfyUI-Manager 里安装 **ComfyUI Agent Panel**
+  （`comfyui-agent-panel`），或者用 git 安装以获取最新构建（见下方
+  [设置](#设置)）。
+</Note>
+
+**[comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)** 在 ComfyUI 的
+侧边栏里放进一个自主智能体。向它要一张图、一条工作流或一处改动 —— 它会直接对着你的
+ComfyUI 动手，并就地回复你。选一个服务商 —— **Claude**、**ChatGPT**、**Gemini** 或
+**Ollama（本地）** —— 对应的智能体就会在后台运行：订阅类服务商**不需要 API 密钥**，
+本地模型**连账号都不需要**（Ollama 后端也能接入任何兼容 OpenAI 的云端端点）。能力
+矩阵见[后端](/docs/backends)，各档模型的实际表现见 [LLM 竞技场](/docs/arena)。
+
+```
+you ⇄ panel (pick a provider) ⇄ loopback bridge ⇄ panel orchestrator ⇄ background agent: Claude · ChatGPT · Gemini · any LLM
+```
+
+订阅类服务商**没有 API 密钥，也没有按 token 计费** —— 本地模型则完全免费、可离线
+运行。智能体用你磁盘上已有的登录信息认证（如果是 Ollama，就直接和本地守护进程通信）。
+一个编排器在一个回环桥接端口（`ws://127.0.0.1:9180`）上服务所有服务商；每个面板
+标签页在握手时选定自己的服务商。桥接只监听回环地址，而面板只执行一份**固定的允许
+列表**里的节点图命令（不执行任意 JavaScript）。
+
+<Note>
+  刚接触？[后端 / 服务商](/docs/backends)会讲清楚选择器、与服务商无关的
+  `AgentBackend` 端口，以及能力矩阵（Claude 和 ChatGPT 之间哪些完全一致，又有哪
+  几处不同）。
+</Note>
+
+## 设置
+
+1. **安装节点包** —— 在 ComfyUI-Manager 里搜索 `comfyui-agent-panel`，或者用 git 安装：
+
+   ```bash
+   cd ComfyUI/custom_nodes
+   git clone https://github.com/artokun/comfyui-mcp-panel
+   ```
+
+   <Warning>
+   **在 Manager 的版本下拉框里选 `Latest`，不要选 `Nightly`。** 名字虽然叫 Nightly，
+   Manager 的 **Nightly** 却并不是每晚构建的：它只在安装时克隆仓库**一次**，之后再也
+   不跟踪那个分支。它会把你冻结在当天恰好是 `main` 的那个提交上，而 `Latest` 会跟上
+   每一次发布 —— 所以 Nightly 通常比 Latest *更旧*，放着不管就会悄悄越落越远。它
+   显示没有可用更新，是因为在它看来确实没有。
+
+   想知道自己实际停在哪里，可以把 **Node Pack Info → Version** 下的 SHA 和
+   [仓库的提交历史](https://github.com/artokun/comfyui-mcp-panel/commits/main)
+   对一下。要脱身，要么在同一个下拉框里选 `Latest (x.y.z)`，要么 —— 如果你想继续
+   用 git —— 在 `custom_nodes/comfyui-mcp-panel` 里执行 `git pull`，它会干净地快进。
+   </Warning>
+
+2. **在你想用的服务商那里登录一次**，让后台智能体可以使用你的订阅：
+
+   ```bash
+   claude        # Claude — or: claude setup-token
+   codex login   # ChatGPT (Codex)
+   ```
+
+3. 在你自己的机器上**启动编排器**并让它一直运行 —— 见
+   [启动面板编排器](/docs/zh/installation#3-启动面板编排器)：
+
+   ```bash
+   npx -y comfyui-mcp@latest connect
+   ```
+
+4. **重启 ComfyUI**，打开**智能体**标签页，**选一个服务商**（Claude / ChatGPT
+   选项按钮），然后点击**连接**。面板会连上编排器的回环桥接。输入一条请求，智能体
+   就会回应。**断开连接**会解除链接；编排器会一直运行，直到你手动停止它。
+
+不需要 `claude mcp add`，也不需要 API 密钥。面板是纯前端扩展，无法自己启动编排器，
+所以编排器始终是一个由你启动的进程 —— 面板只会自动连上一个已经在运行的桥接。前置
+条件只有 PATH 里的 Node.js/`npx` 和上面那一步服务商登录。桥接端口可以用
+`COMFYUI_MCP_BRIDGE_PORT` 修改。
+
+<Note>
+**要驱动远程 ComfyUI**（云 GPU 实例、局域网里的另一台机器）？上面的设置同样适用，
+但编排器要跑在**你自己的机器上**，而不是那台远程机器：`npx -y comfyui-mcp@latest connect <remote-url>`
+会处理好其余部分，包括一条通回实例 HTTPS 页面的安全隧道。然后在面板里点击“连接”。
+完整流程见[云端部署](/docs/cloud-deployment)。
+</Note>
+
+<Note>
+  **服务商上手引导。** 点击“连接”时，面板会检查每个服务商的就绪状态（PATH 里有它
+  的 CLI + 磁盘上有登录信息；macOS 钥匙串也已处理）。只有在**两个服务商都**没有
+  登录时，才会出现上手引导卡片。如果你保存的选择当前不可用，面板会**自动切换到一个
+  已就绪的服务商**（你保存的偏好会保留），而未就绪的服务商那一行会提供一个
+  **“设置”**操作，帮你走完一次性的 `claude` / `codex login` 步骤。见
+  [后端 → 就绪状态与上手引导](/docs/backends#connect-time-readiness--onboarding)。
+</Note>
+
+## 能做什么
+
+智能体（Claude *或* ChatGPT）会加载 comfyui-mcp 的模型技能（IDEOGRAM、WAN、LTX、
+Qwen 等等），因此它已经了解你在跑的那些模型 —— Claude 是原生加载，ChatGPT 则通过
+以 MCP 工具形式暴露的同一份知识（[知识对等](/docs/tools/skills-knowledge)）。它可以
+生成图片、视频和音频，检视并管理你的 ComfyUI，对你的环境做推理 —— 然后在面板对话
+里回复你。
+
+它还能**一次性加载整条工作流或整个安装包**（`panel_load_workflow pack:<name>`），
+并且**考虑成本**：内置的包都是本地 GPU / 免费的；对于临时拼出来的节点图，智能体会
+先检查运行环境（`list_packs` 配 `action:"check_runtime"`），并在**花掉付费 API 额度
+之前先问你**。见[技能、包与运行成本](/docs/tools/skills-knowledge)。
+
+## 驱动实时节点图
+
+自主智能体通过一份**固定的 `panel_*` 命令允许列表**操作你正在运行的 ComfyUI ——
+不执行任意 JavaScript。每一次节点图改动都走 LiteGraph 的变更追踪，所以每一次都可以
+用 **Ctrl+Z** 撤销。同一套 `panel_*` 接口对两个后端完全一致地暴露（Claude 走进程内，
+ChatGPT/Codex 走回环 HTTP MCP），因此[能力对等](/docs/backends)是自动的。
+
+### 读取
+
+| 工具 | 作用 |
+|---|---|
+| `panel_query_graph` | 查询正在查看的节点图 —— 过滤/遍历/聚合，受 token 上限约束 |
+| `panel_get_subgraph` | 读取子图节点内部的那张图 |
+| `panel_view_selected` | 读取用户**选中**的节点 —— 一次调用就能回答“这个节点” |
+| `panel_view_nodes_in_viewport` | 只读取**屏幕上**的部分（视口矩形 + 缩放）—— 在大图上收窄工作范围 |
+| `panel_get_errors` | 节点为什么变红 —— 把每个报错节点和它的成因关联起来（缺失模型 + 下载 URL、缺失素材、校验失败、运行时 `exception_type`） |
+| `panel_list_workflows` | 列出打开的工作流标签页，以及哪一个处于活动状态 |
+| `panel_list_nodes` | 列出已安装的自定义节点包 |
+| `panel_list_mcp` | 列出已连接的 MCP 服务器 |
+| `panel_get_content_mode` | 读取成人内容（NSFW）同意状态 |
+
+### 编辑节点图（可撤销）
+
+| 工具 | 作用 |
+|---|---|
+| `panel_add_node` | 按 class_type 添加节点 |
+| `panel_remove_node` | 移除节点 |
+| `panel_connect` / `panel_disconnect` | 按名称或索引连接 / 断开插槽（`panel_connect` 两个插槽都省略时按类型自动匹配；`auto_match:false` 恢复旧的索引 0 语义） |
+| `panel_set_widget` | 修改控件的值（steps、cfg、提示词等等） |
+| `panel_edit_node` | 原子地移动、缩放、改标题、改颜色、改形状、折叠或固定一个或多个节点 |
+| `panel_auto_layout` | 按连线拓扑把整张图（或其中一部分）自动排布成干净的流式/网格布局 —— 用 `dry_run` 预览 |
+| `panel_clear` | 移除所有节点 —— 整次清空只需一次 Ctrl+Z |
+
+### 子图
+
+| 工具 | 作用 |
+|---|---|
+| `panel_select_nodes` | 在画布上选中节点（支持多选） |
+| `panel_create_subgraph` | 把选中的节点打包成子图（“Convert to Subgraph”） |
+| `panel_enter_subgraph` | 钻进子图，读取 / 编辑它内部的节点 |
+| `panel_exit_subgraph` | 返回父级 / 根节点图 |
+
+### 空间布局
+
+智能体能看到节点的几何信息 —— `panel_query_graph` 的明细行会返回每个节点的
+`pos`/`size`，以及子图的输入/输出 `rails`、`groups` 和每个节点的
+`color`/`collapsed` —— 并用一组对应的写操作来排布画布，然后把结果**截图**下来，
+自己判断布局好不好。`workflow-layout` 技能把这些串成一套按依赖分层、互不重叠的
+自动布局，它的头号规则是*始终把输入和输出露在外面*，这样你可以直接接着上手。
+
+| 工具 | 作用 |
+|---|---|
+| `panel_move_rail` | 移动子图的输入 / 输出轨道，让跨边界的连线保持短 |
+| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | 创建、移动、改标题/改颜色或删除带标签的分组框（传 `node_ids` 可自动包住它们） |
+| `panel_screenshot` | 把画布渲染成 PNG 并作为图片交回来，让智能体可以核对自己的布局 |
+
+### 工作流标签页
+
+| 工具 | 作用 |
+|---|---|
+| `panel_new_workflow` | 在**新**标签页里打开一条全新的空白工作流（绝不会清掉当前这条） |
+| `panel_open_workflow` | 按路径 / 文件名切换工作流 |
+| `panel_rename_workflow` | 重命名工作流 |
+| `panel_close_workflow` | 关闭标签页（有未保存的改动时会拒绝，除非强制） |
+| `panel_save_workflow` | 以程序方式保存 / 另存为 —— 不会弹出对话框 |
+
+### 一次性加载工作流
+
+| 工具 | 作用 |
+|---|---|
+| `panel_load_workflow` | 一次调用就用整条工作流替换实时节点图 —— 要加载内置安装包里的本地 GPU 工作流时优先用 `pack:<name>`，不必让 JSON 在对话里来回搬运。被替换掉的那张图会成为一个撤销点（连按两次 Esc / `/revert`）。 |
+
+### 知识与成本意识
+
+智能体会发现内置的专业知识，并在花掉额度之前检查运行成本（两个后端用的是同一套
+工具 —— 见[技能、包与运行成本](/docs/tools/skills-knowledge)）：
+
+| 工具 | 作用 |
+|---|---|
+| `list_packs`（`action:"skill_list"` / `action:"skill_read"`） | 发现并阅读内置的模型家族 + 工作流技能 |
+| `list_packs`（`action:"list"` / `action:"read_workflow"`） | 列出一条命令即可安装的包（本地 GPU / 免费），并读取某个包的节点图 |
+| `list_packs`（`action:"list_templates"`） | 列出所连服务器上官方的 ComfyUI 工作流模板 |
+| `list_packs`（`action:"check_runtime"`） | 把一张图判定为 **local**（免费）或 **api/mixed/unknown**（付费）—— 智能体会在花掉付费 API 额度之前先问你 |
+
+### 运行与查看
+
+| 工具 | 作用 |
+|---|---|
+| `panel_run` | 把打开的工作流加入队列（等同于按 Queue Prompt） |
+| `panel_canvas` | 适应画面、居中到某个节点、平移或缩放视图 |
+
+### 自定义节点（内置 ComfyUI Manager）
+
+| 工具 | 作用 |
+|---|---|
+| `panel_search_nodes` | 通过用户自己的 Manager 搜索可安装的节点包 |
+| `panel_install_node` | 把一个包的安装加入队列（注册表 id 或 git URL） |
+| `panel_node_queue_status` | 查看 Manager 的安装 / 更新队列 |
+| `panel_restart_comfyui` | 重启 ComfyUI 以加载新节点 —— 面板会自动重连，智能体接着做 |
+
+### MCP 与会话
+
+| 工具 | 作用 |
+|---|---|
+| `panel_add_mcp` / `panel_remove_mcp` | 在用户的智能体 MCP 配置（Claude 或 Codex）里连接 / 移除一个 MCP 服务器 |
+| `panel_request_secret` | 安全地收集 API 令牌 —— 智能体永远看不到具体的值 |
+| `panel_reload` | 软重载编排器（新代码/新工具）或面板 UI，然后接着做 |
+
+### 与用户协作
+
+| 工具 | 作用 |
+|---|---|
+| `panel_ask` | 请用户在若干选项之间做选择（渲染一张提问卡片，并阻塞等待选择） |
+| `panel_set_todo` | 在面板底部托盘里显示实时的 TODO 清单 |
+| `panel_request_adult_consent` / `panel_disable_adult_mode` | 开关 18+ NSFW 同意门槛 |
+
+<Note>
+  每个工具都接受可选的 `tab_id` —— 每个浏览器标签页持有各自的连接，路由默认走唯一
+  的那个标签页，或者用户最后输入过的那个标签页。
+</Note>
+
+## 回退与回滚
+
+过去的消息并没有被冻结。把鼠标悬停在任意消息上，**✎ 编辑**按钮会打开一个回滚弹窗：
+可以回滚**代码**（把节点图还原到那一轮的快照）、回滚**对话**（把会话从那个点分叉
+出去），或者**两者都回滚**，然后从那里重新发送一条改过的消息。节点图还原使用逐轮
+快照，所以撤销某一轮会精确还原它开始时的那张图。
+
+两个快捷方式覆盖了常见场景：
+
+- **`/revert`** —— 撤销上一轮对节点图的修改。
+- **连按两次 Esc** —— 快速回退上一轮：还原节点图，并把那条消息召回到输入框，供你
+  编辑后重发。
+
+<Note>
+  **代码**（节点图）回滚在**两个**服务商上都可用 —— 它靠编排器里的逐轮快照实现。
+  **对话**回滚（把聊天分叉回过去某一轮）目前**只支持 Claude**；ChatGPT/Codex 后端
+  只能整条线程地恢复，所以面板对它关闭了这个范围。见
+  [能力矩阵](/docs/backends#capability-matrix)。
+</Note>
+
+## 待处理消息托盘
+
+在智能体忙碌时输入，你的消息不会淹没在对话里 —— 它会停在一个固定的**待处理**托盘
+里，就停靠在下载托盘上方，不进入对话流。每条待处理消息都有**编辑**、**立即发送**和
+**删除**按钮，还有一个拖动手柄（≡，在左侧）用来**重排**智能体处理它们的顺序。
+**立即发送**会打断当前这一轮，立刻改变它的方向。待处理消息出队时会出现在对话的
+**最下方**，因此整段记录读起来正好是智能体（Claude 或 ChatGPT）实际处理它们的顺序。
+
+## 破坏性操作确认
+
+不可逆的操作会先征求确认。`panel_clear`（清掉所有节点）和 `panel_restart_comfyui`
+会弹出一张是 / 否卡片，只有选**是**才会执行 —— 这样智能体就没法悄悄清空你的节点图
+或者把 ComfyUI 重启掉。
+
+## 重连的稳健性
+
+卡死的编排器不会再把面板晾在一边。如果之前的编排器仍占着桥接端口，点击**连接**会
+回收那个僵尸进程，而不是直接失败 —— 面板会重新连上，而不是把你卡在那儿。
+
+## 输入框附件
+
+可以在输入框里添加附件、拖放，或者直接粘贴。除了图片，输入框现在还接受**视频**、
+**工作流 `.json`** 和**文本**文件，所以你可以直接把一段参考片段、一条要改的工作流
+或一份笔记交给智能体。
+
+## 智能体回复里的富媒体
+
+当一次运行产出的媒体被回传给智能体时，输出并不只是一个图片块 —— 它还带着智能体可以
+推理的**元数据**：每个输出的路径（相对于子文件夹）、文件大小、像素尺寸，以及
+**素材集合分组**（“本次运行的第 K / N 个输出”和同批文件的文件名，或者“单个输出”），
+再加上渲染时长和完成时间。视频故事板在负载中带有相应信息时，还会补上格式和真实的
+帧数 / fps。这样智能体就能准确说出实际保存下来的结果，也能谈论大小、尺寸，以及一次
+运行产生了多少个文件。
+
+## 代码块的复制与换行
+
+渲染出的代码块带有一个悬停显示的**复制**按钮，以及一个会被持久保存的全局**自动换行**
+开关（默认关闭 —— 在你打开它之前，长行会横向滚动）。行内代码也有自己的复制按钮。
+两者的样式都与面板保持一致。
+
+## 渲染停滞警告
+
+编排器会对你的 ComfyUI 队列跑一个被动看门狗：节点/进度不再推进的渲染会被标记为
+**停滞**并告知智能体（这样它就不会盲目地把任务继续堆在一个卡住的任务后面）。阈值就是
+**设置 → Comfy MCP Agent → 通用**下的**渲染停滞警告（秒）**（默认 180 秒，范围
+15–3600）。它会在连接时下发，并且是**实时**推送的 —— 改了立刻生效，不用重连。见
+[配置 → `COMFYUI_MCP_STALL_S`](/docs/configuration#panel-orchestrator--the-bridge)。
+
+## 后台标签页的可靠性
+
+即使 ComfyUI 标签页处在**后台**，流式回复现在也能正常渲染。此前回复的打字机效果跑在
+`requestAnimationFrame` 上，而浏览器会在隐藏的标签页里暂停它 —— 于是在一次多阶段的
+长时间运行中切走，就会留下一个空气泡和一个卡住的流式光标，看起来像智能体“想到一半
+卡住了”，其实那一轮早就结束了。现在标签页被隐藏时回复会同步收尾，并且有一个
+`visibilitychange` 处理器会在隐藏时冲刷掉所有待写入的回复，在你回来时恢复打字机效果。
+前台的动画没有变化。
+
+## RunPod 云端控制
+
+工具栏上的**主机指示**会显示 **🟢 本地 · 你的机器**或 **🔵 RunPod · <pod> · GPU ·
+$/hr**，点开会打开一个 **RunPod 控制面板**：一张实时状态卡片（GPU / VRAM / 运行时长 /
+$·hr / ComfyUI URL / 空闲自动停止倒计时）、一个**按名称**列出你所有实例的下拉框、
+连接 / 启动 / 停止 / **使用本地**，以及一个需要二次确认的**部署**按钮。在 API 密钥
+卡片里设置一次 `RUNPOD_API_KEY`，你就能部署、监控、在本地⇄实例之间切换并停止云端
+GPU，全程不必碰 RunPod 控制台 —— 主机指示始终告诉你下一次渲染会在哪里跑。见
+[云端部署](/docs/cloud-deployment)和博客
+[在租来的云 GPU 上运行 ComfyUI](/docs/blog/runpod-comfyui)。
+
+## CivitAI 浏览器
+
+工具栏上的 **Civitai** 按钮会打开一个完整的 CivitAI 浏览器 —— 图片、视频、检查点、
+LoRA 和工作流，带搜索、筛选和全屏查看器。选中一条结果，可以**分享给智能体**、
+**下载到你的机器**，或者把**内嵌的工作流保存**到画布上。故事在这里：
+[ComfyUI 里的 CivitAI](/docs/blog/civitai-in-comfyui)。
+
+## 参见
+
+- [移动端 App（测试版）](/docs/mobile) —— 把手机和面板配对，随时随地和智能体对话
+- [后端 / 服务商](/docs/backends) —— Claude 与 ChatGPT、选择器、能力对等
+- [技能、包与运行成本](/docs/tools/skills-knowledge) —— 知识对等 + 成本护栏
+- [桥接配置](/docs/configuration)
+- [云端部署](/docs/cloud-deployment) —— 让面板驱动远程的 ComfyUI 实例（RunPod 等）
+- [自建中继](/docs/self-hosted-relay) —— 为桥接运行你自己的隧道基础设施
+- [Claude Code 插件](/docs/plugin) —— 模型技能、斜杠命令、智能体
+- [GitHub 上的 comfyui-mcp](https://github.com/artokun/comfyui-mcp) · [GitHub 上的 comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)

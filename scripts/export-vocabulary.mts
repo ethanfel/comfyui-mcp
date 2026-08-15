@@ -54,7 +54,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { computeVocabularyHash, DEAD_NAMES, MAX_TOOLS, TOOL_NAMES } from "../src/tools/vocabulary.js";
+import { assembleVocabularyHash, DEAD_NAMES, MAX_TOOLS, TOOL_NAMES } from "../src/tools/vocabulary.js";
 import { CALL_TOOL_WHITELIST } from "../src/orchestrator/call-tool-admission.js";
 import { buildPanelToolDefs } from "../src/orchestrator/panel-tools.js";
 
@@ -88,15 +88,13 @@ const dead = DEAD_NAMES.map((d) => ({ name: d.name, since: d.since, replacement:
 
 /** Identifies the VOCABULARY, not the build that produced it.
  *
- *  Computed by computeVocabularyHash() in src/tools/vocabulary.ts rather than
+ *  Computed by assembleVocabularyHash() in src/tools/vocabulary.ts rather than
  *  inline here, because the RUNTIME handshake compares against this value. Two
  *  copies of the rule would drift, and a drifted hash reports a mismatch that is
- *  not real — which is worse than having no check at all. */
-const vocabularyHash = computeVocabularyHash({
-  core,
-  panel: panelSorted,
-  dead: dead.map((d) => d.name),
-});
+ *  not real — which is worse than having no check at all. That applies to the
+ *  INPUT as much as to the digest, so the core/panel-sorted/dead assembly moved
+ *  in there with it; this file no longer decides what gets hashed (#236). */
+const vocabularyHash = assembleVocabularyHash(panel);
 
 const artefact = {
   $comment:

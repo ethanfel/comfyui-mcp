@@ -34,8 +34,10 @@ wherever your MCP client runs, reaching ComfyUI over plain HTTP via
     ComfyUI runs in a container (or on another host); the MCP client still
     spawns `comfyui-mcp` locally, pointed at it with `COMFYUI_URL` (or
     `--comfyui-url`). A non-loopback URL puts the server in **remote mode**:
-    all HTTP tools work, and local-only tools (installing custom nodes,
-    reading logs, removing model files) return a clear error.
+    all HTTP tools work — including installing custom nodes, which goes through
+    the ComfyUI-Manager HTTP API. Tools that need the filesystem or a local
+    process (installing ComfyUI itself, comfy-cli operations, reading logs,
+    removing model files) return a clear error.
   </Card>
 </CardGroup>
 

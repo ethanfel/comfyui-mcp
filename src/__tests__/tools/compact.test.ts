@@ -128,6 +128,148 @@ describe("buildManifest", () => {
     expect(buildManifest(fakeCatalog())).not.toContain("FILTERED view");
   });
 
+  // #1525 — `list_tools search:"download model"` returned ONLY `runpod`. The filter
+  // was matching the literal PHRASE, so `download_model` (an identifier, spelled
+  // with an underscore) never contained it, while an unrelated tool whose prose
+  // happens to say "download model" did. The one tool the caller obviously wanted
+  // was the one excluded, and the only hit was the coincidence.
+  function separatorCatalog(): ToolCatalog {
+    const catalog = new ToolCatalog();
+    const r = catalog.asRegistrar();
+    // Category is set on the catalog, not passed per tool — matching fakeCatalog
+    // above and the real registration order.
+    catalog.setCategory("models");
+    r.tool("download_model", "Download a model file to the local install.", {}, async () => ({ content: [] }));
+    r.tool("list_local_models", "List installed checkpoints.", {}, async () => ({ content: [] }));
+    catalog.setCategory("cloud");
+    r.tool("runpod", "Manage pods. You can download model files onto a pod.", {}, async () => ({ content: [] }));
+    // Terms deliberately FAR APART and in neither order, so a phrase match cannot
+    // pass by accident. The download_model fixture cannot serve this: its corpus
+    // reads "download model download a model file…", which contains the reversed
+    // phrase "model download" by sheer concatenation — a surviving mutation is
+    // what exposed that, and the test it made vacuous looked perfectly good.
+    catalog.setCategory("system");
+    r.tool("clear_vram", "Free GPU memory held by the cache after a long run.", {}, async () => ({ content: [] }));
+    return catalog;
+  }
+
+  it("matches an identifier when the caller types it with a SPACE (#1525)", () => {
+    const manifest = buildManifest(separatorCatalog(), { search: "download model" });
+
+    // The reporter's tool is present — this is the whole bug.
+    expect(manifest).toContain("download_model");
+    // And it is the ONLY result: the tool whose NAME says it wins outright over
+    // one that merely mentions downloading models in prose. Measured against the
+    // real 37-tool surface, term-matching alone returned 10 tools here and 19 for
+    // "install node" — findable, but still the "misleading filter" the report is
+    // actually about.
+    expect(manifest).toContain("1 of 4 tools");
+    expect(manifest).not.toContain("runpod");
+    expect(manifest).not.toContain("list_local_models");
+  });
+
+  it("falls back to the full corpus when NO name matches", () => {
+    // The name tier must not cost the corpus search that makes parameter and
+    // description text findable — "liveness" and "sampling" appear in no tool
+    // name at all, and those cases are why the corpus search exists.
+    const manifest = buildManifest(separatorCatalog(), { search: "checkpoints" });
+    expect(manifest).toContain("list_local_models");
+    expect(manifest).not.toContain("download_model");
+  });
+
+  it("matches with the separator typed either way round", () => {
+    // Both spellings of the same intent must work, in both directions.
+    expect(buildManifest(separatorCatalog(), { search: "download_model" })).toContain("download_model");
+    expect(buildManifest(separatorCatalog(), { search: "DOWNLOAD MODEL" })).toContain("download_model");
+    // A hyphenated query for an underscored name.
+    expect(buildManifest(separatorCatalog(), { search: "download-model" })).toContain("download_model");
+  });
+
+  it("matches terms in ANY order and NOT adjacent (#1525)", () => {
+    // "run" and "memory" both appear in clear_vram's description, far apart, in
+    // neither given order — and no tool NAME carries both, so this exercises the
+    // corpus tier specifically. A literal phrase match finds nothing here.
+    expect(buildManifest(separatorCatalog(), { search: "run memory" })).toContain("clear_vram");
+    expect(buildManifest(separatorCatalog(), { search: "memory run" })).toContain("clear_vram");
+  });
+
+  it("scopes the NAME tier to the category being browsed", () => {
+    // Computed over the whole catalog, a name hit in ANOTHER category suppressed
+    // the corpus results inside the one the caller asked for — the tier silently
+    // emptying the very view being browsed. Within a category the question is
+    // "which of THESE", so the tier is answered from the set the loop will show.
+    const manifest = buildManifest(separatorCatalog(), { category: "cloud", search: "download model" });
+
+    // `download_model` is in `models`, so it cannot appear here...
+    expect(manifest).not.toContain("download_model");
+    // ...and `runpod`, which mentions downloading model files, is the honest
+    // answer for this category rather than an empty result.
+    expect(manifest).toContain("runpod");
+  });
+
+  it("DISCLOSES that results were chosen by name, and how many it withheld", () => {
+    // The name tier is narrowing, not preserving: "download model" used to return
+    // runpod and no longer does. A caller who cannot tell a name-tier result from
+    // "everything that matched" will read a one-line answer as the whole answer.
+    const manifest = buildManifest(separatorCatalog(), { search: "download model" });
+
+    expect(manifest).toContain("Showing tools whose NAME matches");
+    // Counted, not hand-waved: runpod is the one tool the corpus search would
+    // have returned here and this view is not showing.
+    expect(manifest).toContain("1 other tool(s) also match");
+    // It must NOT claim WHERE those tools matched. The corpus includes the name,
+    // so a tool taking one term from its name and the rest from its description
+    // is counted correctly while "matches in its description or parameters" would
+    // be false for it — an accurate number wrapped in an inaccurate sentence.
+    expect(manifest).not.toMatch(/mention these terms in their description/);
+  });
+
+  it("says nothing about a name tier when the corpus answered", () => {
+    // No tool NAME contains both terms, so nothing was withheld and the note must
+    // not appear — otherwise it would read as though results were being hidden.
+    const manifest = buildManifest(separatorCatalog(), { search: "run memory" });
+
+    expect(manifest).toContain("clear_vram");
+    expect(manifest).not.toContain("Showing tools whose NAME matches");
+  });
+
+  it("keeps dots and slashes LITERAL (codex)", () => {
+    // Folding them bought nothing — no tool name has one — and cost precision:
+    // "v1.2" would split into "v1" + "2", each matching anywhere.
+    const catalog = new ToolCatalog();
+    const r = catalog.asRegistrar();
+    catalog.setCategory("misc");
+    r.tool("alpha", "Handles v1.2 payloads.", {}, async () => ({ content: [] }));
+    r.tool("beta", "Handles v1 and takes 2 arguments.", {}, async () => ({ content: [] }));
+
+    const manifest = buildManifest(catalog, { search: "v1.2" });
+    expect(manifest).toContain("alpha");
+    // `beta` would match if the dot were folded into a term separator.
+    expect(manifest).not.toContain("- beta");
+  });
+
+  it("requires EVERY term, so multi-word search still narrows", () => {
+    // Order-independent, but not an OR: a tool matching only one term is excluded.
+    const both = buildManifest(separatorCatalog(), { search: "model download" });
+    expect(both).toContain("download_model");
+
+    const onlyOne = buildManifest(separatorCatalog(), { search: "download checkpoints" });
+    // list_local_models has "checkpoints" but not "download"; download_model the
+    // reverse. Neither has both, so neither matches.
+    expect(onlyOne).toContain("No tools matched");
+  });
+
+  it("treats a whitespace-only search as no search at all", () => {
+    const manifest = buildManifest(separatorCatalog(), { search: "   " });
+    expect(manifest).toContain("4 of 4 tools");
+    expect(manifest).not.toContain("FILTERED view");
+    // The HEADER too. It used to test raw `opts.search`, so a whitespace-only
+    // query stamped "(filtered)" onto a complete catalog — the behaviour was
+    // right and this one line disagreed with it, which is exactly the sort of
+    // half-true label this file keeps having to correct.
+    expect(manifest).not.toContain("(filtered)");
+  });
+
   it("suggests categories when nothing matches", () => {
     const manifest = buildManifest(fakeCatalog(), { search: "no-such-thing" });
     expect(manifest).toContain("No tools matched");
@@ -270,6 +412,32 @@ describe("compact mode over a real MCP client/server pair", () => {
   // bundled debug-render / director skills name panel_* tools), and an outside MCP
   // client reading it holds none of them.
   describe("a panel_* name is answered as a wrong-surface fact, not as non-existence (#804)", () => {
+    it("#1353: a DEFERRED/code-mode client is told where to look before concluding absence", async () => {
+      // The reporter's Codex code-mode session declared the live-canvas tools missing,
+      // repeatedly, while the panel MCP endpoint was answering tools/list with 91 tools
+      // and HTTP 200. No transport error anywhere — the failure was this message.
+      //
+      // It said "if it offers nothing under `panel_`, there is no live-canvas route
+      // from here". On code-mode the panel tools are DEFERRED: they sit in the
+      // ALL_TOOLS catalog as `mcp__panel__panel_graph_outline`, so a scan of the direct
+      // declarations for a bare `panel_` prefix finds nothing and the sentence licenses
+      // exactly the wrong conclusion.
+      const client = await compactPair(fakeCatalog());
+      const res = (await client.callTool({
+        name: "call_tool",
+        arguments: { name: "panel_graph_outline" },
+      })) as { isError?: boolean };
+      const text = textOf(res as never);
+
+      // The prefixed name it must actually look for…
+      expect(text).toContain("mcp__panel__panel_graph_outline");
+      // …the catalog it lives in…
+      expect(text).toMatch(/ALL_TOOLS/);
+      expect(text).toMatch(/deferred/i);
+      // …and the absence test now requires BOTH to be empty before concluding.
+      expect(text).toMatch(/Only when BOTH the direct declarations and the deferred catalog/);
+    });
+
     it("names the panel surface, and gives a remedy for BOTH surfaces the caller might hold", async () => {
       const client = await compactPair(fakeCatalog());
       const res = (await client.callTool({

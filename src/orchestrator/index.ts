@@ -7,7 +7,7 @@
 // of relying on an idle interactive session to notice a channel push — and spawns
 // one Claude Agent SDK streaming session per panel tab (src/orchestrator/
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
-// key. See docs/design/panel-orchestrator.md.
+// key. See design/panel-orchestrator.md.
 
 import {
   existsSync,
@@ -43,7 +43,7 @@ import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
 import { SelfRestarter, canSelfRestart } from "../services/self-restart.js";
 import { pairUrlDurability } from "./pair-durability.js";
 import { loadOrCreatePairToken } from "./pair-token-store.js";
-import { SessionStore, workflowIdentityParts } from "./session-store.js";
+import { SessionStore, workflowIdentityParts, carryWorkflowCommandStamp } from "./session-store.js";
 import { unreachableReason, noPanelTabReason, identityReason } from "./fence-refusal.js";
 import {
   SHARED_SESSION_SCOPE,
@@ -62,7 +62,49 @@ import {
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { setConnectedPanelOrigins } from "../comfyui/fetch.js";
+import { publishConnectedPanelOrigins } from "../services/panel-origin-channel.js";
 import { logger } from "../utils/logger.js";
+import { listDownloadJobs } from "../services/download-jobs.js";
+import { completionDisagreesWithRecord } from "./download-done-guard.js";
+import { assembleVocabularyHash, describeVocabularySkew } from "../tools/vocabulary.js";
+import { buildPanelToolDefs } from "./panel-tools.js";
+
+/** The panel vocabulary hashes whose MISMATCH has already been reported (#236).
+ *
+ *  Keyed by the HASH ALONE, not by tab. Codex round 2 found that a per-tab key lets a
+ *  stale entry suppress a real mismatch: `wf:` ids are reused, so a tab that closes
+ *  after warning leaves an entry that silences the NEXT tab opening the same workflow.
+ *
+ *  Keying by hash is not a patch for that, it is the correct granularity. The fact
+ *  being reported — "the vocabulary this panel build vendored disagrees with this
+ *  server's" — is a property of the panel BUILD, not of a tab or a workflow. Saying it
+ *  once per distinct disagreeing vocabulary is exactly the news there is; saying it
+ *  once per tab was always repeating one fact under different labels.
+ *
+ *  It also bounds itself: a process sees one or two panel builds, so the set holds one
+ *  or two entries where the per-tab map grew with every id ever minted. */
+const loggedVocabularySkew = new Set<string>();
+
+/** A cap anyway (codex round 1, P2). Nothing legitimate mints hashes — a panel
+ *  advertises one per build — but this reads a value off the wire, and a broken or
+ *  hand-modified panel that sent a fresh hash every hello would otherwise grow the set
+ *  without limit. Oldest-first eviction, and the direction stays safe: an evicted entry
+ *  can only cause a mismatch to be reported a SECOND time, never suppress one, because
+ *  entries only ever suppress. */
+const MAX_LOGGED_VOCABULARY_SKEW = 64;
+
+/** This server's vocabulary hash, computed once.
+ *
+ *  Memoised because it cannot change without a restart (the tool surface is fixed at
+ *  build time) and buildPanelToolDefs() walks every panel tool definition — work that
+ *  has no business running on every hello, which is a hot path during a reconnect loop. */
+let cachedServerVocabularyHash: string | undefined;
+function serverVocabularyHash(): string {
+  cachedServerVocabularyHash ??= assembleVocabularyHash(
+    buildPanelToolDefs().map((d) => d.name),
+  );
+  return cachedServerVocabularyHash;
+}
 import {
   PanelAgentManager,
   fetchSupportedModels,
@@ -76,6 +118,10 @@ import {
 } from "./panel-agent.js";
 import { promptText } from "./error-text.js";
 import { callToolAdmission } from "./call-tool-admission.js";
+import {
+  DEFERRED_PANEL_TOOLS_STEERING,
+  withDeferredPanelToolsNote,
+} from "../deferred-panel-tools.js";
 import {
   createPanelMcpServer,
   makePanelToolCtx,
@@ -95,6 +141,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
 import { tryInstallRetiredNameRedirect } from "../tools/retired-redirect.js";
 import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
+import { normalizeInstallPathEnv } from "../utils/install-path-env.js";
 import {
   buildComfyuiMcpEnv,
   comfyuiSecretKeys,
@@ -136,7 +183,12 @@ import { SYSTEM as MODEL_CARD_SYSTEM } from "./ai-proposer.js";
 import { resolvePrompt, registerPrompt, onPromptsChanged } from "../services/prompt-overrides.js";
 import { allBackendReadiness, piCredentialPresent } from "./backend-readiness.js";
 import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth-bridge.js";
-import { buildStartFailureNotice } from "./start-failure-notice.js";
+// HUMAN-facing `say` bubbles only — `trFor`, never `tr`: each frame renders inside one
+// specific panel tab, in THAT user's language (bridge.tabLocale), not the language of
+// whoever launched this process. Everything else this file emits — tool text, system
+// prompts, ack `message` fields, log lines — is read by a machine and stays English.
+import { trFor } from "../i18n/index.js";
+import { buildStartFailureNotice, startFailureSay } from "./start-failure-notice.js";
 import { readyBannerText, bannerCorrection } from "./ready-banner.js";
 import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import {
@@ -208,9 +260,14 @@ const MCP_VERSION_RUNNING = ((): string | undefined => {
   }
 })();
 
-const PANEL_SYSTEM_APPEND = `You are the autonomous assistant embedded directly in a ComfyUI sidebar panel. The person is working in ComfyUI and talks to you through that panel: their messages arrive as your prompts, and everything you write is shown to them in the panel chat. Write for that reader — lead with the result, keep replies short and concrete, and don't narrate routine internal steps.
+/** Exported for tests (#1398): the RENDERED persona is the only thing that proves
+ *  the deferred-catalog guidance actually reaches an agent — a template literal that
+ *  silently failed to interpolate would type-check, build, and ship the placeholder. */
+export const PANEL_SYSTEM_APPEND = `You are the autonomous assistant embedded directly in a ComfyUI sidebar panel. The person is working in ComfyUI and talks to you through that panel: their messages arrive as your prompts, and everything you write is shown to them in the panel chat. Write for that reader — lead with the result, keep replies short and concrete, and don't narrate routine internal steps.
 
 You can SEE and EDIT the workflow the user currently has open, via the panel_* tools (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_get_errors, panel_save_workflow, …). STRONGLY PREFER building on their live canvas: read it first (panel_graph_outline, then panel_query_graph for specifics), add/wire/configure nodes with the panel_* tools, then panel_run to queue it — so the user watches the work happen and the result loads in their own workflow with full Ctrl+Z undo. Only fall back to the headless generate_image/enqueue_workflow tools when the user explicitly wants a one-off they don't need on their canvas, or when no panel tab is connected (a panel_* call will error if so). On a LARGE graph (a loaded pack/template with dozens of nodes), do NOT dump the whole thing and scan it — and NEVER shell out to grep/jq/python over a saved workflow file. To UNDERSTAND the graph, call panel_graph_outline FIRST: a compact, dependency-ordered TEXT map (nodes topologically sorted source→sink, each with its key widgets and ← inputs / → outputs wiring, plus a groups index) made for you to read top-to-bottom. To PINPOINT and INSPECT specific nodes, use panel_query_graph: filter by types/title/widget predicates ('cfg>7'), traverse upstream_of/downstream_of a node, aggregate with group_by:'type', and read ONE node's exact slot/widget detail with {ids:[id], fields:'detail'} — output is token-bounded so it can never flood your context. panel_find_nodes remains for free-text search across all fields.
+
+${DEFERRED_PANEL_TOOLS_STEERING}
 
 PROMPT DIRECTOR AWARENESS. When the graph contains PromptDirector, PromptDirectorAuto, PromptDirectorContext, PromptProducer, or PromptDirectorResultCritic nodes, call panel_audit_prompt_director before declaring that the prompt/model/LoRA setup is correct or diagnosing a failed edit. The audit correlates live wiring and loader widgets with the nodes' resolved Model Explorer metadata, edit plan, LoRA compatibility/strengths, exact final prompt, warnings, and critic verdict. Surface concise, useful observations proactively (including when the configuration is coherent). Its recommendations are READ-ONLY proposals: ask before applying panel_set_widget/panel_connect changes unless the user already explicitly asked you to fix the workflow.
 
@@ -241,6 +298,8 @@ PREFER READY EXPERTISE OVER HAND-BUILDING. When the user asks you to "set up", "
 OPENING A STAGED / DOWNLOADED WORKFLOW. When you've saved or downloaded a workflow .json into the user's ComfyUI workflows folder (e.g. an example you fetched), open it with panel_open_workflow(path:<name-or-path>) — it now REFRESHES the frontend's (cached) workflow list before searching, so a just-staged file is found and opened natively in its own tab. For a workflow .json that lives OUTSIDE the workflows folder (any absolute path on the ComfyUI machine, or a downloaded example you didn't move into workflows/), load it directly onto the live canvas with panel_load_workflow(path:<file>) — the orchestrator reads + parses the JSON server-side and drops it on the canvas in one shot, so even a large (100KB+) workflow never has to shuttle through this chat. Prefer panel_load_workflow(path:<file>) over pasting a big workflow JSON inline as the graph arg.
 
 RESOLVING A TANGLED / TOGGLE-HEAVY WORKFLOW (Get/Set buses + rgthree-bypassed pipelines). Expert and community graphs are often thick with VIRTUAL WIRING — GetNode/SetNode buses and Reroutes that hide the real connections — and rgthree "Fast Groups Bypasser/Muter" TOGGLED PIPELINES (one graph holding several pipelines, only one active at a time). Do NOT hand-trace GetNode→SetNode links or guess which branches are live. To get the REAL wiring: call panel_strip_workflow(path:<file> | pack:<name> | graph:<json>) — it resolves Get/Set buses, Reroutes, subgraph definitions, and bypassed/muted nodes into REAL connections and returns the flat, runnable graph (read server-side, never shuttled through chat). If the file is a MULTI-PIPELINE monolith and you only want ONE pipeline, FIRST panel_slice_workflow(path:<file>, groups:[<group-title substrings>]) to carve that pipeline into a standalone activated graph (it seeds from the output nodes in those groups, takes their backward closure through links + Set/Get buses, and un-bypasses the kept nodes), THEN panel_strip_workflow to flatten the buses. Reach for panel_strip_workflow whenever a graph is too tangled to read directly or you need to UNDERSTAND or REBUILD its actual wiring (e.g. a staged expert example full of GetNode/SetNode/Reroute); reach for panel_slice_workflow when an ULTRA-style monolith bundles several toggled pipelines and you want just one. (The same two tools exist as the MCP get_workflow (action:"strip") / get_workflow (action:"slice") for non-panel sessions.)
+
+AUTHORING rgthree TOGGLES (the counterpart to reading them, above). Fast Groups Bypasser/Muter are FRONTEND-ONLY — registered by the pack's JS and absent from /object_info BY DESIGN, so their absence there is NOT evidence they're unavailable; panel_add_node adds them (it exempts a small allowlist of genuinely frontend-only types, which covers the Fast (Groups) Bypasser/Muter, Label, Reroute and Node Collector — but NOT Bookmark, the Mute/Bypass Relay/Repeater, Fast Actions Button or Random Unmuter, which it refuses fail-closed). They are configured with panel_set_property, NOT panel_set_widget (matchTitle/matchColors/sort/toggleRestriction are node PROPERTIES; panel_set_widget refuses them). They take no wiring and enumerate GROUPS by title, so create and NAME the groups FIRST, and always set matchTitle or the node lists every group in the workflow. Group membership is GEOMETRIC (any node whose centre lands in the box) — when panel_create_group returns extra_node_ids/missing_node_ids and a warning, FIX IT before toggling, or a toggle disables part of the wrong stage. Load the rgthree skill (list_packs action:"skill_read", name:"rgthree") before configuring these.
 
 RECOMMENDING CIVITAI MODELS — SHOW, DON'T JUST TELL. When the user asks about or you're recommending specific CivitAI resources (a "good relight LoRA?", "which Flux checkpoint?", "find me an anime style"), LEAN TOWARD opening the docked CivitAI browser and highlighting your picks rather than answering with only a text table. Flow: panel_open_civitai (docked, matched query/tab/filters) → panel_civitai_search to refine → panel_civitai_results to read the metadata + URLs → panel_civitai_highlight the one(s) you recommend, with a BRIEF text summary of why each fits. This docks beside the chat so both stay visible, and lets the user SEE the actual cards. (Note: you read metadata + URLs only, not the images.) It's a nudge, not a mandate — a quick factual answer or a resource the user already named is fine as text; reach for the browser when they're choosing between options or exploring.
 
@@ -343,6 +402,20 @@ The panel tools cannot come back during this session — the tool set was fixed 
  * lies when the bind fails" is precisely the kind of thing that stays broken when
  * only the happy path is exercised.
  */
+/**
+ * The panel persona as an agent actually receives it (#1398).
+ *
+ * The deferred-catalog guidance is re-applied AFTER `resolvePrompt`, because a
+ * locale translation or a user persona override replaces the WHOLE string and would
+ * otherwise take it with them — reproducing #1398 in exactly the deployments least
+ * equipped to diagnose it (codex review, P1). Exported so that re-application is a
+ * TESTABLE unit: inlining it at the call site made dropping it invisible to every
+ * test, which a mutation run confirmed.
+ */
+export function resolvePanelPersona(): string {
+  return withDeferredPanelToolsNote(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND));
+}
+
 export function panelToolsRetraction(backend: string, panelToolsAvailable: boolean): string {
   if (panelToolsAvailable) return "";
   // pi has no MCP client at all; PI_CAPABILITY_OVERRIDE already retracts strictly
@@ -930,6 +1003,75 @@ export class DownloadProgressSnapshots {
   }
 }
 
+/**
+ * #1524 — a startup that never finishes must not become a silent resident.
+ *
+ * A respawn was observed alive for hours holding NO listening ports, while an
+ * older instance owned 9180/9181/9183. That is not the bind-failure path: that
+ * one is bounded (five attempts, then `whenReady()` resolves false), tries to
+ * reclaim the port, and exits non-zero with a clear message. A process with no
+ * ports at all never got that far — it hung EARLIER, so any guard wrapped around
+ * the bind itself would miss it.
+ *
+ * Hence a deadline armed as early as this function runs and disarmed only once
+ * the port is actually held. It does not care WHERE the hang is, which is the
+ * point: the failure it prevents is not "bind failed" but "we never found out",
+ * and the reporter's framing is that silently staying alive with zero bound ports
+ * is the worst of the available outcomes.
+ *
+ * WHAT IT DOES NOT COVER, because an earlier draft of this comment claimed "the
+ * whole of startup" and that was false (codex):
+ *
+ *   - anything before `boot.ts` finishes dynamically importing this module — the
+ *     timer does not exist yet;
+ *   - a SYNCHRONOUS stall anywhere, which no timer can interrupt, because the
+ *     event loop it would fire on is the one that is blocked.
+ *
+ * So this closes the async-hang shape of the report and cannot close the
+ * synchronous one. If a portless process is ever seen again with this in place,
+ * that difference is the first thing to check, and it is written down here so the
+ * next reader does not have to rediscover it.
+ *
+ * Generous by default (90s) because a cold `npx` start on a slow disk is
+ * legitimately slow, and env-tunable for pathological machines. Exits non-zero so
+ * a supervisor restarts rather than inheriting a half-alive process.
+ */
+export function armStartupDeadline(
+  port: number,
+  deps: { exit?: (code: number) => never; incumbent?: (p: number) => number | undefined } = {},
+): () => void {
+  const exit = deps.exit ?? ((code: number) => process.exit(code));
+  const findIncumbent = deps.incumbent ?? pidListeningOnPort;
+  // CLAMPED, not merely "positive and finite" (codex). Node coerces a
+  // sub-millisecond delay AND anything past the 32-bit signed limit to 1ms — so
+  // `0.5`, or a large number typed by someone trying to RAISE the deadline, would
+  // fire almost instantly and kill every healthy startup. A guard whose escape
+  // hatch can cause the outage it prevents is worse than no guard, so out-of-range
+  // values fall back to the default rather than being honoured literally.
+  const raw = Number(process.env.COMFYUI_MCP_STARTUP_DEADLINE_MS);
+  const MIN_MS = 1_000;
+  const MAX_MS = 2_147_483_647; // Node's setTimeout ceiling
+  const ms = Number.isFinite(raw) && raw >= MIN_MS && raw <= MAX_MS ? Math.floor(raw) : 90_000;
+  const timer = setTimeout(() => {
+    const incumbent = findIncumbent(port);
+    logger.error(
+      `[panel-orchestrator] startup did not complete within ${Math.round(ms / 1000)}s and this ` +
+        `process holds no bridge port — exiting rather than lingering with no way to serve panel_* ` +
+        `tools.` +
+        (incumbent
+          ? ` Port ${port} is held by pid ${incumbent}; if that is an older comfyui-mcp, stop it ` +
+            `and start this one again.`
+          : ` Nothing is listening on ${port} either, so the hang is before the bind — please ` +
+            `report this with the last lines above (#1524).`) +
+        ` Raise COMFYUI_MCP_STARTUP_DEADLINE_MS if this machine is legitimately slower than that.`,
+    );
+    exit(1);
+  }, ms);
+  // Never hold the event loop open on this timer's account.
+  timer.unref?.();
+  return () => clearTimeout(timer);
+}
+
 export async function runPanelOrchestrator(): Promise<void> {
   // Crash guard: the orchestrator is a long-lived background process the user
   // can't see. A stray rejection (e.g. a fire-and-forget push to a tab that
@@ -942,6 +1084,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       `[panel-orchestrator] unhandled rejection (ignored): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`,
     );
   });
+
+  // #1524 — armed HERE, before anything that can block, and disarmed only once
+  // the bridge port is actually held. The port is re-derived rather than passed
+  // in because the deadline has to exist before the block that computes it.
+  const disarmStartupDeadline = armStartupDeadline(
+    Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180,
+  );
   process.on("uncaughtException", (err) => {
     // A synchronous uncaught throw leaves the process in an UNDEFINED state. The
     // old "log + continue" here was a zombie root cause — the orchestrator stayed
@@ -1146,6 +1295,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     );
     process.exit(1);
   }
+  // The port is ours — startup got where it needed to. Everything after this is
+  // long-running work the deadline must not police.
+  disarmStartupDeadline();
 
   // With a pinned pair token, bring the LAN pairing listener up now so a phone's
   // saved URL reconnects across restarts without ever touching the panel. This is
@@ -1253,9 +1405,18 @@ export async function runPanelOrchestrator(): Promise<void> {
   // orchestrator previously read ONLY the env var, so a Desktop user without
   // COMFYUI_PATH always landed in "local install/pack tools limited" even with
   // a local install the MCP itself could find.
-  const envComfyuiPath = process.env.COMFYUI_PATH;
+  // #1512 — the SECOND ingestion point, and the one a fix confined to
+  // resolveComfyUIPath would have missed: this reads the env var directly, and
+  // what it produces is handed to the spawn env builders and to
+  // resolveComfyuiPathForTarget. A trailing space here does not merely fail a
+  // check locally — it is passed on to every agent this orchestrator starts.
+  // Same normalizer as config.ts so the two can never drift apart, which is the
+  // shape of the original bug (panel stripped it, orchestrator did not).
+  const envComfyuiPath = normalizeInstallPathEnv(process.env.COMFYUI_PATH).path;
   // `||` not `??`: a set-but-empty COMFYUI_PATH= means "unset" (the headless
   // MCP's config truthy-checks it the same way) — it must not block detection.
+  // normalizeInstallPathEnv already maps a whitespace-only value to undefined,
+  // so "   " now reaches detection too instead of being adopted as a path.
   const localComfyuiPath = envComfyuiPath || detectLocalComfyUIPath();
   const isLoopbackUrl = (u: string): boolean => {
     try {
@@ -1714,6 +1875,25 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     parkedConversationFrames.set(key, q);
   };
+  /**
+   * A HUMAN-facing `say` fanned out to a conversation's tabs, rendered PER TAB.
+   *
+   * pushToConversation cannot serve this: one conversation can span tabs whose panels are in
+   * DIFFERENT languages, and a single pre-rendered string would then be wrong on all but one
+   * of them. `build` is called once per recipient with that tab's own locale.
+   *
+   * With no tab connected the frame parks like any other (replayed on the next hello),
+   * rendered in English: the tab that will eventually receive it has not told us its language
+   * yet, and English is the honest default rather than a guess.
+   */
+  const pushSayToConversation = (key: string, build: (locale: string) => string): void => {
+    const tabs = conversationDeliveryTabs(key, "say");
+    if (!tabs.length) {
+      pushToConversation(key, { type: "say", text: build("en") });
+      return;
+    }
+    for (const t of tabs) bridge.push({ type: "say", text: build(bridge.tabLocale(t)) }, t);
+  };
   // The REAL tab ids participating in the conversation that `originTab` belongs
   // to — used when a conversation BOUNDARY (New chat / resume switch / rewind)
   // must close every participating tab's journaled tickets, not just the
@@ -1780,7 +1960,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // mirror-image lie: claiming to be a build we are not running.
   const mcpVersionRunning = MCP_VERSION_RUNNING;
   let latestPanelVersion: string | undefined;
-  let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
+  let panelSystemAppend = resolvePanelPersona();
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
   // manager.opts.systemAppend at each spawn; Codex reads the closed-over
@@ -1802,7 +1982,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion: mcpVersionRunning, panelVersion: latestPanelVersion });
       if (gen !== envRefreshGen) return; // a newer refresh superseded us — drop this stale result
       envCaps = caps;
-      panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
+      panelSystemAppend = buildPanelSystemAppend(resolvePanelPersona(), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
       if (gen !== envRefreshGen) return; // superseded — let the newer refresh own the prompt
@@ -1813,7 +1993,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // non-default backend would rebuild a stale env block off the old caps,
       // disagreeing with the reset panelSystemAppend (#358 wiring).
       envCaps = undefined;
-      panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
+      panelSystemAppend = resolvePanelPersona();
       logger.debug(
         `[panel-orchestrator] env-capabilities probe failed (using static prompt): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -1833,7 +2013,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       return panelSystemAppend;
     }
     return buildPanelSystemAppend(
-      resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND),
+      resolvePanelPersona(),
       { ...envCaps, backend, otherBackendAvailable },
     );
   };
@@ -1889,6 +2069,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     // it as a real env override — a revoke that did not revoke.
     // Test-only tool-call trace (knowledge-parity smoke). No-op unless set.
     ...(process.env.COMFYUI_MCP_TOOL_TRACE ? { COMFYUI_MCP_TOOL_TRACE: process.env.COMFYUI_MCP_TOOL_TRACE } : {}),
+    // #873 — the tool-surface policy is forwarded in buildComfyuiMcpEnv(), which BOTH
+    // comfyui spawn lanes share. It was here first, and here is only the Codex/Gemini
+    // lane: the default Claude lane calls buildComfyuiMcpEnv directly and got nothing.
   });
 
   // The orchestrator-hosted HTTP MCP for panel_* tools. Started for the
@@ -2416,7 +2599,20 @@ export async function runPanelOrchestrator(): Promise<void> {
       // start-failure-notice.ts so it is unit-testable (issue #255). #884: the
       // frames fan out to every tab on the failed backend's conversation.
       const { backend, frames } = buildStartFailureNotice(key, message, defaultBackend);
-      for (const frame of frames) pushToConversation(key, frame);
+      for (const frame of frames) {
+        // The say is the only HUMAN-facing frame of the three, and #884's conversation
+        // spans every tab on this backend — which can be several panels in DIFFERENT
+        // languages. So it is rendered per recipient rather than pushing one pre-rendered
+        // copy; deriving a single locale from the key cannot work either, since the key is
+        // usually the SCOPE address `orchestrator::<backend>` and resolves to whichever tab
+        // happens to be pinned or last-active. The ack + turn are machine state and fan out
+        // unchanged. Push order (say → ack → turn) is preserved.
+        if (frame.type === "say") {
+          pushSayToConversation(key, (locale) => startFailureSay(backend, message, locale));
+        } else {
+          pushToConversation(key, frame);
+        }
+      }
       logger.warn(
         `[panel-orchestrator] ${backend} agent failed to start — degraded THIS backend's conversation only, other providers unaffected (${message})`,
       );
@@ -2784,21 +2980,40 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     try {
       for (const [panelTab, { runs, answers, withheld }] of byTab) {
+        // Per TAB, so each person reads this in their own panel's language. `{ count }` is
+        // passed even though the English fallback hedges with "(s)": it lets a catalog
+        // supply real plural forms (`_one`/`_few`/`_other` via Intl.PluralRules, which
+        // knows Korean has one form and Russian four) without touching the English here.
+        const locale = bridge.tabLocale(panelTab);
         // Two different losses, two different remedies — never merged.
-        const parts: string[] = ["⚠️ The agent backend is being restarted."];
+        const parts: string[] = [
+          `⚠️ ${trFor(locale, "say.restart_lost.header", "The agent backend is being restarted.")}`,
+        ];
         if (runs.length) {
+          // `get_history (action:"list")` is a TOOL CALL the user relays to the agent, so it
+          // stays spelled exactly as typed in every language.
           parts.push(
-            `${runs.length} finished render result(s) could not be delivered (${runs.join("; ")}). ` +
-              `Their outcome is UNDETERMINED from the agent's point of view — ask it to check \`get_history (action:"list")\` ` +
-              `for those runs once it reconnects rather than assuming it saw them.`,
+            trFor(
+              locale,
+              "say.restart_lost.runs",
+              `{count} finished render result(s) could not be delivered ({runs}). ` +
+                `Their outcome is UNDETERMINED from the agent's point of view — ask it to check \`get_history (action:"list")\` ` +
+                `for those runs once it reconnects rather than assuming it saw them.`,
+              { count: runs.length, runs: runs.join("; ") },
+            ),
           );
         }
         if (answers.length) {
           parts.push(
-            `${answers.length} answer(s) you gave on a question card never reached the agent: ${answers.join("; ")}. ` +
-              `An answer is not a render — there is NO history to look it up in, and the agent has no way to ` +
-              `recover it once this restart completes. Please tell it your choice again (or paste the text above) ` +
-              `when it comes back.`,
+            trFor(
+              locale,
+              "say.restart_lost.answers",
+              `{count} answer(s) you gave on a question card never reached the agent: {answers}. ` +
+                `An answer is not a render — there is NO history to look it up in, and the agent has no way to ` +
+                `recover it once this restart completes. Please tell it your choice again (or paste the text above) ` +
+                `when it comes back.`,
+              { count: answers.length, answers: answers.join("; ") },
+            ),
           );
         }
         if (withheld > 0) {
@@ -2806,9 +3021,14 @@ export async function runPanelOrchestrator(): Promise<void> {
           // replaced (a new chat, a rewind, a provider switch, another tab taking
           // this workflow). Their text is in the log, not on this screen.
           parts.push(
-            `${withheld} further answer(s) on this tab belong to an earlier conversation that has ` +
-              `since been replaced; they were never delivered either, but they are not shown here ` +
-              `because they were not given to the conversation you are in now.`,
+            trFor(
+              locale,
+              "say.restart_lost.withheld",
+              `{count} further answer(s) on this tab belong to an earlier conversation that has ` +
+                `since been replaced; they were never delivered either, but they are not shown here ` +
+                `because they were not given to the conversation you are in now.`,
+              { count: withheld },
+            ),
           );
         }
         bridge.push({ type: "say", text: parts.join(" ") }, panelTab);
@@ -3063,10 +3283,16 @@ export async function runPanelOrchestrator(): Promise<void> {
           // #884 — keys are shared (`orchestrator::<backend>`); the notices fan
           // out to that backend's conversation like any other agent output.
           if (msgs.length > 0) {
-            pushToConversation(key, {
-              type: "say",
-              text: "✅ Render finished — the local agent is back. Answering your queued message now.",
-            });
+            // Per tab: this conversation's members may be in different panel languages.
+            pushSayToConversation(
+              key,
+              (locale) =>
+                `✅ ${trFor(
+                  locale,
+                  "say.local_agent_resumed",
+                  "Render finished — the local agent is back. Answering your queued message now.",
+                )}`,
+            );
           }
           for (const m of msgs) {
             pushToConversation(key, { type: "turn", state: "working" });
@@ -3177,7 +3403,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     // the action" nudge is not, so it must never broadcast to unrelated tabs.
     // restartAllForMcpEnv() is nudge-preserving, so this can't erase a per-request
     // nudge already queued on another tab (#164).
-    const tally = manager.restartAllForMcpEnv();
+    //
+    // #1567 — arm the orphan check BEFORE restarting, because an idle tab respawns
+    // inside this call. This is the ONLY path allowed to arm it: a respawn from a
+    // credential save is the one that queues, waits turns, and then kills whatever
+    // transfers exist by then. Scoped to the tab this change belongs to, matching the
+    // retry nudge below — the transfers are global (every tab's child is replaced), so
+    // it must be reported once rather than once per tab.
+    const tally = manager.restartAllForMcpEnvAfterCredentialChange(change.tabId ?? null);
     // NUDGE only the tab whose panel_request_secret this change answers — a
     // Settings slot save, a background token (re)load, or a revoke leaves
     // `requested` false and nudges nothing. The per-tab pending-restart map
@@ -3524,6 +3757,50 @@ export async function runPanelOrchestrator(): Promise<void> {
         latestPanelVersion = helloPanelVer;
         void refreshEnvCapabilities();
       }
+      // #236 — THE VOCABULARY HANDSHAKE, at the handshake.
+      //
+      // `describeVocabularySkew` and the hash it compares have existed, fully
+      // unit-tested, since the #683 follow-up, and NOTHING called them: the bridge
+      // stored the panel's advertised hash on every hello under a comment promising
+      // this exact check, and no code read the field. A mechanism can be completely
+      // unreachable and still pass every test it has — the tests proved the function
+      // worked, never that it ran — so the call site below is asserted directly, by
+      // source, in vocabulary-handshake.test.ts.
+      //
+      // The comparison is done HERE rather than in the bridge because the server's own
+      // hash needs buildPanelToolDefs(), and panel-tools.ts imports ui-bridge.ts — the
+      // bridge cannot reach it without a cycle. The orchestrator already imports both.
+      const helloVocabHash = (event as { vocabulary_hash?: unknown }).vocabulary_hash;
+      {
+        const advertised =
+          typeof helloVocabHash === "string" && helloVocabHash ? helloVocabHash : undefined;
+        const skew = describeVocabularySkew(
+          serverVocabularyHash(),
+          advertised,
+          typeof helloPanelVer === "string" ? helloPanelVer : undefined,
+        );
+        // Reported once per DISTINCT disagreeing vocabulary, for the whole process.
+        // A reconnect ping-pong repeats the same hello every few seconds and the same
+        // skew is not new news; a panel that UPDATES to a different (still disagreeing)
+        // vocabulary is, and its new hash reports again.
+        //
+        // There is deliberately NO "clear on match" here. Under the per-tab key a
+        // stale entry had to be cleared so a tab that came back into agreement and
+        // later regressed would report again; keyed by hash there is nothing stale to
+        // clear — a regression re-advertises the same disagreeing hash, and if it was
+        // already reported, that is genuinely the same news the user already has.
+        if (skew.status === "mismatch" && !loggedVocabularySkew.has(advertised!)) {
+          // Insertion-ordered, so the first entry is the oldest. Evicted BEFORE the
+          // add so the cap is a real bound rather than a bound-plus-one.
+          while (loggedVocabularySkew.size >= MAX_LOGGED_VOCABULARY_SKEW) {
+            const oldest = loggedVocabularySkew.values().next().value;
+            if (oldest === undefined) break;
+            loggedVocabularySkew.delete(oldest);
+          }
+          loggedVocabularySkew.add(advertised!);
+          logger.warn(`[panel-orchestrator] ${skew.message}`);
+        }
+      }
       // #706 — an npm-orchestrator update can require a newer Registry panel.
       // The panel-sync service owns the ENTIRE safety decision: it re-reads the
       // local install under the panel-op lock, refuses pins/dev installs/shadows
@@ -3592,10 +3869,13 @@ export async function runPanelOrchestrator(): Promise<void> {
                   );
                   return;
                 }
-                bridge.push(
-                  {
-                    type: "say",
-                    text:
+                // AGENT-ONLY. This is operational status with a lock-recovery procedure
+                // attached — necessary, and addressed to the wrong reader. Printed in the
+                // chat it lands mid-conversation as a wall of text about a subsystem the
+                // user did not ask about. pushAgentNote falls back to a visible `say` on
+                // a panel too old to understand the hidden frame, so nothing is lost.
+                bridge.pushAgentNote(
+                  (
                       `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
                       // #784 — this is pushed to the embedded panel chat, whose
                       // tool set does not include install_comfyui(action:'panel'). Name it only where
@@ -3604,8 +3884,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                         panelRecoveryContext().installPanelUsable
                           ? "Run install_comfyui(action:'panel', panel_action:'status') to inspect it, then retry install_comfyui(action:'panel', panel_action:'sync') if appropriate."
                           : "Inspect and update the panel pack on the ComfyUI host itself — no tool in this session can do it."
-                      } (${detail})`,
-                  },
+                      } (${detail})`
+                  ),
                   panelTab,
                 );
               })
@@ -3724,11 +4004,39 @@ export async function runPanelOrchestrator(): Promise<void> {
         AskAnswers.moveKey(migratedFrom, panelTab);
         flushRunCompletions(panelTab);
         flushAskAnswers(panelTab);
-        // The OLD id's command stamp dies with it: a straggler command issued
-        // for the old workflow must keep failing the panel's fence rather than
-        // mutate the newly-shown one. The new id is stamped from THIS hello
-        // just below.
-        tabCommandWorkflowUuid.delete(migratedFrom);
+        // The stamp MOVES to the new id, like every other piece of routing state
+        // above it (#1331). It used to be deleted here, and the justification —
+        // "a straggler command issued for the old workflow must keep failing the
+        // panel's fence" — is satisfied either way, because the OLD id ceases to
+        // resolve at all once the socket re-helloes under the new one.
+        //
+        // A REGRESSION, and one this file already knew about. #436 added
+        // `carryWorkflowCommandStamp` for exactly this, recording that deleting it
+        // "flapped sessions"; the #884 refactor rewrote this block and left a bare
+        // delete in its place. Thirty lines below, the surviving comment still
+        // argues the case and even names the scenario: "A reconnect hello that
+        // lands before the canvas identity is readable carries no uuid, which is
+        // enough to erase the stamp and wedge the tab for the rest of the session."
+        // That is #1331 verbatim — reported after a save/rename, which is one of
+        // the three events that mints a new tab id.
+        //
+        // Carrying cannot widen authorization. The panel authorizes a fenced
+        // command IFF stamp === the LIVE active workflow uuid, so a carried-but-
+        // stale stamp permits nothing a correct one would not; it simply mismatches
+        // and is refused, exactly as before. An ABSENT stamp is the asymmetric
+        // case: UiBridge then sends frames with no `workflow_uuid`, which the panel
+        // also counts as a mismatch, so every fenced command is refused. NOT
+        // `workflow_list`, which the panel deliberately exempts as its recovery probe
+        // (commandIsCanvasTargetless) — I claimed otherwise in the first version of this
+        // comment, an hour after reading the #1337 code that says so. The panel's
+        // re-advertise repair is
+        // capped at MISMATCH_REHELLO_MAX_PER_IDENTITY (3). Once those are spent the
+        // tab is wedged for the session, which is what cost the reporter four calls
+        // to recover a state the panel already believed it was in.
+        //
+        // If THIS hello does resolve an identity, the `set` below overwrites what
+        // we carried — new evidence always wins over old.
+        carryWorkflowCommandStamp(tabCommandWorkflowUuid, migratedFrom, panelTab);
         logger.info(
           `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — routing state carried; the shared session continues (#884)`,
         );
@@ -3933,10 +4241,17 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ OpenRouter has no API key — the connection would fail on your first message. " +
-              "Set it in Settings → OpenRouter → “Set API key…” (masked, stored by the orchestrator — takes effect immediately, no reconnect needed), " +
-              "or set the OPENROUTER_API_KEY environment variable and restart the orchestrator. Keys: https://openrouter.ai/keys",
+            // Translated in the TAB's language, not the process's: "Settings → OpenRouter →
+            // 'Set API key…'" names controls the user has to find on their own screen, and
+            // a panel in Korean has no menu item spelled "Settings". Env-var names and URLs
+            // are typed literally and stay as they are.
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(panelTab),
+              "say.openrouter_no_key",
+              "OpenRouter has no API key — the connection would fail on your first message. " +
+                "Set it in Settings → OpenRouter → “Set API key…” (masked, stored by the orchestrator — takes effect immediately, no reconnect needed), " +
+                "or set the OPENROUTER_API_KEY environment variable and restart the orchestrator. Keys: https://openrouter.ai/keys",
+            )}`,
           },
           panelTab,
         );
@@ -3953,12 +4268,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ pi has no usable provider credential — the connection would greet ready and then fail on your first message. " +
-              "Configure a provider: set a provider API key (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY / CEREBRAS_API_KEY) and restart the orchestrator, " +
-              "or run `pi` once and `/login` (stored in ~/.pi/agent/auth.json), then Disconnect → Connect. " +
-              "If you already did one of those, check the entry is complete — an ~/.pi/agent/auth.json record with no `key`, " +
-              "a models.json provider with no `apiKey`, or GOOGLE_APPLICATION_CREDENTIALS pointing at a missing file cannot authenticate. https://pi.dev",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(panelTab),
+              "say.pi_no_credential",
+              "pi has no usable provider credential — the connection would greet ready and then fail on your first message. " +
+                "Configure a provider: set a provider API key (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY / CEREBRAS_API_KEY) and restart the orchestrator, " +
+                "or run `pi` once and `/login` (stored in ~/.pi/agent/auth.json), then Disconnect → Connect. " +
+                "If you already did one of those, check the entry is complete — an ~/.pi/agent/auth.json record with no `key`, " +
+                "a models.json provider with no `apiKey`, or GOOGLE_APPLICATION_CREDENTIALS pointing at a missing file cannot authenticate. https://pi.dev",
+            )}`,
           },
           panelTab,
         );
@@ -3972,9 +4290,12 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ No endpoint configured — set the base URL in Settings → Custom endpoint (include the /v1, e.g. http://192.168.1.20:8000/v1 for vLLM, or a hosted provider's OpenAI-compatible URL), " +
-              "plus “Set API key…” if the server needs one. Both apply immediately — then Connect again.",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(panelTab),
+              "say.custom_no_base_url",
+              "No endpoint configured — set the base URL in Settings → Custom endpoint (include the /v1, e.g. http://192.168.1.20:8000/v1 for vLLM, or a hosted provider's OpenAI-compatible URL), " +
+                "plus “Set API key…” if the server needs one. Both apply immediately — then Connect again.",
+            )}`,
           },
           panelTab,
         );
@@ -4031,9 +4352,13 @@ export async function runPanelOrchestrator(): Promise<void> {
                   bridge.push(
                     {
                       type: "say",
-                      text:
-                        "⚠️ Your llama-server is running WITHOUT `--jinja`, so tool calling is disabled — every agent action would fail. " +
-                        "Restart it with tool support: `llama-server -m <model>.gguf --jinja -c 16384` (current builds enable jinja by default; older ones need the flag), then Disconnect → Connect.",
+                      // Shell command lines stay verbatim — they are pasted, not read.
+                      text: `⚠️ ${trFor(
+                        bridge.tabLocale(panelTab),
+                        "say.llamacpp_no_jinja",
+                        "Your llama-server is running WITHOUT `--jinja`, so tool calling is disabled — every agent action would fail. " +
+                          "Restart it with tool support: `llama-server -m <model>.gguf --jinja -c 16384` (current builds enable jinja by default; older ones need the flag), then Disconnect → Connect.",
+                      )}`,
                     },
                     panelTab,
                   );
@@ -4041,7 +4366,12 @@ export async function runPanelOrchestrator(): Promise<void> {
                   bridge.push(
                     {
                       type: "say",
-                      text: `ℹ️ Your llama-server context is ${props.nCtx} tokens (launch flag -c). The agent's tool payload wants ≥16384 — below that, long turns silently truncate. Consider restarting with \`-c 16384\` or higher.`,
+                      text: `ℹ️ ${trFor(
+                        bridge.tabLocale(panelTab),
+                        "say.llamacpp_small_context",
+                        "Your llama-server context is {tokens} tokens (launch flag -c). The agent's tool payload wants ≥16384 — below that, long turns silently truncate. Consider restarting with `-c 16384` or higher.",
+                        { tokens: props.nCtx },
+                      )}`,
                     },
                     panelTab,
                   );
@@ -4067,31 +4397,47 @@ export async function runPanelOrchestrator(): Promise<void> {
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: agentLabel, backend }, panelTab);
             logger.debug(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) — agent healthy, ready ack`);
           } else {
+            // Each variant names a per-provider remedy the user performs by hand ("Open LM
+            // Studio → Developer → Start Server", "Settings → Custom endpoint"), so it
+            // renders in THIS tab's panel language. CLI invocations, env-var names, URLs and
+            // model ids are interpolated or quoted literally and never translated — they are
+            // typed, not read.
+            const dLocale = bridge.tabLocale(panelTab);
+            const dtr = (key: string, en: string, vars?: Record<string, string | number>): string =>
+              `⚠️ ${trFor(dLocale, `say.degraded.${key}`, en, vars)}`;
             const degradedText = reg
-              ? reg.degradedMessage
+              ? // The key-provider registry (glm / kimi / moonshot / minimax) keeps its sentence
+                // in a data table. Keyed by BACKEND with the table's English as the fallback,
+                // rather than left as the one branch of this chain that can never be
+                // translated: otherwise a Korean panel on GLM gets the start-failure notice in
+                // Korean and the degraded notice for the same class of failure in English.
+                // The table's copy carries its own leading ⚠️ (asserted in the say-frame
+                // tests); stripping it keeps all 15 say.degraded.* fallbacks the same shape, so
+                // a catalog never has to guess which ones include the marker.
+                dtr(backend, reg.degradedMessage.replace(/^⚠️\s*/u, ""))
               : isCx
-              ? "⚠️ The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry."
+              ? dtr("codex", "The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry.")
               : isCg
-                ? "⚠️ The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry."
+                ? dtr("chatgpt", "The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry.")
               : isGm
-                ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
+                ? dtr("gemini", "The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry.")
                 : isAg
-                  ? "⚠️ The background agent isn't responding — the Antigravity CLI couldn't answer `agy models`. Install it from https://antigravity.google, run `agy` once and complete the Google Sign-In, then Disconnect → Connect to retry."
+                  ? dtr("antigravity", "The background agent isn't responding — the Antigravity CLI couldn't answer `agy models`. Install it from https://antigravity.google, run `agy` once and complete the Google Sign-In, then Disconnect → Connect to retry.")
                 : isPi
-                  ? "⚠️ The background agent isn't responding — the pi CLI couldn't run `pi --list-models`. Install it from https://pi.dev (`curl -fsSL https://pi.dev/install.sh | sh`), configure a provider (set a provider API key or run `pi` once and `/login`), then Disconnect → Connect to retry."
+                  ? dtr("pi", "The background agent isn't responding — the pi CLI couldn't run `pi --list-models`. Install it from https://pi.dev (`curl -fsSL https://pi.dev/install.sh | sh`), configure a provider (set a provider API key or run `pi` once and `/login`), then Disconnect → Connect to retry.")
                 : isGk
-                  ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
+                  ? dtr("grok", "The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry.")
                 : isOl
-                  ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite — arena-best local model; `:12b` for ~8 GB VRAM), then Disconnect → Connect to retry."
+                  ? dtr("ollama", "The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite — arena-best local model; `:12b` for ~8 GB VRAM), then Disconnect → Connect to retry.")
                   : isLs
-                    ? `⚠️ The background agent isn't responding — LM Studio isn't reachable at ${LMSTUDIO_BASE_URL}. Open LM Studio → Developer → Start Server and load a tool-calling model (our gemma4-comfyui-mcp GGUFs from Hugging Face work great), or set COMFYUI_MCP_LMSTUDIO_HOST if it serves elsewhere — then Disconnect → Connect to retry.`
+                    ? dtr("lmstudio", "The background agent isn't responding — LM Studio isn't reachable at {url}. Open LM Studio → Developer → Start Server and load a tool-calling model (our gemma4-comfyui-mcp GGUFs from Hugging Face work great), or set COMFYUI_MCP_LMSTUDIO_HOST if it serves elsewhere — then Disconnect → Connect to retry.", { url: LMSTUDIO_BASE_URL })
                     : isLc
-                      ? `⚠️ The background agent isn't responding — llama-server isn't reachable at ${LLAMACPP_BASE_URL}. Start it with \`llama-server -m <model>.gguf -c 16384\` (our gemma4-comfyui-mcp GGUFs work great; add --jinja on older builds — required there for tool calling), or set COMFYUI_MCP_LLAMACPP_HOST — then Disconnect → Connect to retry.`
+                      ? dtr("llamacpp", "The background agent isn't responding — llama-server isn't reachable at {url}. Start it with `llama-server -m <model>.gguf -c 16384` (our gemma4-comfyui-mcp GGUFs work great; add --jinja on older builds — required there for tool calling), or set COMFYUI_MCP_LLAMACPP_HOST — then Disconnect → Connect to retry.", { url: LLAMACPP_BASE_URL })
                       : isCu
-                        ? `⚠️ The background agent isn't responding — your custom endpoint isn't answering at ${customBaseUrl}. Check the base URL in Settings → Custom endpoint (it must be OpenAI-compatible and include the /v1) and the API key if the server requires one — then Connect to retry.`
+                        ? dtr("custom", "The background agent isn't responding — your custom endpoint isn't answering at {url}. Check the base URL in Settings → Custom endpoint (it must be OpenAI-compatible and include the /v1) and the API key if the server requires one — then Connect to retry.", { url: customBaseUrl })
                         : isCp
-                          ? "⚠️ The background agent isn't responding — GitHub Copilot (experimental) couldn't start. Sign in from the panel's experimental row, then Disconnect → Connect to retry."
-                        : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
+                          ? dtr("copilot", "The background agent isn't responding — GitHub Copilot (experimental) couldn't start. Sign in from the panel's experimental row, then Disconnect → Connect to retry.")
+                        : dtr("claude", "The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.");
             bridge.push({ type: "say", text: degradedText }, panelTab);
             bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
             logger.warn(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) but model probe empty — degraded ack`);
@@ -4601,7 +4947,20 @@ export async function runPanelOrchestrator(): Promise<void> {
           onAuthChanged: () => pushReadiness(tabId),
           onBackgroundError: (providerId, message) => {
             const label = OAUTH_PROVIDERS[providerId]?.label ?? providerId;
-            bridge.push({ type: "say", text: `⚠️ ${label} sign-in failed: ${message}` }, tabId);
+            // `message` is the provider's own failure text — untranslated, and safe to embed:
+            // trFor interpolates in one pass, so braces inside it stay literal.
+            bridge.push(
+              {
+                type: "say",
+                text: `⚠️ ${trFor(
+                  bridge.tabLocale(tabId),
+                  "say.oauth_signin_failed",
+                  "{provider} sign-in failed: {message}",
+                  { provider: label, message },
+                )}`,
+              },
+              tabId,
+            );
           },
         },
       )
@@ -4683,9 +5042,19 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
+            // 🕶️/👁️ carry the ON/OFF distinction at a glance and are the same in every
+            // language, so they stay outside the translated span.
             text: nextBlind
-              ? "🕶️ Blind mode ON — the agent's image tools now withhold pixels (applies after the current turn; the session resumes automatically)."
-              : "👁️ Blind mode OFF — the agent's image tools deliver pixels again (applies after the current turn).",
+              ? `🕶️ ${trFor(
+                  bridge.tabLocale(tabId),
+                  "say.blind_on",
+                  "Blind mode ON — the agent's image tools now withhold pixels (applies after the current turn; the session resumes automatically).",
+                )}`
+              : `👁️ ${trFor(
+                  bridge.tabLocale(tabId),
+                  "say.blind_off",
+                  "Blind mode OFF — the agent's image tools deliver pixels again (applies after the current turn).",
+                )}`,
           },
           tabId,
         );
@@ -4729,7 +5098,18 @@ export async function runPanelOrchestrator(): Promise<void> {
         // Legacy contract: old clients only understand the say. A rid-stamped
         // request ALSO gets an ok:false options ack so the correlating client
         // resolves the exact failed attempt instead of waiting out a timeout.
-        bridge.push({ type: "say", text: `⚠️ Could not change model/effort: ${message}` }, tabId);
+        bridge.push(
+          {
+            type: "say",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(tabId),
+              "say.options_change_failed",
+              "Could not change model/effort: {message}",
+              { message },
+            )}`,
+          },
+          tabId,
+        );
         const errorAck = optionsErrorAckFrame(message, meta);
         if (errorAck) bridge.push(errorAck, tabId);
       });
@@ -4756,6 +5136,9 @@ export async function runPanelOrchestrator(): Promise<void> {
         // exact sequence — a render error on A silently editing B.
         void manager.injectRunError(agentKeyFor(event.tab_id), ev.error ?? "unknown error", {
           mid: turnOrigins.mintInjectionOrigin(event.tab_id),
+          // #1489 — coalescing a burst is scoped to this tab, so a notice from ANOTHER
+          // tab is never folded in and can never lose its own origin pin (#884 P0).
+          originTab: event.tab_id,
         });
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run_error → agent (interrupt)`);
         return;
@@ -4893,11 +5276,14 @@ export async function runPanelOrchestrator(): Promise<void> {
         bridge.push(
           {
             type: "say",
-            text:
-              "⚠️ New chat started, but the previous conversation's stored session could not be " +
-              "removed from disk (the write failed — a full or locked filesystem?). If the " +
-              "orchestrator restarts before this conversation's first exchange completes, the " +
-              "OLD conversation may resume; start a New chat again if that happens.",
+            text: `⚠️ ${trFor(
+              bridge.tabLocale(tabId),
+              "say.new_chat_durable_clear_failed",
+              "New chat started, but the previous conversation's stored session could not be " +
+                "removed from disk (the write failed — a full or locked filesystem?). If the " +
+                "orchestrator restarts before this conversation's first exchange completes, the " +
+                "OLD conversation may resume; start a New chat again if that happens.",
+            )}`,
           },
           tabId,
         );
@@ -5263,7 +5649,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       bridge.push(
         {
           type: "say",
-          text: "⏸ A render is running, so I've queued your message to keep the GPU free for it. I'll answer the moment it finishes.",
+          text: `⏸ ${trFor(
+            bridge.tabLocale(event.tab_id),
+            "say.message_queued_during_render",
+            "A render is running, so I've queued your message to keep the GPU free for it. I'll answer the moment it finishes.",
+          )}`,
         },
         event.tab_id,
       );
@@ -5309,7 +5699,20 @@ export async function runPanelOrchestrator(): Promise<void> {
   const downloadDonePending = new Map<
     string,
     {
-      downloads: Map<string, { name: string; status: string; attempt?: number; supKey: string }>;
+      downloads: Map<
+        string,
+        {
+          // #1574 — the PROGRESS/tray id. The record cross-check at the flush needs it, and
+          // it is a different identity from the job's public `id`.
+          id?: string;
+          target?: string;
+          name: string;
+          status: string;
+          attempt?: number;
+          supKey: string;
+          recordDisagrees?: boolean;
+        }
+      >;
       flushAt: number;
     }
   >();
@@ -5415,6 +5818,15 @@ export async function runPanelOrchestrator(): Promise<void> {
     // no saved state
   }
   const pollDownloads = () => {
+    // #1415 — the OTHER half of the #952 drift comparison installed above. That
+    // source only serves THIS process, and the tools that fail with `fetch
+    // failed` run in the spawned comfyui children, which have no bridge. Publish
+    // the current set into the progress dir they already share so a child's
+    // failure can make the same comparison. Level-triggered on this tick (not on
+    // connect/disconnect events) so a tab that goes away blanks it within 700ms —
+    // the child must never quote a panel that has since disconnected. Writes only
+    // when the set changed.
+    publishConnectedPanelOrigins(progressDir, bridge.connectedServerOrigins());
     let files: string[] = [];
     try {
       files = readdirSync(progressDir).filter((f) => f.endsWith(".json"));
@@ -5496,13 +5908,34 @@ export async function runPanelOrchestrator(): Promise<void> {
           if (key && manager.hasLiveAgent(key)) {
             const bucket =
               downloadDonePending.get(key) ??
-              { downloads: new Map<string, { name: string; status: string; attempt?: number; supKey: string }>(), flushAt: 0 };
+              {
+                downloads: new Map<
+                  string,
+                  {
+                    id?: string;
+                    target?: string;
+                    name: string;
+                    status: string;
+                    attempt?: number;
+                    supKey: string;
+                    recordDisagrees?: boolean;
+                  }
+                >(),
+                flushAt: 0,
+              };
             // Identify each pending download by its (id, target) supersession key — NOT
             // the id alone: a concurrent LOCAL + POD transfer of the same URL shares an id
             // but must produce TWO #547 outcomes, and the same key lets a newer attempt
             // evict this entry above. Fall back to the file path when the row has no id.
             const supKey = downloadAttemptKey(row) ?? ` ${full}`;
             bucket.downloads.set(supKey, {
+              // #1574 — CARRY THE ROW ID. Without it the record cross-check at the flush has
+              // nothing to match a job against, silently agrees with everything, and the
+              // whole disclosure is a no-op. That is exactly how the first version shipped.
+              id: typeof row.id === "string" ? row.id : undefined,
+              // (id, target) is the row identity — id alone collides for a concurrent
+              // LOCAL + POD transfer of the same URL (review).
+              target: typeof row.target === "string" ? row.target : undefined,
               name: String(row.name ?? row.id ?? "model"),
               status: String(status),
               attempt: typeof row.attempt === "number" ? row.attempt : undefined,
@@ -5549,6 +5982,39 @@ export async function runPanelOrchestrator(): Promise<void> {
       // filename, so the (id, target) eviction above cannot see it. The live rows
       // are already in hand this tick; markSupersededByLive asks them by name.
       markSupersededByLive(settled, downloads);
+      // #1574 — DROP a completion this orchestrator's own status tool would contradict.
+      //
+      // The event is built from the progress ROW; `download_model action:"status"` answers
+      // from the job RECORD. A reporter got "transfer completed" for an 11.46GB file while
+      // status said it was still streaming and the file was not on disk — it landed minutes
+      // later. Whatever wrote that row, the record is in hand right here.
+      //
+      // Only a POSITIVE contradiction drops it (the record exists, same id, still
+      // "downloading"). An absent record means nothing: the record store resets on a
+      // respawn, which is the reported session, and treating absence as in-flight would
+      // silence every completion after any respawn.
+      const records = (() => {
+        try {
+          return listDownloadJobs();
+        } catch {
+          // Never let the guard break the event path — a completion we cannot check is
+          // still a completion worth delivering.
+          return [];
+        }
+      })();
+      // ANNOTATE, never suppress (review). A terminal record can legitimately still read
+      // "downloading" until the ~15s persistence heartbeat retries (#1545), and this bucket
+      // is deleted before this point and never requeued — so dropping the event here would
+      // permanently lose the completion for a download that genuinely finished. That trades
+      // a confusing message for a missing one, which is worse: the user is waiting on it.
+      const disagreeing = settled.filter((d) => completionDisagreesWithRecord(d, records));
+      for (const d of disagreeing) (d as { recordDisagrees?: boolean }).recordDisagrees = true;
+      if (disagreeing.length) {
+        logger.warn(
+          "[panel-orchestrator] a download completion disagrees with the job record; disclosing rather than suppressing (#1574)",
+          { ids: disagreeing.map((d) => String((d as { id?: unknown }).id ?? "")) },
+        );
+      }
       // #884 — a download has no originating TAB (its row names the owning
       // conversation), so its turn INHERITS the conversation's LAST
       // ESTABLISHED origin — never the active tab (confirming gate 2, P0 rule:
@@ -5883,6 +6349,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     // siblings' pending promises intact (codex finding).
     if (!machineRetargetInFlight) { pendingPodConnects.clear(); persistPendingConnects(); }
     if (url !== lastRetargetUrl) {
+      // Captured BEFORE the reassignment: the address every mid-turn tab's
+      // comfyui child is still serving, which is what the #1429 nudge names.
+      const previousUrl = lastRetargetUrl;
       lastRetargetUrl = url;
       // Sync the shared target closures FIRST: retargets that did NOT come
       // through applyComfyuiUrl (runpod tools, watcher callbacks) leave them
@@ -5898,7 +6367,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       QueueMonitor.start(url);
       manager.setMcpServers(buildMcpServers());
       manager.setComfyuiUrl(url);
-      manager.restartAllForMcpEnv();
+      // A tab that is mid-turn cannot have its comfyui MCP child replaced now, so
+      // it keeps serving `previousUrl` until the turn ends (#1429). Tell those
+      // tabs — and ONLY those; an idle tab respawns before it can run anything.
+      const tally = manager.retargetAllForMcpEnv(previousUrl, url);
+      if (tally.scheduled > 0) {
+        logger.warn(
+          `[panel-orchestrator] ${tally.scheduled} tab(s) mid-turn during the retarget — ` +
+            `their comfyui tools stay on ${previousUrl} until the turn ends (#1429)`,
+        );
+      }
       void refreshEnvCapabilities();
     }
     // The readvertise timer follows the target too (created only at startup

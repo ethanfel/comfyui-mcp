@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentBackend, AgentEvent, BackendStartOptions, ModelChoice } from "../../orchestrator/agent-backend.js";
 import { CLAUDE_CAPABILITIES } from "../../orchestrator/agent-backend.js";
+import { waitFor } from "../helpers/wait-for.js";
 
 const hoisted = vi.hoisted(() => ({
   queue: new (class {
@@ -133,7 +134,7 @@ describe("claude backend durable turn registry (#886)", () => {
     // Process 1: a turn is submitted and its session dies with NO result.
     const first = await startBackend();
     hoisted.queue.push(init(S1));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.end();
     await first.done;
     // The submission was recorded durably — this is what a respawned
@@ -148,11 +149,11 @@ describe("claude backend durable turn registry (#886)", () => {
     hoisted.queue.reset();
     const second = await startBackend({ resume: S1 });
     hoisted.queue.push(init(S1));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     // The resumed session's own turn completes normally…
     hoisted.queue.push(assistantMsg(S1, "back again"));
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(second.events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(second.events)).toHaveLength(1));
     expect(resultsOf(second.events)[0]).toMatchObject({ ok: true });
     // …then the pre-restart turn's result lands LATE: traceless in the live
     // FIFO, but RECOGNIZED via the durable record — "completed but
@@ -186,7 +187,7 @@ describe("claude backend durable turn registry (#886)", () => {
       for await (const ev of backend.run({ channel: oneTurn() as never })) events1.push(ev);
     })();
     hoisted.queue.push(init(S2));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.end();
     await done1;
     // Session 2 (no resume — recognition here is the in-memory carry; a NEW
@@ -197,14 +198,14 @@ describe("claude backend durable turn registry (#886)", () => {
       for await (const ev of backend.run({ channel: oneTurn() as never })) events.push(ev);
     })();
     hoisted.queue.push(init(S3));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.push(assistantMsg(S3, "new session turn"));
     hoisted.queue.push(RESULT_SUCCESS); // new session's own turn
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: true });
     // First stray: recognized as the dead session's submitted turn.
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(2));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(2));
     const firstStray = errorsOf(events);
     expect(firstStray).toHaveLength(1);
     expect(firstStray[0].unverifiedCompletion).toBe(true);
@@ -225,7 +226,7 @@ describe("claude backend durable turn registry (#886)", () => {
     const S4 = "44444444-4444-4444-4444-444444444444";
     const { events, done } = await startBackend();
     hoisted.queue.push(init(S4));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.push(assistantMsg(S4, "reply"));
     hoisted.queue.push(RESULT_SUCCESS); // resolves the only submitted turn…
     hoisted.queue.push(RESULT_SUCCESS); // …so this one matches nothing, anywhere
@@ -254,7 +255,7 @@ describe("claude backend durable turn registry (#886)", () => {
     writeFileSync(join(registryDir, `turn-registry-${S5}-deadbeef.json`), "{ not json", "utf8");
     const { events, done } = await startBackend({ resume: S5 });
     hoisted.queue.push(init(S5));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.push(assistantMsg(S5, "reply"));
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.push(RESULT_SUCCESS); // traceless stray
@@ -275,7 +276,7 @@ describe("claude backend durable turn registry (#886)", () => {
     // Process A: submits its turn 1, dies without a result.
     const a = await startBackend();
     hoisted.queue.push(init(S6));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.end();
     await a.done;
     // Process B (fresh instance): resumes S6, submits ITS turn 1, also dies
@@ -283,7 +284,7 @@ describe("claude backend durable turn registry (#886)", () => {
     hoisted.queue.reset();
     const b = await startBackend({ resume: S6 });
     hoisted.queue.push(init(S6));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.end();
     await b.done;
     // Process C: resumes S6. Two turns are outstanding from two different
@@ -291,10 +292,10 @@ describe("claude backend durable turn registry (#886)", () => {
     hoisted.queue.reset();
     const c = await startBackend({ resume: S6 });
     hoisted.queue.push(init(S6));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(3));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(3));
     hoisted.queue.push(assistantMsg(S6, "C's own turn"));
     hoisted.queue.push(RESULT_SUCCESS); // C's turn resolves
-    await vi.waitFor(() => expect(resultsOf(c.events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(c.events)).toHaveLength(1));
     // Two late landings from the two dead processes: BOTH must be recognized.
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.push(RESULT_SUCCESS);
@@ -319,7 +320,7 @@ describe("claude backend durable turn registry (#886)", () => {
       for await (const ev of backend.run({ channel: oneTurn() as never })) events1.push(ev);
     })();
     hoisted.queue.push(init(S8));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.end();
     await done1;
     expect(registryFiles(S8)).toHaveLength(1);
@@ -332,13 +333,13 @@ describe("claude backend durable turn registry (#886)", () => {
       for await (const ev of backend.run({ channel: oneTurn() as never, resume: S8 })) events.push(ev);
     })();
     hoisted.queue.push(init(S8));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     hoisted.queue.push(assistantMsg(S8, "resumed turn"));
     hoisted.queue.push(RESULT_SUCCESS); // the resumed turn resolves
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     // One late landing from the dead run: recognized…
     hoisted.queue.push(RESULT_SUCCESS);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(2));
+    await waitFor(() => expect(resultsOf(events)).toHaveLength(2));
     expect(errorsOf(events)[0]?.unverifiedCompletion).toBe(true);
     // …and a second stray must find NOTHING left — a phantom record would
     // falsely recognize it too.
@@ -356,19 +357,19 @@ describe("claude backend durable turn registry (#886)", () => {
     // Process A leaves one turn outstanding; process B resumes.
     const a = await startBackend();
     hoisted.queue.push(init(S7));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     hoisted.queue.end();
     await a.done;
     hoisted.queue.reset();
     const b = await startBackend({ resume: S7 });
     hoisted.queue.push(init(S7));
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await waitFor(() => expect(hoisted.promptsSeen).toBe(2));
     // B's turn is interrupted: its error_during_execution landing is the
     // interrupt landing for B's OWN trace — blessed ok:true, NO "completed but
     // unverified" disclosure, and the remembered record is NOT consumed.
     await b.backend.interrupt();
     hoisted.queue.push({ type: "result", subtype: "error_during_execution" });
-    await vi.waitFor(() => expect(resultsOf(b.events)).toHaveLength(1));
+    await waitFor(() => expect(resultsOf(b.events)).toHaveLength(1));
     expect(resultsOf(b.events)[0]).toMatchObject({ ok: true });
     expect(errorsOf(b.events)).toHaveLength(0);
     // Proof the record survived: a genuine stray is still recognized.
@@ -486,7 +487,7 @@ describe("panel rendering of a completed-but-unverified disclosure (#886)", () =
     );
     void agent.start();
     agent.send("do the thing");
-    await vi.waitFor(() => expect(says.length).toBeGreaterThanOrEqual(1));
+    await waitFor(() => expect(says.length).toBeGreaterThanOrEqual(1));
     await agent.stop();
     return says;
   }

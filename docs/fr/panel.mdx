@@ -1,0 +1,399 @@
+---
+title: "Panneau latéral"
+description: "ComfyUI Agent Panel — un agent IA autonome dans la barre latérale de ComfyUI qui pilote votre canevas avec n'importe quel LLM : Claude, ChatGPT ou Gemini sur votre abonnement (sans clé API), un modèle local gratuit via Ollama (sans compte), ou n'importe quel modèle hébergé via un endpoint compatible OpenAI. Disponible sur le Comfy Registry sous le nom comfyui-agent-panel."
+icon: "comments"
+---
+
+<Note>
+  **Désormais sur le Comfy Registry.** Installez **ComfyUI Agent Panel**
+  (`comfyui-agent-panel`) depuis ComfyUI-Manager, ou installez depuis git pour
+  obtenir la version la plus récente (voir [Mise en place](#mise-en-place)
+  ci-dessous).
+</Note>
+
+**[comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)** place un
+agent autonome dans la barre latérale de ComfyUI. Demandez-lui une image, un
+workflow ou une modification — il travaille sur votre ComfyUI et répond sur
+place. Choisissez un fournisseur — **Claude**, **ChatGPT**, **Gemini** ou
+**Ollama (local)** — et l'agent correspondant s'exécute en arrière-plan : les
+abonnements **sans clé API**, les modèles locaux **sans le moindre compte** (et
+le backend Ollama atteint aussi n'importe quel endpoint hébergé compatible
+OpenAI). Voir [Backends](/docs/backends) pour la matrice, et
+l'[Arène des LLM](/docs/arena) pour les performances réelles de chaque classe de
+modèle.
+
+```
+you ⇄ panel (pick a provider) ⇄ loopback bridge ⇄ panel orchestrator ⇄ background agent: Claude · ChatGPT · Gemini · any LLM
+```
+
+**Aucune clé API, aucune facturation au token** sur les fournisseurs par
+abonnement — et totalement gratuit/hors ligne sur les modèles locaux. L'agent
+s'authentifie avec votre session enregistrée sur disque (ou, pour Ollama,
+dialogue simplement avec le démon local). Un seul orchestrateur, sur un seul
+port de pont loopback (`ws://127.0.0.1:9180`), sert tous les fournisseurs ;
+chaque onglet du panneau choisit son fournisseur lors de la poignée de main. Le
+pont est exclusivement loopback, et le panneau exécute une **liste
+d'autorisation fixe** de commandes de graphe (pas de JavaScript arbitraire).
+
+<Note>
+  Vous débutez ? [Backends / fournisseurs](/docs/backends) explique le sélecteur,
+  le port `AgentBackend` neutre vis-à-vis du fournisseur, et la matrice des
+  fonctionnalités (ce qui est identique entre Claude et ChatGPT, et les quelques
+  différences).
+</Note>
+
+## Mise en place
+
+1. **Installez le pack** — cherchez `comfyui-agent-panel` dans ComfyUI-Manager, ou depuis git :
+
+   ```bash
+   cd ComfyUI/custom_nodes
+   git clone https://github.com/artokun/comfyui-mcp-panel
+   ```
+
+   <Warning>
+   **Choisissez `Latest`, pas `Nightly`, dans le menu déroulant de versions de
+   Manager.** Malgré son nom, le **Nightly** de Manager n'est pas construit chaque
+   nuit : il clone le dépôt **une seule fois**, au moment de l'installation, puis
+   ne suit plus jamais la branche. Il vous fige sur le commit qui se trouvait être
+   `main` ce jour-là, alors que `Latest` suit le rythme de chaque version — Nightly
+   est donc régulièrement *plus ancien* que Latest, et prend silencieusement du
+   retard à mesure que vous le laissez en place. Il annonce qu'aucune mise à jour
+   n'est disponible, parce que de son point de vue il n'y en a pas.
+
+   Pour savoir où vous en êtes réellement, comparez le SHA affiché sous **Node Pack
+   Info → Version** avec [l'historique des commits du
+   dépôt](https://github.com/artokun/comfyui-mcp-panel/commits/main). Pour vous en
+   sortir, sélectionnez `Latest (x.y.z)` dans ce même menu déroulant, ou — si vous
+   voulez rester sur git — lancez `git pull` dans
+   `custom_nodes/comfyui-mcp-panel`, qui se met à jour proprement en fast-forward.
+   </Warning>
+
+2. **Connectez-vous une fois au fournisseur de votre choix**, pour que l'agent en
+   arrière-plan puisse utiliser votre abonnement :
+
+   ```bash
+   claude        # Claude — or: claude setup-token
+   codex login   # ChatGPT (Codex)
+   ```
+
+3. **Démarrez l'orchestrateur** sur votre machine et laissez-le tourner — voir
+   [Démarrer l'orchestrateur du panneau](/docs/fr/installation#3-démarrer-lorchestrateur-du-panneau) :
+
+   ```bash
+   npx -y comfyui-mcp@latest connect
+   ```
+
+4. **Redémarrez ComfyUI**, ouvrez l'onglet **Agent**, **choisissez un fournisseur**
+   (puces Claude / ChatGPT), puis cliquez sur **Connecter**. Le panneau se relie au
+   pont loopback de l'orchestrateur. Saisissez une requête et l'agent répond.
+   **Déconnecter** rompt le lien ; l'orchestrateur continue de tourner jusqu'à ce
+   que vous l'arrêtiez.
+
+Pas de `claude mcp add`, pas de clé API. Le panneau est une extension purement
+frontend et ne peut pas lancer l'orchestrateur lui-même : c'est donc toujours un
+processus que vous démarrez — le panneau se connecte automatiquement à un pont
+déjà en cours d'exécution. Les prérequis sont Node.js/`npx` dans votre PATH et la
+connexion au fournisseur ci-dessus. Changez le port du pont avec
+`COMFYUI_MCP_BRIDGE_PORT`.
+
+<Note>
+**Vous pilotez un ComfyUI distant** (un pod GPU cloud, une autre machine de votre
+réseau local) ? La mise en place ci-dessus reste valable, mais lancez
+l'orchestrateur **sur votre propre machine**, pas sur la machine distante :
+`npx -y comfyui-mcp@latest connect <remote-url>` s'occupe du reste, y compris d'un
+tunnel sécurisé vers la page HTTPS du pod. Cliquez ensuite sur Connecter dans le
+panneau. Voir [Déploiement cloud](/docs/cloud-deployment) pour la procédure complète.
+</Note>
+
+<Note>
+  **Prise en main des fournisseurs.** Au moment de la connexion, le panneau vérifie
+  l'état de préparation de chaque fournisseur (son CLI dans votre PATH + une session
+  sur disque ; le trousseau macOS est pris en charge). Une carte de prise en main
+  n'apparaît que si **aucun** fournisseur n'est connecté. Si le fournisseur que vous
+  aviez enregistré n'est pas utilisable, le panneau **bascule automatiquement vers un
+  fournisseur prêt** (votre préférence enregistrée est conservée), et la ligne d'un
+  fournisseur non prêt propose une action **« configurer »** qui amorce l'étape unique
+  `claude` / `codex login`. Voir [Backends → état de préparation et prise en main](/docs/backends#connect-time-readiness--onboarding).
+</Note>
+
+## Ce qu'il sait faire
+
+L'agent (Claude *ou* ChatGPT) charge les skills de modèles de comfyui-mcp
+(IDEOGRAM, WAN, LTX, Qwen, et d'autres) : il connaît donc déjà les modèles que
+vous utilisez — nativement pour Claude, et pour ChatGPT via ces mêmes
+connaissances exposées sous forme d'outils MCP
+([parité des connaissances](/docs/tools/skills-knowledge)). Il peut générer des
+images, des vidéos et de l'audio, inspecter et gérer votre ComfyUI, et raisonner
+sur votre configuration — puis répondre dans la conversation du panneau.
+
+Il peut aussi **charger un workflow ou un pack d'installation entier en une fois**
+(`panel_load_workflow pack:<name>`) et il est **attentif aux coûts** : les packs
+fournis tournent sur GPU local et sont gratuits, et pour un graphe ad hoc l'agent
+vérifie le runtime (`list_packs` avec `action:"check_runtime"`) et **demande votre
+accord avant de dépenser des crédits d'API payants**. Voir
+[Skills, packs et coût d'exécution](/docs/tools/skills-knowledge).
+
+## Piloter le graphe en direct
+
+L'agent autonome travaille sur votre ComfyUI en direct au moyen d'une **liste
+d'autorisation fixe** de commandes `panel_*` — pas de JavaScript arbitraire.
+Chaque modification du graphe passe par le suivi des changements de LiteGraph,
+elle est donc annulable avec **Ctrl+Z**. La même surface `panel_*` est exposée à
+l'identique aux deux backends (en processus pour Claude, via un MCP HTTP loopback
+pour ChatGPT/Codex) : la [parité](/docs/backends) est donc automatique.
+
+### Lecture
+
+| Outil | Effet |
+|---|---|
+| `panel_query_graph` | Interroger le graphe affiché — filtrer/parcourir/agréger, dans une limite de tokens |
+| `panel_get_subgraph` | Lire le graphe interne d'un nœud de sous-graphe |
+| `panel_view_selected` | Lire le ou les nœuds que l'utilisateur a **sélectionnés** — répond à « ce nœud » en un seul appel |
+| `panel_view_nodes_in_viewport` | Ne lire que ce qui est **à l'écran** (rectangle de la vue + zoom) — délimite le travail sur un gros graphe |
+| `panel_get_errors` | **Pourquoi** un nœud est rouge — chaque nœud en erreur associé à sa cause (modèle manquant + URL de téléchargement, média manquant, validation, `exception_type` à l'exécution) |
+| `panel_list_workflows` | Lister les onglets de workflow ouverts et indiquer lequel est actif |
+| `panel_list_nodes` | Lister les packs de nœuds personnalisés installés |
+| `panel_list_mcp` | Lister les serveurs MCP connectés |
+| `panel_get_content_mode` | Lire l'état du consentement au contenu adulte (NSFW) |
+
+### Modifier le graphe (annulable)
+
+| Outil | Effet |
+|---|---|
+| `panel_add_node` | Ajouter un nœud par class_type |
+| `panel_remove_node` | Supprimer un nœud |
+| `panel_connect` / `panel_disconnect` | Connecter / déconnecter des emplacements par nom ou par index (omettre les deux emplacements dans `panel_connect` pour une correspondance automatique par type ; `auto_match:false` rétablit l'ancienne sémantique index 0) |
+| `panel_set_widget` | Changer la valeur d'un widget (steps, cfg, prompts, …) |
+| `panel_edit_node` | Déplacer, redimensionner, renommer, recolorer, remodeler, replier ou épingler un ou plusieurs nœuds de façon atomique |
+| `panel_auto_layout` | Réorganiser automatiquement tout le graphe (ou une partie) en une disposition en flux/grille propre, d'après la topologie des liens — `dry_run` pour prévisualiser |
+| `panel_clear` | Supprimer tous les nœuds — l'effacement complet ne compte que pour un seul Ctrl+Z |
+
+### Sous-graphes
+
+| Outil | Effet |
+|---|---|
+| `panel_select_nodes` | Sélectionner des nœuds sur le canevas (sélection multiple) |
+| `panel_create_subgraph` | Regrouper les nœuds sélectionnés en un sous-graphe (« Convert to Subgraph ») |
+| `panel_enter_subgraph` | Entrer dans un sous-graphe pour lire / modifier ses nœuds internes |
+| `panel_exit_subgraph` | Revenir au graphe parent / racine |
+
+### Disposition spatiale
+
+L'agent voit la géométrie des nœuds — les lignes de détail de `panel_query_graph`
+renvoient les `pos`/`size` de chaque nœud, ainsi que les `rails` d'entrée/sortie
+des sous-graphes, les `groups` et les `color`/`collapsed` de chaque nœud — et il
+organise le canevas avec un jeu d'écritures correspondant, puis prend une
+**capture d'écran** du résultat pour juger de sa propre disposition. Une skill
+`workflow-layout` relie tout cela en une disposition automatique en couches, par
+dépendances et sans chevauchement, dont la règle maîtresse est de *toujours
+laisser les entrées et les sorties accessibles* pour que vous puissiez enchaîner
+directement.
+
+| Outil | Effet |
+|---|---|
+| `panel_move_rail` | Déplacer le rail d'entrée / de sortie d'un sous-graphe pour garder les fils de frontière courts |
+| `panel_create_group` / `panel_move_group` / `panel_edit_group` / `panel_remove_group` | Créer, déplacer, renommer/recolorer ou supprimer une boîte de groupe étiquetée (passer `node_ids` pour l'ajuster automatiquement au contenu) |
+| `panel_screenshot` | Rendre le canevas en PNG et le renvoyer comme image, pour que l'agent puisse vérifier sa disposition |
+
+### Onglets de workflow
+
+| Outil | Effet |
+|---|---|
+| `panel_new_workflow` | Ouvrir un workflow vierge dans un NOUVEL onglet (n'efface jamais l'onglet courant) |
+| `panel_open_workflow` | Basculer vers un workflow par chemin / nom de fichier |
+| `panel_rename_workflow` | Renommer un workflow |
+| `panel_close_workflow` | Fermer un onglet (refuse en cas de modifications non enregistrées, sauf si on force) |
+| `panel_save_workflow` | Enregistrer / enregistrer sous par programme — aucune boîte de dialogue n'apparaît |
+
+### Charger un workflow en une fois
+
+| Outil | Effet |
+|---|---|
+| `panel_load_workflow` | Remplacer le graphe en direct par un workflow complet en un seul appel — préférez `pack:<name>` pour charger le workflow GPU local d'un pack d'installation fourni sans faire transiter le JSON par la conversation. Le graphe remplacé devient un point d'annulation (double Échap / `/revert`). |
+
+### Connaissances et conscience des coûts
+
+L'agent découvre l'expertise fournie avec le produit et vérifie le coût
+d'exécution avant de dépenser des crédits (mêmes outils sur les deux backends —
+voir [Skills, packs et coût d'exécution](/docs/tools/skills-knowledge)) :
+
+| Outil | Effet |
+|---|---|
+| `list_packs` (`action:"skill_list"` / `action:"skill_read"`) | Découvrir et lire les skills fournies pour les familles de modèles + les workflows |
+| `list_packs` (`action:"list"` / `action:"read_workflow"`) | Lister les packs d'installation en une commande (GPU local / gratuits) et lire le graphe d'un pack |
+| `list_packs` (`action:"list_templates"`) | Lister les modèles de workflow ComfyUI officiels du serveur connecté |
+| `list_packs` (`action:"check_runtime"`) | Classer un graphe comme **local** (gratuit) ou **api/mixed/unknown** (payant) — l'agent demande votre accord avant de dépenser des crédits d'API payants |
+
+### Exécuter et visualiser
+
+| Outil | Effet |
+|---|---|
+| `panel_run` | Mettre le workflow ouvert en file d'attente (comme un appui sur Queue Prompt) |
+| `panel_canvas` | Ajuster la vue, la centrer sur un nœud, la déplacer ou zoomer |
+
+### Nœuds personnalisés (ComfyUI Manager intégré)
+
+| Outil | Effet |
+|---|---|
+| `panel_search_nodes` | Rechercher des packs de nœuds installables via le Manager de l'utilisateur |
+| `panel_install_node` | Mettre en file l'installation d'un pack (id de registre ou URL git) |
+| `panel_node_queue_status` | Consulter la file d'installation / de mise à jour du Manager |
+| `panel_restart_comfyui` | Redémarrer ComfyUI pour charger les nouveaux nœuds — le panneau se reconnecte automatiquement et l'agent reprend |
+
+### MCP et session
+
+| Outil | Effet |
+|---|---|
+| `panel_add_mcp` / `panel_remove_mcp` | Connecter / retirer un serveur MCP dans la configuration MCP de l'agent (Claude ou Codex) |
+| `panel_request_secret` | Collecter un jeton d'API en toute sécurité — l'agent ne voit jamais la valeur |
+| `panel_reload` | Recharger à chaud l'orchestrateur (nouveau code/outils) ou l'interface du panneau, puis reprendre |
+
+### Interaction avec l'utilisateur
+
+| Outil | Effet |
+|---|---|
+| `panel_ask` | Demander à l'utilisateur de choisir entre plusieurs options (affiche une carte de question et attend un choix) |
+| `panel_set_todo` | Afficher une liste TODO en direct dans le bandeau en pied du panneau |
+| `panel_request_adult_consent` / `panel_disable_adult_mode` | Activer ou désactiver la barrière de consentement NSFW 18+ |
+
+<Note>
+  Chaque outil accepte un `tab_id` facultatif — chaque onglet du navigateur possède
+  sa propre connexion, et le routage vise par défaut l'unique onglet, ou celui dans
+  lequel l'utilisateur a écrit en dernier.
+</Note>
+
+## Rembobinage et retour en arrière
+
+Les messages passés ne sont pas figés. Survolez n'importe quel message : le bouton
+**✎ modifier** ouvre une fenêtre de retour en arrière, qui permet de restaurer le
+**code** (ramener le graphe à l'instantané de ce tour), la **conversation**
+(reprendre la session à partir de ce point) ou **les deux**, puis de renvoyer
+depuis là un message modifié. Les restaurations de graphe s'appuient sur des
+instantanés par tour : annuler un tour rétablit donc exactement le graphe tel
+qu'il était à son début.
+
+Deux raccourcis couvrent les cas courants :
+
+- **`/revert`** — annuler les modifications du graphe du dernier tour.
+- **Double Échap** — un rembobinage rapide du dernier tour : restaure le graphe et
+  ramène le message dans la zone de rédaction pour le modifier et le renvoyer.
+
+<Note>
+  Le retour en arrière du **code** (le graphe) fonctionne sur **les deux**
+  fournisseurs — il est assuré par l'orchestrateur au moyen d'instantanés par tour.
+  Le retour en arrière de la **conversation** (reprendre le chat à un tour passé)
+  est pour l'instant **réservé à Claude** : le backend ChatGPT/Codex ne sait
+  reprendre que des fils entiers, le panneau désactive donc cette portée pour lui.
+  Voir la [matrice des fonctionnalités](/docs/backends#capability-matrix).
+</Note>
+
+## Bandeau des messages en attente
+
+Écrivez pendant que l'agent travaille : votre message ne se perd pas dans la
+conversation — il patiente dans un bandeau **En attente** fixe, ancré au-dessus du
+bandeau des téléchargements, hors du fil de la conversation. Chaque message en
+attente dispose des boutons **modifier**, **envoyer maintenant** et **supprimer**,
+ainsi que d'une poignée de glissement (≡, à gauche) pour **réordonner** la manière
+dont l'agent les traite. **Envoyer maintenant** interrompt le tour en cours pour le
+réorienter immédiatement. Quand un message en attente sort de la file, il apparaît
+**en bas** de la conversation : la transcription se lit donc exactement dans
+l'ordre où l'agent (Claude ou ChatGPT) l'a traitée.
+
+## Confirmation des opérations destructrices
+
+Les actions irréversibles demandent d'abord confirmation. `panel_clear` (supprimer
+tous les nœuds) et `panel_restart_comfyui` affichent une carte oui / non et
+n'agissent que sur un **oui** — l'agent ne peut donc pas anéantir votre graphe ni
+relancer ComfyUI en silence.
+
+## Robustesse de la reconnexion
+
+Un orchestrateur coincé n'isole plus le panneau. Si un orchestrateur précédent
+retient encore le port du pont, cliquer sur **Connecter** récupère ce processus
+zombie au lieu d'échouer — le panneau se reconnecte au lieu de vous laisser bloqué.
+
+## Pièces jointes dans la zone de rédaction
+
+Joignez un fichier, glissez-déposez ou collez dans la zone de rédaction. Outre les
+images, la zone de rédaction accepte désormais les fichiers **vidéo**, les
+**workflows `.json`** et les fichiers **texte** : vous pouvez donc remettre
+directement à l'agent un clip de référence, un workflow à adapter ou un fichier de
+notes.
+
+## Médias enrichis dans les réponses de l'agent
+
+Quand les médias d'une exécution sont renvoyés à l'agent, la sortie n'est pas un
+simple bloc d'image : elle porte des **métadonnées** sur lesquelles l'agent peut
+raisonner — le chemin de chaque sortie (relatif au sous-dossier), la taille du
+fichier, les dimensions en pixels et le **regroupement en jeu d'assets**
+(« sortie K sur N de cette exécution », avec le nom de ses fichiers frères, ou
+« sortie unique »), ainsi que la durée de rendu et l'heure de fin. Les
+storyboards vidéo ajoutent le format et le nombre réel d'images / les fps quand la
+charge utile les contient. L'agent nomme ainsi le résultat réellement enregistré
+avec exactitude, et peut parler de sa taille, de ses dimensions et du nombre de
+fichiers produits par une exécution.
+
+## Copier et renvoyer à la ligne les blocs de code
+
+Les blocs de code affichés disposent d'un bouton **Copier** au survol et d'un
+commutateur global persistant de **renvoi à la ligne** (désactivé par défaut — les
+longues lignes défilent horizontalement tant que vous ne l'activez pas). Le code en
+ligne a son propre bouton Copier. Les deux adoptent le style du panneau.
+
+## Alerte de rendu bloqué
+
+L'orchestrateur exécute un chien de garde passif sur votre file d'attente ComfyUI :
+un rendu dont le nœud/la progression n'avance plus est signalé comme **bloqué** et
+l'agent en est informé (pour qu'il cesse d'empiler aveuglément des jobs derrière un
+rendu coincé). Le seuil est le réglage **Alerte de rendu bloqué (secondes)**, dans
+**Réglages → Comfy MCP Agent → Général** (180 s par défaut, plage 15–3600). Il est
+envoyé à la connexion puis poussé **en direct** — le modifier s'applique sans
+reconnexion. Voir
+[Configuration → `COMFYUI_MCP_STALL_S`](/docs/configuration#panel-orchestrator--the-bridge).
+
+## Fiabilité en onglet d'arrière-plan
+
+Les réponses en flux s'affichent désormais même quand l'onglet ComfyUI est en
+**arrière-plan**. Auparavant, l'effet machine à écrire de la réponse s'appuyait sur
+`requestAnimationFrame`, que le navigateur suspend dans un onglet masqué — passer à
+un autre onglet pendant une longue exécution en plusieurs étapes laissait donc la
+bulle vide, avec un curseur de flux figé, comme si l'agent était « bloqué à
+réfléchir » alors même que le tour était terminé. La réponse se finalise à présent
+de façon synchrone quand l'onglet est masqué, et un gestionnaire
+`visibilitychange` vide toute réponse en attente au masquage puis relance l'effet
+machine à écrire au retour. L'animation au premier plan est inchangée.
+
+## Contrôle du cloud RunPod
+
+Un **bouton d'hôte** dans la barre d'outils affiche **🟢 Local · votre machine** ou
+**🔵 RunPod · <pod> · GPU · $/h** et ouvre un **panneau de contrôle RunPod** : une
+carte d'état en direct (GPU / VRAM / temps de fonctionnement / $·h / URL ComfyUI /
+compte à rebours d'arrêt automatique en cas d'inactivité), un menu déroulant qui
+liste vos pods **par nom**, Connecter / Démarrer / Arrêter / **Utiliser local**, et
+un **Déployer** à confirmer. Renseignez `RUNPOD_API_KEY` une seule fois dans la
+carte des clés API et vous pourrez déployer, surveiller, basculer local⇄pod et
+arrêter un GPU cloud sans toucher à la console RunPod — le bouton d'hôte vous dit
+toujours où s'exécutera le prochain rendu. Voir
+[Déploiement cloud](/docs/cloud-deployment) et l'article de blog
+[Exécuter ComfyUI sur un GPU cloud loué](/docs/blog/runpod-comfyui).
+
+## Navigateur CivitAI
+
+Le bouton **Civitai** de la barre d'outils ouvre un navigateur CivitAI complet —
+images, vidéos, checkpoints, LoRA et workflows, avec recherche, filtres et
+visionneuse plein écran. Choisissez un résultat pour **le partager avec l'agent**,
+**le télécharger sur votre machine** ou **enregistrer un workflow intégré** sur le
+canevas. L'histoire complète :
+[CivitAI dans ComfyUI](/docs/blog/civitai-in-comfyui).
+
+## Voir aussi
+
+- [Appli mobile (bêta)](/docs/mobile) — appairez votre téléphone avec le panneau et discutez avec l'agent où que vous soyez
+- [Backends / fournisseurs](/docs/backends) — Claude contre ChatGPT, le sélecteur, la parité des fonctionnalités
+- [Skills, packs et coût d'exécution](/docs/tools/skills-knowledge) — parité des connaissances + le garde-fou sur les coûts
+- [Configuration du pont](/docs/configuration)
+- [Déploiement cloud](/docs/cloud-deployment) — piloter le panneau sur un pod ComfyUI distant (RunPod, etc.)
+- [Relais auto-hébergé](/docs/self-hosted-relay) — faites tourner votre propre infrastructure de tunnel pour le pont
+- [Le plugin Claude Code](/docs/plugin) — skills de modèles, commandes slash, agents
+- [comfyui-mcp sur GitHub](https://github.com/artokun/comfyui-mcp) · [comfyui-mcp-panel sur GitHub](https://github.com/artokun/comfyui-mcp-panel)

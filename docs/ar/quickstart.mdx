@@ -1,0 +1,66 @@
+---
+title: "البدء السريع"
+description: "أضف ComfyUI MCP إلى Claude Code وولّد أول صورة لك."
+icon: "rocket"
+---
+
+<Steps>
+  <Step title="شغّل نسخة من ComfyUI">
+    ثبّت [ComfyUI Desktop](https://www.comfy.org/download) أو شغّله
+    [من المصدر](https://github.com/comfyanonymous/ComfyUI)، ثم ابدأ تشغيله. يكتشف ComfyUI MCP
+    تلقائيًا التثبيت المحلي ومنفذه (8188 / 8000). ولاستهداف نسخة بعيدة،
+    راجع [الإعدادات](/docs/configuration).
+  </Step>
+
+  <Step title="أضف خادم MCP إلى Claude Code">
+    أضِفه إلى ملف إعدادات Claude Code (`~/.claude/settings.json`). ويجلب `npx` أحدث حزمة
+    منشورة تلقائيًا.
+
+    ```json ~/.claude/settings.json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "CIVITAI_API_TOKEN": ""
+          }
+        }
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="أعد الاتصال">
+    شغّل `/mcp` في Claude Code (أو أعد تشغيله) للاتصال بخادم `comfyui`. ستلاحظ أن أدوات
+    ComfyUI MCP أصبحت متاحة.
+  </Step>
+
+  <Step title="ولّد شيئًا">
+    اطلب من الوكيل بلغة طبيعية:
+
+    > ولّد صورة لثعلب بألوان مائية في غابة ضبابية.
+
+    خلف الكواليس يستدعي هذا [`generate_image`](/docs/tools/image-generation) الذي يبني سير عمل
+    txt2img، ويختار ملف Checkpoint تلقائيًا، ويدرجه في قائمة الانتظار، ثم يُرجع `prompt_id`.
+    وتصل الصورة المكتملة عبر إشعار الاكتمال — اعرضها بـ
+    [`get_image (action:"view")`](/docs/tools/assets-images).
+  </Step>
+</Steps>
+
+## الخطوات التالية
+
+<CardGroup cols={2}>
+  <Card title="تفاصيل التثبيت" icon="download" href="/docs/ar/installation">
+    إعدادات التشغيل المحلي مقابل البعيد، و`npm link` للتطوير.
+  </Card>
+  <Card title="الإعدادات" icon="gear" href="/docs/configuration">
+    جميع متغيرات البيئة وناقل HTTP.
+  </Card>
+  <Card title="كيف يعمل" icon="diagram-project" href="/docs/concepts">
+    المفهوم الذي تقوم عليه الأدوات — وأيّها يحتاج إلى تثبيت محلي.
+  </Card>
+  <Card title="تصفّح الأدوات" icon="wrench" href="/docs/tools/image-generation">
+    المرجع الكامل المولَّد من المخطط.
+  </Card>
+</CardGroup>

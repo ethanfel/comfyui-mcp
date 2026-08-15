@@ -644,6 +644,11 @@ interface StableAudio3Txt2AudioParams {
   sampler_name?: string;
   scheduler?: string;
   filename_prefix?: string;
+  /** #1458 — mirrors the ace_step sibling. `audio_quality` is a PUBLIC parameter of
+   *  the audio generation tool, and this family both ignored it and emitted no
+   *  `quality` at all, so a caller who set it had it silently dropped on top of every
+   *  run failing validation. */
+  audio_quality?: string;
 }
 
 function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
@@ -759,9 +764,20 @@ function buildStableAudio3Txt2Audio(p: StableAudio3Txt2AudioParams): WorkflowJSO
   const seed = p.seed ?? Math.floor(Math.random() * 2 ** 48);
   const steps = p.steps ?? 50;
   const cfg = p.cfg ?? 7;
-  const sampler = p.sampler_name ?? "lcm";
+  // #1458 — NOT "lcm". lcm at cfg 7 renders DIGITAL SILENCE (mean -91 dB) while
+  // ComfyUI reports success: a correctly-sized, correctly-durated file of nothing,
+  // with nothing in the logs to say so. The reporter measured six combinations and
+  // that pair was the only silent one — lcm at cfg 1 is fine — so it was specifically
+  // the pairing this template shipped.
+  //
+  // dpmpp_2m rather than euler, also measured: at 42s euler produced ~53.7 audible
+  // click artifacts/sec against ~0.8/sec for dpmpp_2m. Both avoid the silence; only
+  // one stays clean as the render gets longer, and a default is judged on the long
+  // case because that is where nobody is watching.
+  const sampler = p.sampler_name ?? "dpmpp_2m";
   const scheduler = p.scheduler ?? "simple";
   const prefix = p.filename_prefix ?? "audio/stable_audio_3";
+  const audioQuality = p.audio_quality ?? "320k";
 
   return {
     "1": {
@@ -807,7 +823,11 @@ function buildStableAudio3Txt2Audio(p: StableAudio3Txt2AudioParams): WorkflowJSO
     },
     "8": {
       class_type: "SaveAudioMP3",
-      inputs: { audio: conn("7", 0), filename_prefix: prefix },
+      // #1458 — `quality` is REQUIRED on SaveAudioMP3. Omitting it made every
+      // audio generation for this family fail validation before execution:
+      // "SaveAudioMP3 (node 8): Required input is missing (quality)". The ace_step
+      // builder above always set it; only this sibling did not.
+      inputs: { audio: conn("7", 0), filename_prefix: prefix, quality: audioQuality },
     },
   };
 }

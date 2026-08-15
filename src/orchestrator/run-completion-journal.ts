@@ -195,7 +195,25 @@ export interface JournalEntry {
    *  by then. Undefined when the caller named none (see ownsRun). */
   conversation?: string;
   arrivedAt: number;
+  /** Delivery OFFERS made for this entry — including ones nothing could take.
+   *  Drives the `replayed` flag ("this landed late"), which is true of a refused
+   *  offer too: the completion really did fail to reach the agent when it
+   *  arrived. NOT a record of what an agent was told — see `handoffs`. */
   attempts: number;
+  /**
+   * Offers an agent actually TOOK onto its queue.
+   *
+   * Distinct from `attempts`, and the distinction is load-bearing (#1327): the
+   * orchestrator flushes the journal the instant a completion arrives, so a
+   * render that finishes while its own `panel_run` call is still in flight gets
+   * offered to an agent that cannot take it. That offer is REFUSED — it tells
+   * nobody anything — yet it still counts an attempt. Anything asking "has an
+   * agent been told this?" must read this counter, never `attempts`.
+   *
+   * Survives a release back to `pending`, which is why the question cannot be
+   * answered from `state` either.
+   */
+  handoffs: number;
   state: EntryState;
   /** Content fingerprint — set only for ID-LESS completions, which have no run
    *  identity to dedupe on. See idlessFingerprint(). */
@@ -394,8 +412,12 @@ export class RunCompletionJournalImpl {
    * was evicted. Only doing it on the reopen left the eviction ordering able to
    * present an older run's result as the newly queued one's.
    */
-  private retireOlderEntriesFor(promptId: string): void {
+  private retireOlderEntriesFor(promptId: string, keep?: Set<JournalEntry>): void {
     for (const entry of this.entries.values()) {
+      // #1327 — an entry this very dispatch produced is not an OLDER run's; retiring
+      // it would immediately undo the claim above and re-report the agent's own render
+      // as undetermined, which is the defect being fixed.
+      if (keep?.has(entry)) continue;
       if (
         entry.correlation.status === "unidentified" ||
         entry.correlation.promptId !== promptId ||
@@ -424,7 +446,105 @@ export class RunCompletionJournalImpl {
    *  been re-registered (the #704 gap) is still this conversation's own history,
    *  and missing it would let the re-queued id be treated as a clean identity —
    *  the exact misattribution-plus-loss the `reused` flag exists to prevent. */
-  private hasHistoryFor(key: string, promptId: string, conversation?: string): boolean {
+  /**
+   * #1327 — re-stamp any UNDELIVERED completion that this dispatch itself produced.
+   *
+   * Returns the entries proven to belong to the run being opened, so the caller can
+   * also stop counting them as prior history for the id.
+   *
+   * Two conditions, both required, and both are proof rather than heuristic:
+   *   • the entry ARRIVED at or after this dispatch — the prompt id did not exist
+   *     before ComfyUI minted it here, so nothing earlier can legitimately carry it;
+   *   • the entry has NOT been handed to an agent yet — nobody has read the wrong
+   *     verdict, so correcting it changes no answer already given.
+   *
+   * The second is what keeps this compatible with the journal's rule that a REPLAY
+   * never re-correlates. That rule exists so a delivered verdict cannot be rewritten
+   * under a later run; this only ever corrects a verdict still sitting unread, and only
+   * toward the run that demonstrably produced it.
+   */
+  private claimRaced(
+    promptId: string,
+    meta: { tabId: string; conversation?: string; dispatchedAt?: number },
+  ): Set<JournalEntry> {
+    const claimed = new Set<JournalEntry>();
+    // No dispatch time means no proof — do nothing rather than guess.
+    if (typeof meta.dispatchedAt !== "number") return claimed;
+    for (const entry of this.entries.values()) {
+      // NOBODY HAS BEEN TOLD YET is the real condition, and only `handoffs` says so.
+      //
+      // Not `state`: a released entry (handed to an agent whose turn ended without an
+      // ack) goes back to `pending`, so a state check would silently re-stamp a verdict
+      // an agent had already been given.
+      //
+      // And NOT `attempts`, which is what this guard used to read — the recurrence of
+      // #1327. The orchestrator flushes the journal the moment a completion arrives, so
+      // a render that beats its own /prompt reply is offered to an agent still sitting
+      // inside the `panel_run` call that queued it. That offer is REFUSED, which tells
+      // the agent nothing at all, but it still counted an attempt — so this guard fired
+      // on the exact race it exists to repair, and the reporter got their own render
+      // back as "RE-DELIVERED … origin is UNDETERMINED" a second time.
+      //
+      // A refused offer reached nobody; only a TAKEN one commits a verdict to an agent.
+      if (entry.handoffs > 0) continue;
+      // Subsumed by the line above today (every non-pending state is reached through a
+      // taken hand-off), and kept because it can only ever REFUSE a claim: a future
+      // state that arrives without one would otherwise be claimed by default.
+      if (entry.state !== "pending") continue;
+      // An ID-LESS completion carries no run identity at all, so nothing can prove it
+      // belongs here — it stays unidentified rather than being claimed on timing alone.
+      if (entry.correlation.status === "unidentified") continue;
+      if (entry.correlation.promptId !== promptId) continue;
+      if (entry.arrivedAt < meta.dispatchedAt) continue;
+      // Only for the party this dispatch belongs to; another tab's completion for
+      // the same id is not ours to claim.
+      const sameParty =
+        entry.key === meta.tabId ||
+        (meta.conversation !== undefined && entry.conversation === meta.conversation);
+      if (!sameParty) continue;
+      claimed.add(entry);
+      if (entry.correlation.status === "matched") continue;
+      entry.correlation = { status: "matched", promptId };
+      if (meta.conversation !== undefined) entry.conversation = meta.conversation;
+      logger.info(
+        `[run-completions] prompt ${promptId} completed before its ticket existed (a fast/cached run) — the journaled completion is re-attributed to the run that produced it instead of being reported as foreign`,
+      );
+    }
+    return claimed;
+  }
+
+  /**
+   * Bind claimed entries to the generation of the ticket that now owns them.
+   *
+   * The claim is otherwise only half-applied. A completion that beat its ticket was
+   * journaled with generation 0 — "this tab never ticketed the id" — and `claimRaced`
+   * only rewrites the VERDICT. Generation 0 is a bucket rather than an identity, so
+   * `ack()` reads the entry as unprovable: it writes no delivered-memo and settles no
+   * ticket. MEASURED consequence, not a theoretical one — after the agent had been
+   * given the render and its turn had ended, a re-sent frame for the same run was
+   * delivered a SECOND time with no `possible_repeat` flag, i.e. as though a second
+   * render had happened.
+   *
+   * Called once the generation exists, which is why it cannot live inside
+   * `claimRaced`: on the fresh-ticket path the ticket is minted after the claim.
+   *
+   * `ambiguousId` is deliberately left as it was. It only blocks a later completion
+   * from merging into this entry, which costs an extra delivery at worst and never a
+   * loss — the standing trade — so it is not worth widening the merge surface here.
+   */
+  private bindClaimed(claimed: Set<JournalEntry>, seq: number): void {
+    for (const entry of claimed) {
+      if (entry.correlation.status === "unidentified") continue;
+      entry.ticketSeq = seq;
+    }
+  }
+
+  private hasHistoryFor(
+    key: string,
+    promptId: string,
+    conversation?: string,
+    exclude?: Set<JournalEntry>,
+  ): boolean {
     // BOTH owners: the memo may have been written under the tab (no conversation
     // known at the time, or an older entry) or under the conversation.
     const prefixes = [`${key}|${promptId}|`];
@@ -433,6 +553,7 @@ export class RunCompletionJournalImpl {
       if (prefixes.some((p) => memo.startsWith(p))) return true;
     }
     for (const entry of this.entries.values()) {
+      if (exclude?.has(entry)) continue; // #1327 — this dispatch's own completion
       if (
         (entry.key === key ||
           (conversation !== undefined && entry.conversation === conversation)) &&
@@ -451,9 +572,27 @@ export class RunCompletionJournalImpl {
    *  attribute. */
   openRun(
     promptId: string | null | undefined,
-    meta: { tabId: string; conversation?: string; toNodeId?: number },
+    meta: { tabId: string; conversation?: string; toNodeId?: number; dispatchedAt?: number },
   ): boolean {
     if (typeof promptId !== "string" || !promptId) return false;
+    // #1327 — CLAIM THE COMPLETION THAT BEAT ITS OWN TICKET.
+    //
+    // A ticket cannot be opened before dispatch, because ComfyUI mints the prompt id
+    // when it accepts the run. So a render that finishes faster than the reply travels
+    // back — the reporter's was 0.1s, fully cached — lands here BEFORE openRun and
+    // correlates against no ticket at all. It was journaled `foreign`, and the agent
+    // was told its own render "does NOT match any run you queued", with an instruction
+    // to go poll get_history and distrust the result.
+    //
+    // It also poisoned what came after: an already-journaled entry makes hasHistoryFor
+    // true below, so the fresh ticket was born `reused` and EVERY later completion for
+    // that id read UNDETERMINED too.
+    //
+    // The dispatch time settles it without guessing. The id did not exist before this
+    // dispatch created it, so a completion carrying it that arrived at/after that
+    // moment is necessarily this run's. Entries older than the dispatch are a genuinely
+    // reused id and keep the existing ambiguity handling.
+    const claimed = this.claimRaced(promptId, meta);
     // NOTE: no memo clearing is needed here. The delivered memo is keyed by
     // ticket GENERATION, and every path below either bumps the generation (a
     // reopen) or mints a fresh one (a new ticket), so a newly queued run's memo
@@ -478,7 +617,8 @@ export class RunCompletionJournalImpl {
       // on is unattributable (see RunTicket.reused) — reported UNDETERMINED, and
       // never suppressed as a duplicate of the other generation.
       existing.reused = true;
-      this.retireOlderEntriesFor(promptId);
+      this.bindClaimed(claimed, existing.seq);
+      this.retireOlderEntriesFor(promptId, claimed);
       return true;
     }
     // A FRESH ticket is only a fresh IDENTITY if this tab has no history for the
@@ -489,12 +629,17 @@ export class RunCompletionJournalImpl {
     // ambiguous: had it been treated as a clean identity, A's resend would
     // correlate as B, its ack would settle B, and B's real completion would then
     // be suppressed by B's own settled flag — misattribution AND loss.
-    const hasHistory = this.hasHistoryFor(meta.tabId, promptId, meta.conversation);
+    // #1327 — a completion this dispatch just produced is NOT prior history for the
+    // id. Counting it made the ticket `reused` and turned every later completion for
+    // the same run undetermined; `claimed` is exactly the set proven to be ours.
+    const hasHistory =
+      this.hasHistoryFor(meta.tabId, promptId, meta.conversation, claimed) || false;
+    const seq = ++this.ticketSeq;
     this.tickets.set(promptId, {
       promptId,
       tabId: meta.tabId,
       ...(meta.conversation !== undefined ? { conversation: meta.conversation } : {}),
-      seq: ++this.ticketSeq,
+      seq,
       queuedAt: Date.now(),
       ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
       settled: false,
@@ -505,11 +650,12 @@ export class RunCompletionJournalImpl {
         `[run-completions] prompt ${promptId} was queued again for tab ${meta.tabId.slice(0, 8)} after its ticket had been evicted — this tab already has history for that id, so it is treated as REUSED (every completion for it reported as undetermined)`,
       );
     }
+    this.bindClaimed(claimed, seq);
     // …and on THIS branch too. A fresh ticket after the old one was evicted is
     // still a NEW run for an id that already has journaled completions: without
     // this, an older `matched` entry survives untouched and goes on telling the
     // agent "this is the run YOU queued" for the id now outstanding.
-    this.retireOlderEntriesFor(promptId);
+    this.retireOlderEntriesFor(promptId, claimed);
     this.trimTickets();
     return true;
   }
@@ -733,6 +879,7 @@ export class RunCompletionJournalImpl {
       ...(conversation !== undefined ? { conversation } : {}),
       arrivedAt: Date.now(),
       attempts: 0,
+      handoffs: 0,
       state: "pending",
       ...(correlation.status === "unidentified"
         ? { fingerprint: idlessFingerprint(key, payload) }
@@ -888,6 +1035,10 @@ export class RunCompletionJournalImpl {
     const entry = this.entries.get(token);
     if (!entry) return;
     entry.attempts += 1;
+    // …and count separately whether the offer was actually TAKEN. A refused one
+    // reached no agent, so it must not answer "has this verdict been read?" — see
+    // JournalEntry.handoffs (#1327).
+    if (handedOff) entry.handoffs += 1;
     entry.state = handedOff ? "handed_off" : "pending";
   }
 

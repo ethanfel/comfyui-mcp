@@ -1,0 +1,54 @@
+name: krea2-identity-edit
+display_name: Krea 2 Identity Edit — outfit swap
+family: krea2
+kind: edit
+description: >-
+  Reference-driven OUTFIT SWAP and identity-preserving editing on KREA 2. Two images in:
+  a PRIMARY reference (the person to keep — face, hair, body, pose) and a SECONDARY
+  reference (the clothing or style to apply). Krea2EditGroundedEncode grounds the edit on
+  both, so a plain-English instruction changes the outfit while the subject and background
+  survive. Runs krea2_turbo fp8_scaled with the Qwen3-VL 4B encoder and the Krea 2
+  Identity Edit v1.2 LoRA. Local, 10 steps, cfg 1 — no API node, no per-image cost.
+vram: "16GB+ (fp8_scaled turbo; krea2_raw_bf16 wants 24GB+)"
+workflow: workflow.json
+skill: krea2-identity-edit
+launch_args: []
+sources:
+  model: https://huggingface.co/Comfy-Org/Krea-2
+  lora: https://huggingface.co/conradlocke/krea2-identity-edit
+  nodes: https://github.com/lbouaraba/comfyui-krea2edit
+  mirror: https://huggingface.co/Aitrepreneur/FLX
+notes:
+  - >-
+    Run the generated installer from your ComfyUI root (the folder containing custom_nodes/
+    and models/).
+  - >-
+    REFERENCE ORDER MATTERS, and it is the thing people get backwards. PRIMARY (group 1) is
+    the SUBJECT — the output always matches this person. SECONDARY (group 2) is the OUTFIT.
+    Swapping them swaps which identity survives.
+  - >-
+    The LoRA must land in loras/Krea2/ — the workflow loads it as
+    "Krea2\krea2_identity_edit_v1_2.safetensors". A flat loras/ install leaves the loader
+    pointing at a file that is present but unfindable.
+  - >-
+    THE FIDELITY DIALS FOLLOW THE IMAGE SLOTS, NOT THE ROLES. Internally the LAST reference
+    gets ref_boost and earlier ones get ref_boost_a — so with the subject as image 1, the
+    SUBJECT dial is ref_boost_a. Raise it if the face drifts.
+  - >-
+    Steps: 10 / cfg 1 on turbo. 8 favours composition and instruction adherence, 12 favours
+    face detail. Swapping in krea2_raw_bf16 instead wants 40 steps and cfg 3-4, where the
+    negative prompt starts to matter.
+  - >-
+    Set the output resolution to MATCH THE PRIMARY (subject) image — the ResolutionSelector
+    drives EmptySD3LatentImage, and a mismatched aspect crops or letterboxes the subject.
+  - >-
+    Prompt in plain English and name both roles, e.g. "Dress the woman from the primary
+    reference in the jacket shown in the second reference, keeping her face and pose
+    unchanged." Naming what to PRESERVE is as load-bearing as naming what to change.
+post_install:
+  - >-
+    Restart ComfyUI (or reload the browser tab) so comfyui-krea2edit registers
+    Krea2EditGroundedEncode / Krea2EditModelPatch, then load workflow.json.
+  - >-
+    CLIPLoader type must be "krea2" — that requires a ComfyUI with native KREA 2 support.
+    If the type is missing from the dropdown, update ComfyUI first.

@@ -64,7 +64,11 @@ describe("#1089 Manager 403 names its own reason", () => {
     const src = readFileSync(new URL("../../services/node-management.ts", import.meta.url), "utf8");
     const i = src.indexOf("ComfyUI-Manager API ${res.status} ${res.statusText} for ${path}");
     expect(i).toBeGreaterThan(-1);
-    const window = src.slice(i, i + 240);
+    // Widened from 240 for #1397, which appends managerBodyClause(text) and its
+    // rationale between the message head and the `details` object. The assertions
+    // below are unchanged — only the distance they scan, which was never the
+    // property being protected.
+    const window = src.slice(i, i + 900);
     expect(window).toMatch(/explainManagerForbidden\(res\.status, text\)/);
     // …and the raw body is still carried in details, so nothing is LOST by
     // summarising it in the message.

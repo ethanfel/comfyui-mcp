@@ -17,7 +17,13 @@ export function registerManifestTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          "Path to a .json, .yaml, or .yml manifest file. Provide exactly one of `manifest` or `path`.",
+          "Path to a .json, .yaml, or .yml manifest file. Provide exactly one of `manifest`, `path`, or `pack`.",
+        ),
+      pack: z
+        .string()
+        .optional()
+        .describe(
+          "A bundled installer pack by NAME, as reported by list_packs (action:\"list\"). PREFER THIS over `path` for a bundled pack: the name is resolved against the running build at apply time, while a manifest_path captured earlier points into an npx cache directory that a later respawn no longer has (#1568). Provide exactly one of `manifest`, `path`, or `pack`.",
         ),
     },
     async (args) => {

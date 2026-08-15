@@ -1,0 +1,66 @@
+---
+title: "شروع سریع"
+description: "ComfyUI MCP را به Claude Code اضافه کنید و اولین تصویرتان را تولید کنید."
+icon: "rocket"
+---
+
+<Steps>
+  <Step title="یک نمونهٔ ComfyUI در حال اجرا داشته باشید">
+    [ComfyUI Desktop](https://www.comfy.org/download) را نصب کنید یا آن را
+    [از سورس](https://github.com/comfyanonymous/ComfyUI) اجرا کنید، بعد راهش بیندازید. ComfyUI MCP
+    نصب محلی و پورت آن (8188 / 8000) را خودکار تشخیص می‌دهد. برای هدف گرفتن یک نمونهٔ راه دور،
+    [پیکربندی](/docs/configuration) را ببینید.
+  </Step>
+
+  <Step title="سرور MCP را به Claude Code اضافه کنید">
+    آن را به پیکربندی Claude Code (`~/.claude/settings.json`) اضافه کنید. `npx` آخرین بستهٔ
+    منتشرشده را خودکار می‌گیرد.
+
+    ```json ~/.claude/settings.json
+    {
+      "mcpServers": {
+        "comfyui": {
+          "command": "npx",
+          "args": ["-y", "comfyui-mcp"],
+          "env": {
+            "CIVITAI_API_TOKEN": ""
+          }
+        }
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="دوباره وصل شوید">
+    در Claude Code دستور `/mcp` را اجرا کنید (یا آن را دوباره راه‌اندازی کنید) تا به سرور
+    `comfyui` وصل شوید. باید ببینید که ابزارهای ComfyUI MCP در دسترس می‌شوند.
+  </Step>
+
+  <Step title="چیزی تولید کنید">
+    به زبان طبیعی از دستیارتان بخواهید:
+
+    > تصویری از یک روباه آبرنگی در جنگلی مه‌آلود تولید کن.
+
+    پشت صحنه این کار [`generate_image`](/docs/tools/image-generation) را صدا می‌زند که یک
+    گردش‌کار txt2img می‌سازد، یک چک‌پوینت را خودکار انتخاب می‌کند، آن را به صف می‌فرستد و یک
+    `prompt_id` برمی‌گرداند. تصویر آماده از راه اعلان تکمیل می‌رسد — با
+    [`get_image (action:"view")`](/docs/tools/assets-images) ببینیدش.
+  </Step>
+</Steps>
+
+## گام‌های بعدی
+
+<CardGroup cols={2}>
+  <Card title="جزئیات نصب" icon="download" href="/docs/fa/installation">
+    راه‌اندازی محلی در برابر راه دور، و `npm link` برای توسعه.
+  </Card>
+  <Card title="پیکربندی" icon="gear" href="/docs/configuration">
+    همهٔ متغیرهای محیطی و انتقال HTTP.
+  </Card>
+  <Card title="چطور کار می‌کند" icon="diagram-project" href="/docs/concepts">
+    طرز کار پشت ابزارها — و اینکه کدامشان به نصب محلی نیاز دارند.
+  </Card>
+  <Card title="مرور ابزارها" icon="wrench" href="/docs/tools/image-generation">
+    مرجع کامل که از روی اسکیما تولید شده است.
+  </Card>
+</CardGroup>

@@ -661,11 +661,17 @@ export class AskAnswerJournalImpl {
   }
 
   /** Does this journal know the ask id — i.e. is a late answer for it one of
-   *  OURS? The bridge's late-answer sink is fed by every `ask_user` card
-   *  (confirm/consent/secret gates included) and only `panel_ask` answers belong
-   *  here; those other cards have their own, deliberately non-recoverable paths
-   *  (a recovered "Yes, go ahead" must never authorise a different destructive
-   *  operation). */
+   *  OURS? The bridge's late-answer sink is fed by the ask cards, and only
+   *  `panel_ask` answers belong here; the others have their own, deliberately
+   *  non-recoverable paths (a recovered "Yes, go ahead" must never authorise a
+   *  different destructive operation).
+   *
+   *  SECRET CARDS NO LONGER REACH THE SINK AT ALL (#1352). They are recoverable
+   *  now — a credential typed a moment late is applied rather than dropped — but
+   *  only from the bridge's in-memory buffer, because journaling is durable by
+   *  design and that is the one property a credential must not have. This prefix
+   *  check would also decline them; the bridge declines first, deliberately, so
+   *  the guarantee does not rest on a policy that lives in another file. */
   tracks(askId: string): boolean {
     return askId.startsWith(PANEL_ASK_ID_PREFIX);
   }

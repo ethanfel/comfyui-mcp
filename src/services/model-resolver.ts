@@ -6,19 +6,26 @@ import { dirname, join, basename, normalize, resolve, relative, sep, isAbsolute,
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getClient, getLogs, getSystemStats, comfyApiFetch } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
-import { resolveEffectiveComfyUIBase, resolveLiveServerRoot } from "./workspace-env.js";
+import {
+  liveRootFromArgv,
+  resolveEffectiveComfyUIBase,
+  resolveLiveServerRoot,
+} from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError, unreachableHostMessage } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
+import { modelNotFoundMessage } from "./model-root-scope.js";
+import { divergentInstallRefusal } from "./download-root-correspondence.js";
 import {
   resolveModelsDir,
   resolveModelsDirWithBases,
   parseModelsDirFromArgv,
   hasUnresolvableRelativeModelDirFlag,
   isLiveAuthoritativeModelsDir,
+  modelsDirNamedByServer,
   type LiveServerSnapshot,
   type ModelsDirSource,
 } from "./output-dir.js";
@@ -1068,7 +1075,12 @@ async function assertDestinationVisibleToLiveServer(
   // reports its CONTAINER-side `--models-directory`, and writing that path here
   // silently creates a host directory the server never reads (codex gate, round 3).
   // The check below is cheap and fails open, so run it for that case too.
-  if (isLiveAuthoritativeModelsDir(source) && existsSync(modelsRoot)) return;
+  // Only a root the SERVER ITSELF named skips this (#369). `observed-root` reads
+  // as live-authoritative elsewhere and is not wrong to — it beats local config —
+  // but it is INFERRED from where the interpreter lives, and that inference can
+  // land on a stale bundle whose python happens to be on PATH. The exemption
+  // needs a statement from the server, not our best reading of the OS.
+  if (modelsDirNamedByServer(source) && existsSync(modelsRoot)) return;
   if (!snapshot.reachable || isRemoteMode()) return;
 
   // The target category first (it is the one that matters), then the rest of the
@@ -1258,7 +1270,19 @@ export async function isUnderLiveModelRoots(
   } catch {
     return { inRoots: undefined };
   }
-  if (!isLiveAuthoritativeModelsDir(dest.source)) return { inRoots: undefined };
+  // Same narrowing as the pre-write guard, and for the sharper reason (#369,
+  // review): this answer authorizes the POST-write "visible" verdict. An INFERRED
+  // root that is actually stale makes the membership test pass against a root the
+  // server does not read, and a live listing that names the file for an unrelated
+  // reason — the user already had that model — then reads as proof the download
+  // landed somewhere the server can see. That is #369's original symptom exactly:
+  // reported success, model never appears.
+  //
+  // Answering UNKNOWN here costs a correct `observed-root` install its confident
+  // "visible" and gives it the qualified note instead. That is the right trade:
+  // the note names the file, the root, and the remedy, whereas the false positive
+  // is silent and the user discovers it at queue time.
+  if (!modelsDirNamedByServer(dest.source)) return { inRoots: undefined };
   const liveRoot = resolve(dest.modelsDir);
 
   // A negative answer is only honest when everything it rests on could actually be
@@ -1319,23 +1343,39 @@ export async function currentLiveModelsRoot(): Promise<string | undefined> {
  * into a verified answer.
  *
  * Saying "unconfirmed" without saying WHY leaves the user with nothing to act on.
- * There are exactly two reasons the live root stays unpinnable: the running server
- * reported a relative `main.py` with no working directory (so its own report is not
- * enough), and the OS process table could not be read to identify the process on our
- * port. The second is a TOOLING gap on POSIX — `lsof` is simply not installed on
- * many minimal images — and installing it converts this host into a verifiable one.
+ * The running server reported a relative `main.py` with no working directory, so its
+ * own report is not enough to pin the install, and the root had to come from
+ * somewhere it never named.
+ *
+ * #1587 — this used to assert a CONJUNCTION as the cause: "...AND the process
+ * listening on the ComfyUI port could not be identified". That second half is often
+ * FALSE. On ComfyUI Desktop the process is identified — the same session's
+ * `install_comfyui(action:"environment")` reports `python_probe_trusted:true` with a
+ * process-table PID — and the root is STILL unpinnable, because an interpreter's
+ * location is evidence of where the BINARY lives, not of where the server reads
+ * (see `modelsDirNamedByServer`, and the measured stale-portable-python shape in
+ * #1374). Telling that user their process could not be identified sends them to fix
+ * something that is not broken, and "make its process observable" is advice they
+ * have already followed.
+ *
+ * So the reasons are stated as ALTERNATIVES, and the `lsof` gap — real, and worth
+ * naming on POSIX — is offered as a possibility to check rather than as a finding.
  */
 function unverifiableDestinationRemedy(): string {
   const probe =
     platform() === "win32"
-      ? "the process listening on the ComfyUI port could not be identified"
-      : "the process listening on the ComfyUI port could not be identified (this needs `lsof`, " +
-        "which is missing on many minimal images — installing it makes future downloads verifiable)";
+      ? ""
+      : " If the process on that port could not be identified at all, that needs `lsof`, " +
+        "which is missing on many minimal images — installing it makes future downloads " +
+        "verifiable.";
   return (
-    "This happens when the running ComfyUI reports a RELATIVE main.py with no working " +
-    `directory AND ${probe}. To get a definite answer: point COMFYUI_PATH at the ComfyUI ` +
-    "that is actually running, launch it with an absolute --base-directory, or make its " +
-    "process observable. Meanwhile, confirm with list_local_models."
+    "This happens when the running ComfyUI names a RELATIVE main.py with no working " +
+    "directory, so its models root has to come from somewhere the server did not name — " +
+    "local configuration, or the install tree around the interpreter the OS reports for " +
+    "the process on that port (which locates the BINARY, not the models the server " +
+    `reads).${probe} To get a definite answer, NAME the root: point COMFYUI_PATH at the ` +
+    "ComfyUI that is actually running, or launch it with an absolute --base-directory. " +
+    "Meanwhile, confirm with list_local_models."
   );
 }
 
@@ -1364,6 +1404,21 @@ const LIVE_VISIBILITY_RETRY_MS = 1000;
  *  established. Three states, because "the server did not list it" and "the
  *  server could not be asked" are different facts (#796). */
 export type ManagerVisibility = "visible" | "not-listed" | "unknown";
+
+/**
+ * What the caller established about whether the connected server ALREADY listed
+ * this entry before the dispatch started. THREE states, and the third is
+ * load-bearing (#1374 review, P1-1).
+ *
+ * `false` is the only one that licenses crediting a later listing to THIS
+ * dispatch. `true` means a same-named file was already there. `"unknown"` means
+ * the baseline was never established — the name was not known up front, or the
+ * pre-dispatch listing could not be read — and that is NOT the same fact as
+ * "was not listed before". Spelling both as `undefined` is what let a
+ * PRE-EXISTING file answer "visible" for a dispatch that fetched nothing, which
+ * is the #369 trap wearing a Manager's clothes.
+ */
+export type ListedBeforeBaseline = boolean | "unknown";
 
 /**
  * Ask the CONNECTED server whether it now lists a model a Manager dispatch was
@@ -1395,7 +1450,11 @@ export async function verifyManagerVisibility(
   opts?: {
     attempts?: number;
     retryMs?: number;
-    listedBefore?: boolean;
+    /** Tri-state — see ListedBeforeBaseline. OMITTING it is NOT "it was not
+     *  there before": an absent baseline is an unknown one, and is treated
+     *  exactly like `"unknown"`. Only an explicit `false` licenses a `visible`
+     *  verdict. */
+    listedBefore?: ListedBeforeBaseline;
     /** The listing probe, injectable so this is testable without a live server.
      *  Defaults to liveListingHasEntry — which a test CANNOT intercept by mocking
      *  the module, because the call below resolves a module-local binding rather
@@ -1418,6 +1477,20 @@ export async function verifyManagerVisibility(
         `still be the older file. Compare the file size or hash on the server if that matters.`,
     };
   }
+  // #1374 review, P1-1 — AN UNKNOWN BASELINE IS NOT A NEGATIVE ONE.
+  //
+  // `listedBefore === false` is the ONLY answer that lets a listing seen now be
+  // credited to this dispatch. Anything else — an explicit `"unknown"`, or an
+  // omitted option — means nobody established what the server listed beforehand,
+  // so a hit here is equally consistent with a file that was always there. The
+  // previous shape checked only `=== true`, which folded "we could not find out"
+  // into "it was not there" and re-opened the #369 trap on the one route that
+  // had never had a guard against it.
+  //
+  // This is NOT short-circuited like the `true` case: a NEGATIVE answer is still
+  // worth reporting (and is the #1374 finding), and an unaskable server is still
+  // `unknown`. Only the POSITIVE direction is withheld.
+  const baselineIsNegative = opts?.listedBefore === false;
   const attempts = Math.max(1, opts?.attempts ?? LIVE_VISIBILITY_ATTEMPTS);
   const retryMs = opts?.retryMs ?? LIVE_VISIBILITY_RETRY_MS;
   let asked = false;
@@ -1427,6 +1500,16 @@ export async function verifyManagerVisibility(
       has = await probe(targetSubfolder, filename);
     } catch {
       has = undefined; // never throws outward — see the docblock
+    }
+    if (has === true && !baselineIsNegative) {
+      return {
+        visibility: "unknown",
+        note:
+          `The connected ComfyUI lists "${filename}" in ${targetSubfolder} now, but whether it ` +
+          `ALREADY listed that name before this dispatch was never established, so the listing ` +
+          `cannot be attributed to this download — it may be a pre-existing file of the same ` +
+          `name. Compare the file size or hash on the server if that matters.`,
+      };
     }
     if (has === true) {
       return {
@@ -1643,8 +1726,9 @@ export async function verifyLandedModel(
           liveVisible: "unknown",
           note:
             `The connected ComfyUI (${getComfyUIBaseUrl()}) lists "${wanted}" under "${category}", ` +
-            "but this destination came from local configuration rather than from the running " +
-            "server, so that listing cannot be tied to the file just written to " +
+            "but this destination was not named by the running server — it came from local " +
+            "configuration, or was inferred from where the server's interpreter lives — so that " +
+            "listing cannot be tied to the file just written to " +
             `${verifiedPath} — it may be the server's own copy elsewhere` +
             (opts?.listedBefore === true
               ? " (it already listed that name before this download)"
@@ -2080,6 +2164,13 @@ export interface ResolvedDownloadTarget {
   liveRootAtResolve?: string;
 }
 
+/** The models CATEGORY a target subfolder belongs to — its first segment. Live extra
+ *  roots are category-scoped, so a `checkpoints` root must not vouch for a LoRA. */
+function normalizedSubfolderFor(targetSubfolder: string): string | undefined {
+  const first = (targetSubfolder ?? "").trim().replace(/\\/g, "/").split("/")[0];
+  return first || undefined;
+}
+
 /**
  * The SINGLE source of truth for a model download's final on-disk destination,
  * shared by downloadModel (the writer) AND the background job registry (which
@@ -2122,6 +2213,35 @@ export async function resolveDownloadTarget(
       "Refusing to write outside the target model directory.",
       { filename: rawFilename },
     );
+  }
+  // #1371 — a stale COMFYUI_PATH wrote a model into a DIFFERENT local install than the
+  // one serving the session. The destination is rooted at the server's own models dir
+  // when it can be, but falls back to <COMFYUI_PATH>/models when the server was not
+  // launched with --base-directory — and nothing then checked that the fallback belongs
+  // to THAT server.
+  //
+  // A server can still name its install root through its main.py argv. When it does and
+  // the destination is outside it, the installs are PROVABLY different. Positive
+  // evidence, so this does not reintroduce the false-refusal class the content check's
+  // own note warns about — and it is skipped entirely when the destination came from
+  // the live server (nothing to disagree with) or when no root can be derived.
+  if (!liveRootAtResolve) {
+    const membership = await isUnderLiveModelRoots(targetDir, normalizedSubfolderFor(targetSubfolder));
+    const refusal = divergentInstallRefusal({
+      targetDir,
+      inRoots: membership.inRoots,
+      liveRoot: membership.liveRoot,
+      // Defensive: decoration on a refusal, and an existing suite mocks config.js
+      // without this export — a message detail must never fail a download.
+      serverUrl: (() => {
+        try {
+          return getComfyUIBaseUrl();
+        } catch {
+          return undefined;
+        }
+      })(),
+    });
+    if (refusal) throw new ModelError(refusal, { path: targetDir });
   }
   return { targetDir, filename: resolvedFilename, targetPath, liveRootAtResolve };
 }
@@ -2254,9 +2374,12 @@ export async function resolveExistingModelFile(
 
   if (dirHit) return dirHit;
 
+  // #1474 — say WHY only these roots were searched. `list_paths` may display roots
+  // this resolver refused to enumerate (it backs DELETION, so it uses only roots
+  // provable from the running server's launch arguments), and the caller was left
+  // holding two tools that disagreed with nothing to reconcile them.
   throw new ModelError(
-    `Model file not found: ${relativePath}. Searched ${searched.length} root(s): ` +
-      `${searched.join(", ")}`,
+    modelNotFoundMessage({ relativePath, searched }),
     { path: relativePath, searched },
   );
 }
@@ -2715,17 +2838,36 @@ async function downloadModelViaManagerRemote(
     filename: resolvedFilename,
   });
 
-  await installModelViaManager({
-    // Manager's do_install_model reads json_data['name'] (required, non-empty).
-    // We only have the filename to identify the model here, so use it.
-    name: resolvedFilename,
-    url: dispatchUrl,
-    filename: resolvedFilename,
-    type: managerType,
-    save_path: managerSavePath,
-    // Panel tray: watch OUR canonical category for the file to land (#143).
-    trayCategory: modelType,
-  });
+  try {
+    await installModelViaManager({
+      // Manager's do_install_model reads json_data['name'] (required, non-empty).
+      // We only have the filename to identify the model here, so use it.
+      name: resolvedFilename,
+      url: dispatchUrl,
+      filename: resolvedFilename,
+      type: managerType,
+      save_path: managerSavePath,
+      // Panel tray: watch OUR canonical category for the file to land (#143).
+      trayCategory: modelType,
+    });
+  } catch (err) {
+    // #1374 — the ONLY failure entitled to the route explanation: Manager was contacted
+    // and Manager is what failed. Scoped to this call rather than the whole function
+    // because everything above it — target resolution, the remote payload preflight — can
+    // fail for reasons unrelated to the route. The first version wrapped the lot and
+    // matched on error text; the preflight's own auth-gated refusal mentions
+    // ComfyUI-Manager, so it was misattributed anyway. A flag at the call site cannot be
+    // fooled by prose.
+    if (err instanceof DOMException && err.name === "AbortError") throw err;
+    const why = await explainManagerDownloadRoute();
+    if (!why) throw err;
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new ModelError(`${raw}
+
+WHY THIS WENT THROUGH ComfyUI-Manager AT ALL: ${why}`, {
+      url,
+    });
+  }
 
   // Cancelled while the dispatch was in flight (#515): the local job is cancelled.
   // We CAN'T recall a Manager queue task, so the host may keep fetching — but this
@@ -2775,6 +2917,83 @@ async function downloadModelViaManagerRemote(
  * no server is reachable, so the local resolver surfaces its clear, actionable error
  * rather than silently succeeding.
  */
+/**
+ * WHY a download went to ComfyUI-Manager, reported as CURRENT STATE (#1374).
+ *
+ * The reporter's LOCAL install could not download at all: every attempt died on
+ * "ComfyUI-Manager's queue API is not reachable", for a capability that needs no Manager.
+ * That error is raised in generic Manager code which cannot know it is serving a download,
+ * so it named the thing that BROKE and not the decision that made Manager necessary --
+ * this MCP could not work out where the connected server keeps its models. Only the second
+ * has a remedy the user can apply.
+ *
+ * FOUR REVIEW ROUNDS WENT INTO A MESSAGE, and every one found the same shape of fault: a
+ * diagnostic claiming to narrate the routing DECISION while reading state that might not
+ * be the state that decision was made from. A second /system_stats read could describe a
+ * different server. A process-global record of the first read could be overwritten by a
+ * concurrent download. Stamping the target closed the simple overwrite but not an
+ * A -> B -> A retarget.
+ *
+ * Each fix made the window smaller instead of closing it, so what changes here is the
+ * CLAIM. This reports the state as it is now and says so. It cannot be stale, because it
+ * no longer asserts it was ever anything else -- and the argv/cwd a reporter needs in
+ * order to say which case they hit is exactly as useful either way.
+ */
+export async function explainManagerDownloadRoute(): Promise<string> {
+  if (isRemoteMode()) {
+    return (
+      "This MCP is in REMOTE mode (--comfyui-url) RIGHT NOW, so downloads are dispatched " +
+      "to the connected ComfyUI's Manager by design -- there is no local models directory " +
+      "to stream into. Manager must be installed and enabled on that host. (Current state: " +
+      "if the target was changed since this download started, it may not be why this one " +
+      "took that route.)"
+    );
+  }
+  let argv: string[] | undefined;
+  let cwd: string | undefined;
+  try {
+    const stats = await getSystemStats();
+    argv = (stats as { system?: { argv?: string[] } })?.system?.argv;
+    cwd = (stats as { system?: { cwd?: string } })?.system?.cwd;
+  } catch {
+    // Nothing observed now. Say nothing rather than guess why the route was taken.
+    return "";
+  }
+  // Rendered RAW rather than JSON.stringify'd: a Windows argv comes back with doubled
+  // backslashes, in the one line that exists to be pasted into a bug report.
+  const detail =
+    `Reading the connected server NOW: argv[0]=${argv?.[0] ?? "(none)"} and ` +
+    `cwd=${cwd ?? "(not reported)"}. (Current state -- if the server was restarted or ` +
+    `retargeted since this download started, it may not be what the routing decision saw.)`;
+  if (hasUnresolvableRelativeModelDirFlag(argv, cwd)) {
+    return (
+      `Your ComfyUI was started with a RELATIVE --base-directory/--models-directory and did ` +
+      `not report its working directory, so this MCP cannot tell where its models actually ` +
+      `live -- writing locally would put the file somewhere the server never reads. ${detail} ` +
+      `FIX: restart ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the ` +
+      `install root, and a local download will stream directly with no Manager involved.`
+    );
+  }
+  const liveRoot = resolveLiveServerRoot(argv, cwd, { remote: false });
+  if (liveRoot.root && !existsSync(liveRoot.root)) {
+    return (
+      `The connected ComfyUI reports its install root as ${liveRoot.root}, which does not ` +
+      `exist on THIS machine -- it is a container-side or remote path (a Docker/SSH-forwarded ` +
+      `loopback server looks local but is not). Writing there would create a bogus directory ` +
+      `instead of reaching the server, so the fetch is handed to its Manager. ${detail} ` +
+      `FIX: enable Manager on that host, or run this MCP where the models directory really is.`
+    );
+  }
+  return (
+    `This MCP could not resolve where the connected ComfyUI keeps its models, so it handed ` +
+    `the fetch to that server's Manager instead of streaming locally. ${detail} ` +
+    `FIX: set COMFYUI_PATH to the ComfyUI install root (the directory containing main.py) -- ` +
+    `a local download then streams directly and needs no Manager. Please include this whole ` +
+    `paragraph if you report it (#1374): the argv/cwd above is what identifies which case ` +
+    `this is.`
+  );
+}
+
 export async function shouldDispatchDownloadToManager(): Promise<boolean> {
   if (isRemoteMode()) return true;
   try {
@@ -2886,7 +3105,11 @@ export async function downloadModel(
   if (routeToManager) {
     // Thread the PRE-rewrite HF identity so the flip probe's credential derivation keeps the
     // HF token flowing to an HF_ENDPOINT mirror (matches the local path below).
-    return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth, signal, wasHfUrl);
+    // The route explanation lives INSIDE the dispatch (see downloadModelViaManagerRemote),
+    // where a flag records whether Manager was actually contacted. Matching on error text
+    // from out here could not tell a Manager failure from a preflight refusal that happens
+    // to mention Manager.
+    return await downloadModelViaManagerRemote(url, targetSubfolder, filename, auth, signal, wasHfUrl);
   }
 
   // Root the destination at the LIVE server's models dir (its --base-directory),
